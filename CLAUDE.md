@@ -13,7 +13,7 @@ Assist fully with code exploration, modification, and benchmarking.
 ## Four-build setup
 
 Two comparison pairs, all with GGML_METAL=OFF:
-
+go
 | Build dir             | Threading | BLAS      |
 |-----------------------|-----------|-----------|
 | build-pthread-blas    | pthreads  | ON (Accelerate) |

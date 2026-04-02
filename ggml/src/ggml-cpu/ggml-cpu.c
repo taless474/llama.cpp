@@ -53,11 +53,7 @@
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
-#define GGML_CACHE_LINE  64
-
-#if defined(__clang__) || defined(__GNUC__)
-#define GGML_CACHE_ALIGN __attribute__((aligned(GGML_CACHE_LINE)))
-#endif
+// GGML_CACHE_LINE / GGML_CACHE_ALIGN defined in ggml-cpu-threads.h
 
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -99,7 +95,7 @@ struct ggml_riscv_arch_features_type {
 #include <windows.h>
 
 #if defined(_MSC_VER) && !defined(__clang__)
-#define GGML_CACHE_ALIGN __declspec(align(GGML_CACHE_LINE))
+// GGML_CACHE_ALIGN defined in ggml-cpu-threads.h
 
 typedef volatile LONG atomic_int;
 typedef atomic_int atomic_bool;
@@ -195,8 +191,7 @@ typedef void * thread_ret_t;
 
 typedef pthread_t ggml_thread_t;
 
-#define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
-#define GGML_THREADPOOL_N_THREADS_BITS (16)
+// GGML_THREADPOOL_N_THREADS_MASK / _BITS defined in ggml-cpu-threads.h
 
 #if defined(__APPLE__)
 #include <unistd.h>
@@ -403,8 +398,6 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
 // Threading defs
 //
 
-typedef pthread_t          ggml_thread_t;
-
 #if defined(_WIN32)
 
 typedef CONDITION_VARIABLE ggml_cond_t;
@@ -457,44 +450,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
-// Threadpool def
-struct ggml_threadpool {
-    ggml_mutex_t mutex;       // mutex for cond.var
-    ggml_cond_t  cond;        // cond.var for waiting for new work
-
-    struct ggml_cgraph * cgraph;
-    struct ggml_cplan  * cplan;
-
-    // synchronization primitives
-    atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
-    atomic_int GGML_CACHE_ALIGN n_barrier;
-    atomic_int GGML_CACHE_ALIGN n_barrier_passed;
-    atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
-
-    // these are atomic as an annotation for thread-sanitizer
-    atomic_bool stop;         // Used for stopping the threadpool altogether
-    atomic_bool pause;        // Used for pausing the threadpool or individual threads
-    atomic_int  abort;        // Used for aborting processing of a graph
-
-    struct ggml_compute_state * workers;   // per thread state
-    int          n_threads;   // Number of threads in the pool
-    int32_t      prio;        // Scheduling priority
-    uint32_t     poll;        // Polling level (0 - no polling)
-
-    enum ggml_status ec;
-};
-
-// Per-thread state
-struct ggml_compute_state {
-#ifndef GGML_USE_OPENMP
-    ggml_thread_t thrd;
-    int  last_graph;
-    bool pending;
-#endif
-    bool cpumask[GGML_MAX_N_THREADS];
-    struct ggml_threadpool * threadpool;
-    int ith;
-};
+#include "ggml-cpu-threads.h"
 
 // Helpers for polling loops
 #if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
@@ -553,6 +509,7 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+#if !defined(GGML_USE_HPX)
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
@@ -590,6 +547,7 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #endif
 #endif
 }
+#endif // !GGML_USE_HPX
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
     atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
@@ -2654,12 +2612,13 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
+#if !defined(GGML_USE_HPX)
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
 
     const int n_threads = threadpool->n_threads;
 
-#ifndef GGML_USE_OPENMP
+#if !defined(GGML_USE_OPENMP) && !defined(GGML_USE_HPX)
     struct ggml_compute_state* workers = threadpool->workers;
 
     ggml_mutex_lock(&threadpool->mutex);
@@ -2678,14 +2637,15 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
-#endif // GGML_USE_OPENMP
+#endif // !GGML_USE_OPENMP && !GGML_USE_HPX
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
+#endif // !GGML_USE_HPX
 
-#ifndef GGML_USE_OPENMP
+#if !defined(GGML_USE_OPENMP) && !defined(GGML_USE_HPX)
 // pause/resume must be called under mutex
 static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
     GGML_PRINT_DEBUG("Pausing threadpool\n");
@@ -2698,10 +2658,11 @@ static void ggml_threadpool_resume_locked(struct ggml_threadpool * threadpool) {
     threadpool->pause = false;
     ggml_cond_broadcast(&threadpool->cond);
 }
-#endif
+#endif // !GGML_USE_OPENMP && !GGML_USE_HPX
 
+#if !defined(GGML_USE_HPX)
 void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
-#ifndef GGML_USE_OPENMP
+#if !defined(GGML_USE_OPENMP)
     ggml_mutex_lock(&threadpool->mutex);
     if (!threadpool->pause) {
        ggml_threadpool_pause_locked(threadpool);
@@ -2713,7 +2674,7 @@ void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
 }
 
 void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
-#ifndef GGML_USE_OPENMP
+#if !defined(GGML_USE_OPENMP)
     ggml_mutex_lock(&threadpool->mutex);
     if (threadpool->pause) {
        ggml_threadpool_resume_locked(threadpool);
@@ -2723,6 +2684,7 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
     UNUSED(threadpool);
 #endif
 }
+#endif // !GGML_USE_HPX
 
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
@@ -2949,7 +2911,11 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
+#if defined(GGML_USE_HPX)
+thread_ret_t ggml_graph_compute_thread(void * data) {
+#else
 static thread_ret_t ggml_graph_compute_thread(void * data) {
+#endif
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
 
@@ -3009,7 +2975,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     return 0;
 }
 
-#ifndef GGML_USE_OPENMP
+#if !defined(GGML_USE_OPENMP) && !defined(GGML_USE_HPX)
 
 // check if thread is ready to proceed (exit from polling or sleeping)
 // returns true if loops should exit, sets state->pending to indicate new work
@@ -3145,8 +3111,9 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     ggml_mutex_unlock(&threadpool->mutex);
 }
 
-#endif // GGML_USE_OPENMP
+#endif // !GGML_USE_OPENMP && !GGML_USE_HPX
 
+#if !defined(GGML_USE_HPX)
 static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
                struct ggml_cgraph * cgraph,
@@ -3158,8 +3125,10 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->n_graph          = 0;
+#if !defined(GGML_USE_HPX)
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
+#endif
         threadpool->current_chunk    = 0;
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
@@ -3190,7 +3159,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     for (int j = 0; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
-#else // GGML_USE_OPENMP
+#elif !defined(GGML_USE_HPX) // GGML_USE_OPENMP
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
 
@@ -3215,7 +3184,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
             ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
         }
     }
-#endif // GGML_USE_OPENMP
+#endif // GGML_USE_OPENMP / !GGML_USE_HPX
 
     return threadpool;
 }
@@ -3223,6 +3192,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
+#endif // !GGML_USE_HPX
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
@@ -3241,7 +3211,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
+#if defined(GGML_USE_HPX)
+        threadpool = ggml_threadpool_new(&ttp);
+        threadpool->cgraph = cgraph;
+        threadpool->cplan  = cplan;
+#else
         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+#endif
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
@@ -3275,6 +3251,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
         ggml_graph_compute_thread(&threadpool->workers[0]);
+    }
+#elif defined(GGML_USE_HPX)
+    {
+        // HPX: forward to the HPX implementation (defined in ggml-cpu-hpx.cpp)
+        enum ggml_status ggml_graph_compute_hpx(struct ggml_cgraph *, struct ggml_cplan *, struct ggml_threadpool *, int);
+        threadpool->ec = ggml_graph_compute_hpx(cgraph, cplan, threadpool, n_threads);
     }
 #else
     if (n_threads > threadpool->n_threads) {

@@ -18,8 +18,10 @@ This pair answers: **does HPX help in real-world inference conditions?**
 ### Pair B: pthreads vs HPX with GGML_BLAS=OFF (pure threading comparison)
 
 With BLAS disabled, ggml's thread pool is responsible for all compute including GEMM.
-The thread pool overhead and scheduling quality become the dominant factor.
-This pair answers: **how much does HPX's scheduler matter when threading is the bottleneck?**
+Note that disabling BLAS changes both the threading load *and* the compute path itself
+(ggml's own GEMM kernels replace Accelerate's), so any performance difference reflects
+a combination of scheduler quality and kernel differences — not scheduling alone.
+This pair answers: **is HPX competitive when the thread pool is responsible for all compute?**
 
 Together the two pairs isolate whether any HPX gain is from better scheduling of
 the ggml thread pool, or only visible when BLAS hides the threading cost.
@@ -84,9 +86,11 @@ Compiled in place of the pthread implementation when `-DGGML_HPX=ON`.
 - `ggml/CMakeLists.txt` — add `option(GGML_HPX "use HPX for threading" OFF)`
 - `ggml/src/ggml-cpu/CMakeLists.txt` — conditionally link HPX, swap source file
 
-**Two separate build dirs** keep baseline and HPX builds independent:
-- `build-baseline/` — unmodified pthread build
-- `build-hpx/` — HPX build
+**Four build dirs** keep all variants independent (matching the names used throughout this document):
+- `build-pthread-blas/` — pthreads + BLAS ON
+- `build-hpx-blas/` — HPX + BLAS ON
+- `build-pthread-noblas/` — pthreads + BLAS OFF
+- `build-hpx-noblas/` — HPX + BLAS OFF
 
 ---
 
@@ -97,6 +101,8 @@ Compiled in place of the pthread implementation when `-DGGML_HPX=ON`.
 See `models/README.md` for download instructions.
 
 ### Step 2: Build all four variants
+
+> **Naming:** all build directories and result files use the names defined in the repo structure above — `build-pthread-blas`, `build-hpx-blas`, `build-pthread-noblas`, `build-hpx-noblas`.
 
 ```bash
 # Pair A — BLAS ON (realistic, Accelerate handles GEMM)
@@ -127,7 +133,33 @@ cmake --build build-hpx-noblas -j --target llama-bench
 Create `ggml/src/ggml-cpu/ggml-cpu-hpx.cpp` implementing the `ggml_threadpool`
 interface with HPX primitives. Update CMake as described in `HPX_IMPL_PLAN.md`.
 
-### Step 4: Run thread sweeps
+### Step 4: Validate correctness before benchmarking
+
+Do not treat any timing numbers as meaningful until the HPX build passes a
+correctness check. Run `test_correctness.sh` (in `hpx-bench/`) to confirm that
+the HPX and pthread builds produce identical output for a short inference run:
+
+```bash
+# Quick smoke-test: single-token generation with a tiny prompt
+./build-pthread-blas/bin/llama-cli \
+  -m models/llama3.1-8b/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+  -ngl 0 -t 4 -p "Hello" -n 5 --no-display-prompt 2>/dev/null \
+  > /tmp/out_pthread_blas.txt
+
+./build-hpx-blas/bin/llama-cli \
+  -m models/llama3.1-8b/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+  -ngl 0 -t 4 -p "Hello" -n 5 --no-display-prompt 2>/dev/null \
+  > /tmp/out_hpx_blas.txt
+
+diff /tmp/out_pthread_blas.txt /tmp/out_hpx_blas.txt \
+  && echo "PASS: outputs match" || echo "FAIL: outputs differ"
+```
+
+Repeat for the BLAS-OFF pair. A diff should be empty — LLM sampling is
+deterministic given the same seed and thread count. If outputs differ, the HPX
+implementation has a correctness bug and benchmark results are meaningless.
+
+### Step 5: Run thread sweeps
 
 Common flags for all runs:
 - `-ngl 0` — CPU only, no Metal offload
@@ -161,7 +193,7 @@ mkdir -p results
   -o csv | tee results/hpx_noblas_sweep.csv
 ```
 
-### Step 5: Compare results
+### Step 6: Compare results
 
 ```bash
 # Pair A
@@ -174,6 +206,24 @@ python scripts/compare-llama-bench.py \
   results/pthread_noblas_sweep.csv \
   results/hpx_noblas_sweep.csv
 ```
+
+---
+
+## Benchmark hygiene
+
+Follow these practices to keep measurements trustworthy:
+
+- **Thermal state** — run a 2–3 minute warm-up workload before recording numbers,
+  and discard any run where the M4's performance cores are throttling (check with
+  `sudo powermetrics --samplers cpu_power -i 1000 -n 3`).
+- **Background noise** — close browsers, editors, and other CPU-intensive apps.
+  Disable Spotlight indexing (`sudo mdutil -a -i off`) for the duration.
+- **Repetitions** — use `-r 5` (not `-r 3`) and report median, not mean, to
+  reduce the impact of OS scheduling jitter on individual runs.
+- **Run order** — alternate pthread / HPX runs rather than batching all pthread
+  first, to avoid systematic bias from thermal or frequency drift over time.
+- **Verification** — if any single run's `avg_ts` differs from the median by
+  more than 10%, flag it as an outlier and re-run rather than averaging it in.
 
 ---
 
@@ -210,8 +260,27 @@ python scripts/compare-llama-bench.py \
 | pp (prompt processing) | Scales up to ~4 perf cores, then diminishing returns |
 | tg (token generation) | Memory-bandwidth bound, flattens early (~4 threads) |
 | Pair A Δ | Small — BLAS dominates, HPX only affects non-GEMM ops (~10% of compute) |
-| Pair B Δ | Larger — HPX scheduler directly affects all GEMM parallelism |
+| Pair B Δ | Mixed — reflects both scheduler quality and ggml vs Accelerate kernel differences |
 | Knee point | Thread count where adding more hurts or plateaus |
 
 The key question: is there a meaningful HPX gain in Pair B that is absent in Pair A?
-If yes, HPX helps the ggml thread pool but gets hidden by BLAS in practice.
+If yes, the result is consistent with HPX helping the ggml thread pool, though the
+BLAS-OFF kernel change means it cannot be attributed to scheduling alone.
+
+---
+
+## Defining a meaningful result
+
+Set these thresholds before looking at numbers to avoid post-hoc rationalization:
+
+| Claim | Threshold |
+|-------|-----------|
+| HPX is **beneficial** for prompt processing | HPX pp median ≥ pthread pp median + 5% at ≥ 2 thread counts in Pair B |
+| HPX is **neutral** | All Δ values within ±5% across both pairs |
+| HPX is **harmful** | HPX median < pthread median − 5% at any thread count in either pair |
+| Result is **inconclusive** | Pair B shows a gain but Pair A does not narrow it down — collect profiling data (e.g. `perf`, Instruments) before drawing conclusions |
+
+A 5% threshold is chosen because run-to-run noise on the M4 is typically < 2%
+for prompt processing, so a consistent 5% signal is unlikely to be measurement
+artifact. Token generation is more variable (memory-bandwidth bound); apply a
+10% threshold there.
