@@ -13,16 +13,26 @@
 
 // atomic_int / atomic_bool
 //
-// C mode  : use C11 <stdatomic.h> types directly.
-// C++ mode: alias std::atomic<> to the C11 names so the struct definition is
-//           shared.  This avoids the libc++ / clang <stdatomic.h> macro conflict
-//           that occurs when <atomic> and <stdatomic.h> are both visible.
-//           (std::atomic<int> and _Atomic int are ABI-compatible on GCC/Clang.)
+// C++ mode: alias std::atomic<> to the C11 names so the struct layout is
+//           shared between C and C++ translation units.  The two types are
+//           layout-compatible on GCC/Clang for trivially-copyable T, but this
+//           is not guaranteed by the standard — it works in practice on all
+//           supported targets (x86-64, aarch64).
+//
+// C mode, GCC/Clang: use C11 <stdatomic.h> directly.
+//
+// C mode, MSVC (without clang-cl): MSVC does not ship <stdatomic.h> for C.
+//   This header is not intended to be included from C translation units under
+//   MSVC without HPX; the HPX path always compiles as C++ so the top branch
+//   applies.  If you need MSVC C support, add _Atomic / Interlocked stubs here.
 #if defined(__cplusplus)
 #  include <atomic>
 using atomic_int  = std::atomic<int>;
 using atomic_bool = std::atomic<bool>;
-#elif !defined(_MSC_VER) || defined(__clang__)
+#elif defined(_MSC_VER) && !defined(__clang__)
+// MSVC C mode: not supported — see comment above.
+#  error "ggml-cpu-threads.h in C mode requires GCC, Clang, or clang-cl"
+#else
 #  include <stdatomic.h>
 #endif
 
@@ -40,6 +50,26 @@ using atomic_bool = std::atomic<bool>;
 #  else
 #    define GGML_CACHE_ALIGN
 #  endif
+#endif
+
+// ── CPU spin-hint ─────────────────────────────────────────────────────────────
+// Used by both pthread and HPX poll loops.
+// Inline asm on x86 to avoid _mm_pause() / intrinsic header dependency.
+
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+static inline void ggml_thread_cpu_relax(void) { __asm__ volatile("yield" ::: "memory"); }
+#elif defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+static inline void ggml_thread_cpu_relax(void) { __asm__ volatile("pause" ::: "memory"); }
+#elif defined(__riscv)
+static inline void ggml_thread_cpu_relax(void) {
+#  ifdef __riscv_zihintpause
+    __asm__ __volatile__("pause");
+#  else
+    __asm__ __volatile__("" ::: "memory");
+#  endif
+}
+#else
+static inline void ggml_thread_cpu_relax(void) { ; }
 #endif
 
 // ── Thread count packing helpers ──────────────────────────────────────────────
@@ -98,6 +128,9 @@ struct ggml_compute_state {
     int  last_graph;
     bool pending;
 #endif
+    // cpumask is populated by ggml_thread_cpumask_next() in the pthread path.
+    // The HPX backend retains this field for struct layout compatibility but
+    // does not act on it — CPU placement is controlled by the HPX scheduler.
     bool cpumask[GGML_MAX_N_THREADS];
     struct ggml_threadpool * threadpool;
     int ith;

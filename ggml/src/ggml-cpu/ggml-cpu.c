@@ -452,27 +452,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #include "ggml-cpu-threads.h"
 
-// Helpers for polling loops
-#if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
-static inline void ggml_thread_cpu_relax(void) {
-    __asm__ volatile("yield" ::: "memory");
-}
-#elif defined(__x86_64__)
-static inline void ggml_thread_cpu_relax(void) {
-    _mm_pause();
-}
-#elif defined(__riscv)
-static inline void ggml_thread_cpu_relax(void) {
-    #ifdef __riscv_zihintpause
-        __asm__ __volatile__ ("pause");
-    #else
-        /* Encoding of the pause instruction */
-        __asm__ __volatile__ (".4byte 0x100000F");
-    #endif
-}
-#else
-static inline void ggml_thread_cpu_relax(void) {;}
-#endif
+// ggml_thread_cpu_relax() is defined in ggml-cpu-threads.h (shared with HPX impl)
 
 //
 // NUMA support

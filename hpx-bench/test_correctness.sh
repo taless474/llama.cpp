@@ -68,22 +68,20 @@ run_inference() {
         --single-turn    \
         --log-disable    \
         2>/dev/null \
+        | col -b \
         | grep -v '^\[.*t/s.*\]' \
+        | grep -v '^Loading model' \
         > "$outfile"
 }
 
 # ── Model detection ───────────────────────────────────────────────────────────
 
-if [[ $# -ge 1 && -f "$1" ]]; then
-    MODEL="$1"
-else
-    MODEL=$(find ./models -name "*.gguf" -not -name "*.part*" | sort | head -1 || true)
-    if [[ -z "$MODEL" ]]; then
-        echo "ERROR: no .gguf model found."
-        echo "Pass the model path as the first argument, or place a .gguf in ./models/"
-        exit 1
-    fi
+if [[ $# -lt 1 || ! -f "$1" ]]; then
+    echo "Usage: $0 <model.gguf> [n_tokens]"
+    echo "Example: $0 models/llama3.1-8b/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+    exit 1
 fi
+MODEL="$1"
 
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 

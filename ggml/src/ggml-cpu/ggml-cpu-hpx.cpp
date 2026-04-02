@@ -27,6 +27,7 @@
 
 #include <hpx/future.hpp>
 #include <hpx/init.hpp>
+#include <hpx/modules/program_options.hpp>
 #include <hpx/synchronization/barrier.hpp>
 
 // ── Accessor helpers ──────────────────────────────────────────────────────────
@@ -44,27 +45,29 @@ static hpx::barrier<> & tp_barrier(ggml_threadpool * tp) {
     return *static_cast<hpx::barrier<> *>(tp->hpx_barrier);
 }
 
-// ── HPX runtime singleton ─────────────────────────────────────────────────────
+// ── HPX runtime lifecycle ─────────────────────────────────────────────────────
 //
-// Constructed at static-init time (before main()), destroyed at exit.
-// The (void)g_hpx_runtime reference in ggml_threadpool_new_impl_hpx prevents
-// the linker from dead-stripping this TU.
+// HPX is started once per process on the first ggml_threadpool_new call and is
+// NOT stopped from ggml_threadpool_free.  Stopping from free() broke the
+// disposable-threadpool pattern used by ggml_graph_compute(): a temporary pool
+// can be created, freed, and another created later — but std::once_flag would
+// prevent a second hpx::start(), leaving the second pool with no live runtime.
+//
+// Instead HPX shuts down via the atexit handler it registers internally.  The
+// lambda passed to hpx::start returns 0 so the atexit handler calls exit(0)
+// rather than the default exit(-1) that HPX uses when no user function is given.
 
 namespace {
 
-struct HpxRuntime {
-    HpxRuntime() {
+std::once_flag g_hpx_start_flag;
+
+void hpx_start_once() {
+    std::call_once(g_hpx_start_flag, []() {
         hpx::init_params p;
-        hpx::start(nullptr, 0, nullptr, p);
-    }
-
-    ~HpxRuntime() {
-        hpx::finalize();
-        hpx::stop();
-    }
-};
-
-static HpxRuntime g_hpx_runtime;  // NOLINT(cert-err58-cpp)
+        hpx::start([](hpx::program_options::variables_map&) -> int { return 0; },
+                   0, nullptr, p);
+    });
+}
 
 }  // namespace
 
@@ -77,52 +80,81 @@ extern "C" void ggml_barrier(ggml_threadpool * tp) {
     if (n_threads == 1) {
         return;
     }
+    // hpx::barrier::arrive_and_wait() throws HPX(invalid_status) if called from
+    // a non-HPX thread or after the runtime has been finalized (e.g. during
+    // static-destructor teardown).  All actual compute is complete by then, so
+    // silently skip the barrier in that case.
+    if (!hpx::is_running()) {
+        return;
+    }
     tp_barrier(tp).arrive_and_wait();
 }
 
 // ── Worker loop (persistent workers 1..N-1) ───────────────────────────────────
 
-// Wait until a new graph is kicked, the pool is stopped, or pause is cleared.
-// Returns state->pending.
+// Detect a new graph and update state->pending / state->last_graph atomically.
+// Returns true if a new graph counter was observed.
+// Shared by both the spin-poll phase and the condvar-wait predicate.
+static bool hpx_note_new_graph_if_any(ggml_compute_state * state) {
+    ggml_threadpool * tp = state->threadpool;
+    int ng = tp->n_graph.load(std::memory_order_relaxed);
+    if (ng != state->last_graph) {
+        int n_threads     = ng & GGML_THREADPOOL_N_THREADS_MASK;
+        state->pending    = (state->ith < n_threads);
+        state->last_graph = ng;
+        return true;
+    }
+    return false;
+}
+
+// Wait for new work (or stop).  Returns true if a new graph was detected,
+// false if stop was set.  Workers inactive for a graph (pending == false)
+// still return true so they loop back and wait for the next graph.
+//
+// Mirrors pthread ggml_graph_compute_poll_for_work() + check_for_work():
+//   Phase 1 — spin-poll for up to 1024*128*poll iterations (tp->poll == 0 → skip)
+//   Phase 2 — block on condvar
 static bool hpx_check_for_work(ggml_compute_state * state) {
     ggml_threadpool * tp = state->threadpool;
+
+    // ── Phase 1: spin-poll ────────────────────────────────────────────────────
+    const uint64_t n_rounds = 1024ULL * 128 * tp->poll;
+    for (uint64_t i = 0; i < n_rounds; i++) {
+        if (tp->stop.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (tp->pause.load(std::memory_order_relaxed)) {
+            break;  // fall through to condvar; pause may lift later
+        }
+        if (hpx_note_new_graph_if_any(state)) {
+            // seq-cst fence — mirrors ggml_graph_compute_thread_sync()
+            tp->n_graph.fetch_add(0, std::memory_order_seq_cst);
+            return true;
+        }
+        ggml_thread_cpu_relax();
+    }
+
+    // ── Phase 2: condvar-wait ─────────────────────────────────────────────────
     std::unique_lock<std::mutex> lk(tp_mutex(tp));
     tp_cond(tp).wait(lk, [&] {
-        if (tp->stop.load(std::memory_order_relaxed) || tp->pause.load(std::memory_order_relaxed)) {
-            return true;
-        }
-        int ng = tp->n_graph.load(std::memory_order_relaxed);
-        if (ng != state->last_graph) {
-            int n_threads     = ng & GGML_THREADPOOL_N_THREADS_MASK;
-            state->pending    = (state->ith < n_threads);
-            state->last_graph = ng;
-            return true;
-        }
-        return false;
+        if (tp->stop.load(std::memory_order_relaxed))  return true;
+        if (tp->pause.load(std::memory_order_relaxed)) return false;
+        return hpx_note_new_graph_if_any(state);
     });
-    return state->pending;
+    return !tp->stop.load(std::memory_order_relaxed);
 }
 
 // Persistent HPX task body for workers 1..N-1.
+// Mirrors the pthread secondary thread: alive until stop, inactive graphs are
+// skipped (pending == false), not treated as a termination signal.
 static void hpx_worker_thread(ggml_compute_state * state) {
-    while (true) {
-        // Wait while paused.
-        {
-            std::unique_lock<std::mutex> lk(tp_mutex(state->threadpool));
-            tp_cond(state->threadpool).wait(lk, [&] {
-                return !state->threadpool->pause.load(std::memory_order_relaxed);
-            });
-        }
-
-        if (state->threadpool->stop.load(std::memory_order_relaxed)) {
-            break;
-        }
-
-        hpx_check_for_work(state);
+    while (hpx_check_for_work(state)) {
         if (state->pending) {
             state->pending = false;
             ggml_graph_compute_thread(state);
         }
+        // pending == false: this worker was not needed for this graph.
+        // Loop back and wait for the next one.
     }
 }
 
@@ -135,8 +167,12 @@ static void ggml_graph_compute_kickoff_hpx(ggml_threadpool * tp, int n_threads) 
     n_graph     = ((n_graph + 1) << GGML_THREADPOOL_N_THREADS_BITS) | (n_threads & GGML_THREADPOOL_N_THREADS_MASK);
     tp->n_graph.store(n_graph, std::memory_order_seq_cst);
 
-    // hpx::barrier count is fixed at construction; recreate when n_threads changes.
-    // Cheap: once per graph dispatch, not per node barrier.
+    // hpx::barrier<> has a fixed participant count set at construction.  We
+    // recreate it each dispatch because n_threads can vary between graphs —
+    // the participant count must match exactly or arrive_and_wait() will
+    // deadlock or throw.  The previous barrier is fully retired before kickoff
+    // is called: fut0.get() returns only after every participant has exited
+    // arrive_and_wait(), so the delete here does not race with any live caller.
     delete static_cast<hpx::barrier<> *>(tp->hpx_barrier);
     tp->hpx_barrier = new hpx::barrier<>(static_cast<std::ptrdiff_t>(n_threads));
 
@@ -171,7 +207,7 @@ extern "C" enum ggml_status ggml_graph_compute_hpx(struct ggml_cgraph     * /*cg
 
 static ggml_threadpool * ggml_threadpool_new_impl_hpx(
     ggml_threadpool_params * tpp, ggml_cgraph * cgraph, ggml_cplan * cplan) {
-    (void) g_hpx_runtime;  // keep TU alive — prevents linker dead-stripping
+    hpx_start_once();
 
     auto * tp = static_cast<ggml_threadpool *>(ggml_aligned_malloc(sizeof(ggml_threadpool)));
     memset(tp, 0, sizeof(*tp));
@@ -244,6 +280,7 @@ extern "C" void ggml_threadpool_free(ggml_threadpool * tp) {
     const size_t wsz = sizeof(ggml_compute_state) * tp->n_threads;
     ggml_aligned_free(tp->workers, wsz);
     ggml_aligned_free(tp, sizeof(ggml_threadpool));
+    // HPX runtime is NOT stopped here — see hpx_start_once() for rationale.
 }
 
 // ── pause / resume ────────────────────────────────────────────────────────────

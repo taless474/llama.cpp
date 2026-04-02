@@ -229,6 +229,103 @@ static float run_add_chain(int n, float val, int chain_len,
     return sum / sample_n;
 }
 
+/* ── helpers: mul_mat ───────────────────────────────────────────────────── */
+
+static float pattern_a(int k, int m) {
+    /* exactly representable-ish small values */
+    int v = ((k * 17 + m * 13) % 19) - 9;
+    return 0.125f * (float)v;
+}
+
+static float pattern_b(int k, int n) {
+    int v = ((k * 11 + n * 7) % 23) - 11;
+    return 0.125f * (float)v;
+}
+
+/* Run C = A^T * B via ggml_mul_mat(A, B)
+ *
+ * A shape: [K, M]
+ * B shape: [K, N]
+ * C shape: [M, N]
+ *
+ * We use A=F16 and B=F32 so this exercises a more realistic ggml_mul_mat path:
+ *   - vec_dot on non-F32 src0
+ *   - src1 conversion path when vec_dot_type != src1->type
+ *
+ * Returns the maximum absolute error vs a scalar reference computed from the
+ * *stored* tensor values, so fp16 rounding in A is accounted for.
+ */
+static float run_mul_mat_max_err(
+    int K, int M, int N,
+    int n_threads,
+    struct ggml_threadpool *tp)
+{
+    size_t mem = (size_t)(K * M * 8 + K * N * 8 + M * N * 8) + 8 * 1024 * 1024;
+
+    struct ggml_init_params init = {
+        .mem_size   = mem,
+        .mem_buffer = NULL,
+        .no_alloc   = false,
+    };
+    struct ggml_context *ctx = ggml_init(init);
+
+    struct ggml_tensor *A = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, M);
+    struct ggml_tensor *B = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+
+    /* Fill A[k,m], B[k,n] */
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            ggml_set_f32_1d(A, m * K + k, pattern_a(k, m));
+        }
+    }
+
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+            ggml_set_f32_1d(B, n * K + k, pattern_b(k, n));
+        }
+    }
+
+    struct ggml_tensor *C = ggml_mul_mat(ctx, A, B);
+
+    struct ggml_cgraph *gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, C);
+
+    struct ggml_cplan plan = ggml_graph_plan(gf, n_threads, tp);
+    uint8_t *work = NULL;
+    if (plan.work_size > 0) {
+        work = malloc(plan.work_size);
+        plan.work_data = work;
+    }
+
+    enum ggml_status st = ggml_graph_compute(gf, &plan);
+    CHECK(st == GGML_STATUS_SUCCESS, "mul_mat graph_compute status OK");
+
+    float max_err = 0.0f;
+
+    /* Scalar reference: ref[m,n] = sum_k A[k,m] * B[k,n]
+     * Use stored tensor values so fp16 rounding in A is reflected. */
+    for (int n = 0; n < N; ++n) {
+        for (int m = 0; m < M; ++m) {
+            float ref = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                float a = ggml_get_f32_nd(A, k, m, 0, 0);
+                float b = ggml_get_f32_nd(B, k, n, 0, 0);
+                ref += a * b;
+            }
+
+            float got = ggml_get_f32_nd(C, m, n, 0, 0);
+            float err = fabsf(got - ref);
+            if (err > max_err) {
+                max_err = err;
+            }
+        }
+    }
+
+    free(work);
+    ggml_free(ctx);
+    return max_err;
+}
+
 /* ── Test 7: barrier correctness ─────────────────────────────────────────── */
 /* A chain of 10 adds creates 10 graph nodes → 10 barrier cycles per dispatch.
  * A broken barrier lets threads race into the next node before the previous
@@ -386,6 +483,96 @@ static void test_disposable_threadpool(void)
     ggml_free(ctx);
 }
 
+/* ── Test 12: mul_mat correctness across thread counts ─────────────────── */
+
+static void test_mul_mat_correctness(void)
+{
+    const int K = 1024;
+    const int M = 192;
+    const int N = 96;
+
+    int thread_counts[] = {1, 2, 4, 8};
+    for (int i = 0; i < 4; ++i) {
+        int t = thread_counts[i];
+        struct ggml_threadpool_params p = ggml_threadpool_params_default(t);
+        struct ggml_threadpool *tp = ggml_threadpool_new(&p);
+
+        float max_err = run_mul_mat_max_err(K, M, N, t, tp);
+        CHECK(max_err < 1e-2f, "mul_mat: max abs error within tolerance");
+
+        ggml_threadpool_free(tp);
+    }
+}
+
+/* ── Test 13: mul_mat same pool, repeated t=2 dispatches ───────────────── */
+
+static void test_mul_mat_stress_t2(void)
+{
+    const int K = 1024;
+    const int M = 192;
+    const int N = 96;
+    const int RUNS = 50;
+
+    struct ggml_threadpool_params p = ggml_threadpool_params_default(2);
+    struct ggml_threadpool *tp = ggml_threadpool_new(&p);
+
+    for (int i = 0; i < RUNS; ++i) {
+        float max_err = run_mul_mat_max_err(K, M, N, 2, tp);
+        CHECK(max_err < 1e-2f, "mul_mat stress t=2: max abs error within tolerance");
+    }
+
+    ggml_threadpool_free(tp);
+}
+
+/* ── Test 14: barrier/thread-count churn ─────────────────────────────────── */
+/* Same persistent pool, thousands of dispatches, changing n_threads each time.
+ * This stresses:
+ *   - barrier recreation / reuse semantics
+ *   - n_graph packing/unpacking
+ *   - worker lifetime across inactive graphs
+ */
+
+static void test_barrier_thread_count_churn(void)
+{
+    const int ITERS     = 5000;
+    const int N         = 16 * 1024;
+    const int CHAIN_LEN = 6;
+    const float VAL     = 1.0f;
+    const float EXPECTED = (float)(CHAIN_LEN + 1) * VAL; /* 7.0 */
+
+    int max_t = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (max_t < 4) max_t = 4;
+    if (max_t > 10) max_t = 10;   /* keep runtime bounded */
+
+    struct ggml_threadpool_params p = ggml_threadpool_params_default(max_t);
+    struct ggml_threadpool *tp = ggml_threadpool_new(&p);
+
+    for (int i = 0; i < ITERS; ++i) {
+        int t;
+        switch (i % 8) {
+            case 0: t = 1; break;
+            case 1: t = max_t; break;
+            case 2: t = 2; break;
+            case 3: t = max_t - 1; break;
+            case 4: t = 4; break;
+            case 5: t = max_t; break;
+            case 6: t = 3; break;
+            default: t = 1; break;
+        }
+
+        float result = run_add_chain(N, VAL, CHAIN_LEN, t, tp);
+        if (fabsf(result - EXPECTED) >= 1e-2f) {
+            printf("  FAIL  churn iter=%d t=%d got=%f expected=%f\n",
+                   i, t, result, EXPECTED);
+            ggml_threadpool_free(tp);
+            fail("barrier/thread-count churn");
+        }
+    }
+
+    ggml_threadpool_free(tp);
+    pass("barrier/thread-count churn: 5000 dispatches with changing n_threads");
+}
+
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -408,6 +595,11 @@ int main(void)
     test_stress();
     test_thread_count_edges();
     test_disposable_threadpool();
+    test_barrier_thread_count_churn();
+
+    printf("\n── mul_mat-focused tests ──\n");
+    test_mul_mat_correctness();
+    test_mul_mat_stress_t2();
 
     printf("\nAll tests passed.\n\n");
     return 0;
