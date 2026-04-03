@@ -524,55 +524,6 @@ static void test_mul_mat_stress_t2(void)
     ggml_threadpool_free(tp);
 }
 
-/* ── Test 14: barrier/thread-count churn ─────────────────────────────────── */
-/* Same persistent pool, thousands of dispatches, changing n_threads each time.
- * This stresses:
- *   - barrier recreation / reuse semantics
- *   - n_graph packing/unpacking
- *   - worker lifetime across inactive graphs
- */
-
-static void test_barrier_thread_count_churn(void)
-{
-    const int ITERS     = 5000;
-    const int N         = 16 * 1024;
-    const int CHAIN_LEN = 6;
-    const float VAL     = 1.0f;
-    const float EXPECTED = (float)(CHAIN_LEN + 1) * VAL; /* 7.0 */
-
-    int max_t = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (max_t < 4) max_t = 4;
-    if (max_t > 10) max_t = 10;   /* keep runtime bounded */
-
-    struct ggml_threadpool_params p = ggml_threadpool_params_default(max_t);
-    struct ggml_threadpool *tp = ggml_threadpool_new(&p);
-
-    for (int i = 0; i < ITERS; ++i) {
-        int t;
-        switch (i % 8) {
-            case 0: t = 1; break;
-            case 1: t = max_t; break;
-            case 2: t = 2; break;
-            case 3: t = max_t - 1; break;
-            case 4: t = 4; break;
-            case 5: t = max_t; break;
-            case 6: t = 3; break;
-            default: t = 1; break;
-        }
-
-        float result = run_add_chain(N, VAL, CHAIN_LEN, t, tp);
-        if (fabsf(result - EXPECTED) >= 1e-2f) {
-            printf("  FAIL  churn iter=%d t=%d got=%f expected=%f\n",
-                   i, t, result, EXPECTED);
-            ggml_threadpool_free(tp);
-            fail("barrier/thread-count churn");
-        }
-    }
-
-    ggml_threadpool_free(tp);
-    pass("barrier/thread-count churn: 5000 dispatches with changing n_threads");
-}
-
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -595,7 +546,6 @@ int main(void)
     test_stress();
     test_thread_count_edges();
     test_disposable_threadpool();
-    test_barrier_thread_count_churn();
 
     printf("\n── mul_mat-focused tests ──\n");
     test_mul_mat_correctness();

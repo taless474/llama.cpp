@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Users/unick/Desktop/hpx/llama-hpx/hpx-bench/build-pthread/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
