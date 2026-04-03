@@ -1,3 +1,26 @@
+# HPX Backend Experiments for llama.cpp
+
+This fork explores an HPX-backed thread-pool path for ggml/llama.cpp CPU inference.
+
+## What this fork changes
+- HPX-based ggml thread-pool implementation
+- correctness and stress tests
+- dispatch-overhead and reuse benchmarks
+
+## Current findings
+- HPX works functionally on many ggml workloads
+- tiny repeated CPU dispatches exposed large orchestration overhead
+- a major reusable-dispatch stall was traced to an OS-thread-blocking wait path in HPX workers
+
+## Key files
+- `ggml/src/ggml-cpu/ggml-cpu-hpx.cpp`
+- `hpx-bench/`
+- `docs/HPX_BENCHMARK_PLAN.md`
+
+## Upstream
+This repository is a fork of `ggml-org/llama.cpp`.
+
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)

@@ -29,6 +29,7 @@
 #include <hpx/init.hpp>
 #include <hpx/modules/program_options.hpp>
 #include <hpx/synchronization/barrier.hpp>
+#include <hpx/thread.hpp>
 
 // ── Accessor helpers ──────────────────────────────────────────────────────────
 // hpx_mutex / hpx_cond are std::mutex* / std::condition_variable* in this impl.
@@ -118,30 +119,45 @@ static bool hpx_check_for_work(ggml_compute_state * state) {
     ggml_threadpool * tp = state->threadpool;
 
     // ── Phase 1: spin-poll ────────────────────────────────────────────────────
+    // Fast path for frequent back-to-back dispatches: workers stay hot in a
+    // tight spin so they detect n_graph updates without lock overhead.
     const uint64_t n_rounds = 1024ULL * 128 * tp->poll;
     for (uint64_t i = 0; i < n_rounds; i++) {
         if (tp->stop.load(std::memory_order_relaxed)) {
             return false;
         }
         if (tp->pause.load(std::memory_order_relaxed)) {
-            break;  // fall through to condvar; pause may lift later
+            break;  // fall through to Phase 2; pause may lift later
         }
         if (hpx_note_new_graph_if_any(state)) {
-            // seq-cst fence — mirrors ggml_graph_compute_thread_sync()
             tp->n_graph.fetch_add(0, std::memory_order_seq_cst);
             return true;
         }
         ggml_thread_cpu_relax();
     }
 
-    // ── Phase 2: condvar-wait ─────────────────────────────────────────────────
-    std::unique_lock<std::mutex> lk(tp_mutex(tp));
-    tp_cond(tp).wait(lk, [&] {
-        if (tp->stop.load(std::memory_order_relaxed))  return true;
-        if (tp->pause.load(std::memory_order_relaxed)) return false;
-        return hpx_note_new_graph_if_any(state);
-    });
-    return !tp->stop.load(std::memory_order_relaxed);
+    // ── Phase 2: HPX-cooperative yield ────────────────────────────────────────
+    // std::condition_variable::wait() would block the underlying OS thread,
+    // removing it from HPX's pool.  With workers 1..N-1 all sleeping, HPX has
+    // no OS thread left to schedule worker 0; hpx::barrier never gets its N-th
+    // arrival → permanent stall.
+    //
+    // Instead: re-check the condition under the lock for memory visibility, then
+    // call hpx::this_thread::yield().  This suspends only the HPX *task*, not
+    // the OS thread, so the OS thread stays available for worker 0.
+    // kickoff/pause/resume still call notify_all() for forward compatibility;
+    // the yield loop is self-rescheduling without it.
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(tp_mutex(tp));
+            if (tp->stop.load(std::memory_order_relaxed))  return false;
+            if (!tp->pause.load(std::memory_order_relaxed) &&
+                    hpx_note_new_graph_if_any(state)) {
+                return true;
+            }
+        }
+        hpx::this_thread::yield();
+    }
 }
 
 // Persistent HPX task body for workers 1..N-1.

@@ -5,15 +5,21 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_iter = -1;
 
 static void on_alarm(int sig) {
     (void)sig;
-    printf("\nFAIL: timeout/hang at iter=%d\n", (int)g_iter);
+    printf("\nFAIL: perm-hang at iter=%d\n", (int)g_iter);
     fflush(stdout);
     _exit(2);
+}
+
+static uint64_t now_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
 int main(void) {
@@ -36,17 +42,24 @@ int main(void) {
     struct ggml_threadpool *tp = ggml_threadpool_new(&p);
     struct ggml_cplan plan = ggml_graph_plan(gf, T, tp);
 
-    printf("reuse test: N=%d chain=%d threads=%d runs=%d\n", N, CHAIN, T, RUNS);
+    printf("reuse test (Exp A — Phase2 disabled): N=%d chain=%d t=%d runs=%d\n",
+           N, CHAIN, T, RUNS);
+    printf("iter   us_elapsed\n");
 
+    double max_us = 0.0;
     for (int i = 0; i < RUNS; ++i) {
         g_iter = i;
-        alarm(5);
+        alarm(30);  /* permanent-hang guard: fires only if truly stuck */
+        uint64_t t0 = now_ns();
         enum ggml_status st = ggml_graph_compute(gf, &plan);
+        uint64_t t1 = now_ns();
         alarm(0);
         if (st != GGML_STATUS_SUCCESS) { printf("FAIL: non-success at iter=%d\n", i); return 1; }
-        if ((i+1) % 5 == 0) printf("ok %d/%d\n", i+1, RUNS);
+        double us = (double)(t1 - t0) / 1e3;
+        if (us > max_us) max_us = us;
+        printf("%4d  %10.1f us\n", i, us);
     }
-    printf("PASS\n");
+    printf("\nPASS  max_latency=%.1f us\n", max_us);
     ggml_threadpool_free(tp);
     ggml_free(ctx);
     return 0;

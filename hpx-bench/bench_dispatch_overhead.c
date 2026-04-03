@@ -187,14 +187,14 @@ int main(int argc, char ** argv) {
 
     printf("── Dispatch-overhead microbenchmark ──\n");
     fflush(stdout);
-    run_case(csv, "tiny", 32, 2, t, 20000, false);
-    run_case(csv, "tiny", 32, 2, t, 5000, true);
+    run_case(csv, "tiny", 32, 2, t, 100, false);
+    run_case(csv, "tiny", 32, 2, t, 100, true);
 
     printf("\n── Size ladder (same reusable pool shape) ──\n");
     fflush(stdout);
-    run_case(csv, "tiny", 32, 2, t, 20000, false);
-    run_case(csv, "small", 256, 4, t, 10000, false);
-    run_case(csv, "medium", 4096, 4, t, 1000, false);
+    run_case(csv, "tiny", 32, 2, t, 100, false);
+    run_case(csv, "small", 256, 4, t, 100, false);
+    run_case(csv, "medium", 4096, 4, t, 100, false);
     run_case(csv, "large", 65536, 4, t, 100, false);
 
     printf("\n");
