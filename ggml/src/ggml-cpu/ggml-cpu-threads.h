@@ -90,10 +90,8 @@ struct ggml_threadpool {
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done; holds graph and active thread counts
-#if !defined(GGML_USE_HPX)
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
-#endif
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads
 
     // these are atomic as an annotation for thread-sanitizer
@@ -108,11 +106,6 @@ struct ggml_threadpool {
 
     enum ggml_status ec;
 
-#if defined(GGML_USE_HPX)
-    void * hpx_mutex;         // std::mutex*              (callable from any thread)
-    void * hpx_cond;          // std::condition_variable* (callable from any thread)
-    void * hpx_barrier;       // hpx::barrier<>*          (HPX threads only)
-#endif
 };
 
 // ── Per-thread state ──────────────────────────────────────────────────────────
@@ -120,9 +113,6 @@ struct ggml_threadpool {
 struct ggml_compute_state {
 #if !defined(GGML_USE_OPENMP) && !defined(GGML_USE_HPX)
     ggml_thread_t thrd;
-#endif
-#if defined(GGML_USE_HPX)
-    void * hpx_future;        // hpx::future<void>*
 #endif
 #if !defined(GGML_USE_OPENMP)
     int  last_graph;
