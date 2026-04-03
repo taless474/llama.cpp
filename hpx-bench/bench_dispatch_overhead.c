@@ -164,13 +164,26 @@ int main(int argc, char ** argv) {
         }
     }
 
+    /* CSV path: use explicit arg, or auto-generate a timestamped name. */
+    char auto_csv_path[256];
     const char * csv_path = NULL;
     if (argc >= 3) {
         csv_path = argv[2];
+    } else {
+#ifndef BENCH_BACKEND
+#define BENCH_BACKEND "unknown"
+#endif
+        time_t now = time(NULL);
+        struct tm * tm_info = localtime(&now);
+        ensure_dir("results");
+        strftime(auto_csv_path, sizeof(auto_csv_path),
+                 "results/bench_dispatch_overhead_" BENCH_BACKEND "_%Y%m%d_%H%M%S.csv",
+                 tm_info);
+        csv_path = auto_csv_path;
     }
 
     FILE * csv = NULL;
-    if (csv_path) {
+    {
         ensure_dir("results");
         csv = fopen(csv_path, "w");
         if (!csv) {
@@ -179,6 +192,7 @@ int main(int argc, char ** argv) {
         }
         fprintf(csv, "label,mode,threads,runs,n,chain,total_ms,us_per_dispatch\n");
         fflush(csv);
+        printf("saving CSV → %s\n", csv_path);
     }
 
     printf("\n=== dispatch overhead / size ladder ===\n");

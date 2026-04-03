@@ -41,9 +41,7 @@
 /lcov-report/
 
 # HPX Benchmark
-/results/
 /hpx-bench/build*/
-/local/results/
 /hpx-bench/results/
 
 # Build Artifacts

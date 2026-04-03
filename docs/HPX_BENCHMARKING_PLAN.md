@@ -18,10 +18,6 @@ This pair answers: **is HPX competitive when the thread pool is responsible for 
 ---
 
 ## Repository structure
-
-```
-## Repository structure
-
 ```text
 llama-hpx/
 ├── README.md                          ← main project README (modified)
@@ -40,22 +36,21 @@ llama-hpx/
 │   ├── templates/
 │   ├── README.md                      ← download instructions for benchmark models
 │   └── llama3.1-8b/                   ← gitignored, download manually
-├── hpx-bench/
-│   ├── CMakeLists.txt                 ← benchmark/test build definitions
-│   ├── benchmark.sh                   ← benchmark runner
-│   ├── test_correctness.sh            ← correctness/stress test runner
-│   ├── bench_dispatch_overhead.c
-│   ├── test_ggml_threadpool.c
-│   ├── test_ggml_threadpool_common.h
-│   ├── test_hpx_primitives.cpp
-│   ├── ...                            ← additional targeted repro/stress tests
-│   ├── build-pthread/                 ← pthreads + BLAS ON
-│   ├── build-pthread-noblas/          ← pthreads + BLAS OFF
-│   ├── build-hpx/                     ← HPX + BLAS ON
-│   └── build-hpx-noblas/              ← HPX + BLAS OFF
-└── results/                           ← gitignored benchmark outputs, if kept at repo root
+└── hpx-bench/
+    ├── CMakeLists.txt                 ← benchmark/test build definitions
+    ├── benchmark.sh                   ← benchmark runner
+    ├── test_correctness.sh            ← correctness/stress test runner
+    ├── bench_dispatch_overhead.c
+    ├── test_ggml_threadpool.c
+    ├── test_ggml_threadpool_common.h
+    ├── test_hpx_primitives.cpp
+    ├── ...                            ← additional targeted repro/stress tests
+    ├── results/                       ← gitignored benchmark outputs
+    ├── build-pthread/                 ← pthreads + BLAS ON
+    ├── build-pthread-noblas/          ← pthreads + BLAS OFF
+    ├── build-hpx/                     ← HPX + BLAS ON
+    └── build-hpx-noblas/              ← HPX + BLAS OFF
 ```
-
 ---
 
 ## Threading model in ggml-cpu.c

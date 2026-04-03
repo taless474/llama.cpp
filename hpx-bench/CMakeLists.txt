@@ -19,6 +19,10 @@ target_link_libraries(test_hpx_primitives PRIVATE HPX::hpx HPX::wrap_main)
 if(DEFINED GGML_BUILD_DIR)
     set(_bd "${GGML_BUILD_DIR}")
 
+    # Derive a short backend label from the build directory name for CSV filenames.
+    get_filename_component(_bd_name "${_bd}" NAME)
+    set(BENCH_BACKEND "${_bd_name}" CACHE STRING "Backend label for CSV output filenames")
+
     add_executable(test_ggml_threadpool test_ggml_threadpool.c)
 
     target_include_directories(test_ggml_threadpool PRIVATE
@@ -62,6 +66,7 @@ if(DEFINED GGML_BUILD_DIR)
         ${CMAKE_SOURCE_DIR}/../ggml/include
         ${CMAKE_SOURCE_DIR}/../include
     )
+    target_compile_definitions(bench_dispatch_overhead PRIVATE BENCH_BACKEND="${BENCH_BACKEND}")
     target_link_directories(bench_dispatch_overhead PRIVATE ${_bd}/bin)
     target_link_libraries(bench_dispatch_overhead PRIVATE ggml-cpu ggml-base ggml m)
     set_target_properties(bench_dispatch_overhead PROPERTIES BUILD_RPATH "${_bd}/bin")
@@ -89,6 +94,16 @@ if(DEFINED GGML_BUILD_DIR)
     add_ggml_test(test_mul_mat_variable_thread_counts_same_pool test_mul_mat_variable_thread_counts_same_pool.c)
     add_ggml_test(test_pause_resume_stress                test_pause_resume_stress.c)
     add_ggml_test(test_two_pools_isolation                test_two_pools_isolation.c)
+
+    add_executable(bench_mul_mat bench_mul_mat.c)
+    target_include_directories(bench_mul_mat PRIVATE
+        ${CMAKE_SOURCE_DIR}/../ggml/include
+        ${CMAKE_SOURCE_DIR}/../include
+    )
+    target_compile_definitions(bench_mul_mat PRIVATE BENCH_BACKEND="${BENCH_BACKEND}")
+    target_link_directories(bench_mul_mat PRIVATE ${_bd}/bin)
+    target_link_libraries(bench_mul_mat PRIVATE ggml-cpu ggml-base ggml m)
+    set_target_properties(bench_mul_mat PROPERTIES BUILD_RPATH "${_bd}/bin")
 
 else()
     message(STATUS "test_ggml_threadpool: skipped (set -DGGML_BUILD_DIR=<path>)")
