@@ -7,10 +7,19 @@
 //   Chunk fn:      check only, return early — never resets the token
 //   Post-dispatch: observe-and-consume (same as entry)
 //
-// The chunk fns are stubs: they validate bounds, touch one byte of scratch
-// per chunk to prove execution was reached, and return without running ggml
-// ops. The scratch write is not thread-safe across chunks, but each chunk
-// writes only to its own offset (chunk_idx), so no two chunks alias.
+// Compute:
+//   Each chunk fn uses ggml_graph_view (ggml-impl.h) to present a
+//   region's node slice as a ggml_cgraph and then calls
+//   ggml_backend_graph_compute.  Both graph parameters are ggml_cgraph*
+//   (not const) because ggml_graph_view requires a non-const pointer.
+//
+// Prefill backend resolution:
+//   run_prefill resolves one backend per region before dispatch using
+//   ggml_backend_sched_get_tensor_backend on the region's first node.
+//   Mixed-backend regions are unsupported (no cross-backend tensor copy
+//   is implemented here).  A debug-build check asserts uniformity across
+//   every node in each region; a mismatch means the adapter diverged
+//   from the scheduler split structure.
 
 #include "ggml-hpx-exec.h"
 #include "ggml-hpx-abort.h"
@@ -19,9 +28,13 @@
 #include "ggml-hpx-plan.h"
 #include "ggml-hpx-runtime.h"
 
-#include "ggml.h"    // GGML_ASSERT
+#include "ggml-backend.h"    // ggml_backend_graph_compute,
+                             //   ggml_backend_sched_get_tensor_backend
+#include "ggml-impl.h"       // ggml_graph_view
+#include "ggml.h"            // GGML_ASSERT, ggml_status
 
 #include <cstdint>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Executor struct
@@ -87,18 +100,19 @@ struct decode_run_ctx
     ggml_hpx_decode_plan const*   plan     = nullptr;
     ggml_hpx_decode_backends      backends{};
     ggml_hpx_abort_token*         abort    = nullptr;
-    void*                         scratch  = nullptr;
+    ggml_cgraph*                  graph    = nullptr;
 };
 
 struct prefill_run_ctx
 {
-    ggml_hpx_prefill_plan const* plan    = nullptr;
-    ggml_hpx_abort_token*        abort   = nullptr;
-    void*                        scratch = nullptr;
+    ggml_hpx_prefill_plan const*  plan            = nullptr;
+    ggml_hpx_abort_token*         abort           = nullptr;
+    ggml_cgraph*                  graph           = nullptr;
+    ggml_backend_t const*         region_backends = nullptr;
 };
 
 // ---------------------------------------------------------------------------
-// Stub chunk fns
+// Chunk fns — real ggml compute
 // ---------------------------------------------------------------------------
 
 static void decode_chunk_fn(uint32_t chunk_idx, void* user_data)
@@ -115,19 +129,19 @@ static void decode_chunk_fn(uint32_t chunk_idx, void* user_data)
     ggml_hpx_region const& region = ctx->plan->regions[chunk_idx];
     GGML_ASSERT(region.node_begin <= region.node_end);
 
-    // Resolve which backend owns this region. API plumbing only —
-    // no subgraph construction or ggml_backend_graph_compute yet.
     ggml_backend_t const backend =
         backend_for_region(region, ctx->backends);
-    (void)backend;
 
-    // Touch scratch at this chunk's offset to prove the chunk was reached.
-    if (ctx->scratch != nullptr)
+    ggml_cgraph view = ggml_graph_view(
+        ctx->graph,
+        static_cast<int>(region.node_begin),
+        static_cast<int>(region.node_end));
+
+    ggml_status const st = ggml_backend_graph_compute(backend, &view);
+    if (st != GGML_STATUS_SUCCESS)
     {
-        static_cast<uint8_t*>(ctx->scratch)[chunk_idx] = 1;
+        ctx->abort->request();
     }
-
-    // No real ggml ops yet.
 }
 
 static void prefill_chunk_fn(uint32_t chunk_idx, void* user_data)
@@ -145,13 +159,18 @@ static void prefill_chunk_fn(uint32_t chunk_idx, void* user_data)
     GGML_ASSERT(region.node_begin <= region.node_end);
     GGML_ASSERT(region.node_end <= ctx->plan->topo.n_nodes);
 
-    // Touch scratch at this chunk's offset to prove the chunk was reached.
-    if (ctx->scratch != nullptr)
-    {
-        static_cast<uint8_t*>(ctx->scratch)[chunk_idx] = 1;
-    }
+    ggml_backend_t const backend = ctx->region_backends[chunk_idx];
 
-    // No real ggml ops yet.
+    ggml_cgraph view = ggml_graph_view(
+        ctx->graph,
+        static_cast<int>(region.node_begin),
+        static_cast<int>(region.node_end));
+
+    ggml_status const st = ggml_backend_graph_compute(backend, &view);
+    if (st != GGML_STATUS_SUCCESS)
+    {
+        ctx->abort->request();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +193,7 @@ static bool consume_abort(ggml_hpx_abort_token& token) noexcept
 
 ggml_hpx_exec_status ggml_hpx_exec_run_decode(
     ggml_hpx_exec*                  exec,
-    ggml_cgraph const*              graph,
+    ggml_cgraph*                    graph,
     ggml_hpx_decode_backends const& backends)
 {
     if (consume_abort(exec->abort))
@@ -207,13 +226,13 @@ ggml_hpx_exec_status ggml_hpx_exec_run_decode(
     }
 
     auto const n_chunks = static_cast<uint32_t>(plan->regions.size());
-    ggml_hpx_runtime_scratch_ensure(exec->runtime, n_chunks);
+    ggml_hpx_runtime_scratch_ensure(exec->runtime, plan->workspace_bytes);
 
     decode_run_ctx ctx{};
     ctx.plan     = plan;
     ctx.backends = backends;
     ctx.abort    = &exec->abort;
-    ctx.scratch  = ggml_hpx_runtime_scratch_ptr(exec->runtime);
+    ctx.graph    = graph;
     ggml_hpx_runtime_dispatch_decode(
         exec->runtime, n_chunks, decode_chunk_fn, &ctx);
 
@@ -226,8 +245,7 @@ ggml_hpx_exec_status ggml_hpx_exec_run_decode(
 }
 
 ggml_hpx_exec_status ggml_hpx_exec_run_prefill(
-    ggml_hpx_exec* exec, ggml_cgraph const* graph,
-    ggml_backend_sched_t sched)
+    ggml_hpx_exec* exec, ggml_cgraph* graph, ggml_backend_sched_t sched)
 {
     if (consume_abort(exec->abort))
     {
@@ -262,10 +280,53 @@ ggml_hpx_exec_status ggml_hpx_exec_run_prefill(
     }
 
     auto const n_chunks = static_cast<uint32_t>(plan->topo.regions.size());
-    ggml_hpx_runtime_scratch_ensure(exec->runtime, n_chunks);
 
-    prefill_run_ctx ctx{plan, &exec->abort,
-        ggml_hpx_runtime_scratch_ptr(exec->runtime)};
+    // Resolve one backend per region using the scheduler.
+    //
+    // Each region was built with backend identity as its grouping key, so
+    // all nodes within a region are assigned to the same backend.  We use
+    // node_begin to derive the representative backend for each region.
+    //
+    // Mixed-backend regions are not supported: no cross-backend tensor copy
+    // is implemented here.  The #ifndef NDEBUG block below verifies the
+    // uniformity assumption and fires a hard assertion if the adapter ever
+    // produces a mixed-backend region.
+    std::vector<ggml_backend_t> region_backends;
+    region_backends.reserve(n_chunks);
+
+    for (ggml_hpx_region const& region : plan->topo.regions)
+    {
+        ggml_backend_t const be = (region.node_begin < region.node_end)
+            ? ggml_backend_sched_get_tensor_backend(
+                sched, graph->nodes[region.node_begin])
+            : nullptr;
+        region_backends.push_back(be);
+    }
+
+#ifndef NDEBUG
+    for (uint32_t ri = 0; ri < n_chunks; ++ri)
+    {
+        ggml_hpx_region const& region   = plan->topo.regions[ri];
+        ggml_backend_t const   expected = region_backends[ri];
+        for (uint32_t ni = region.node_begin + 1; ni < region.node_end; ++ni)
+        {
+            ggml_backend_t const actual =
+                ggml_backend_sched_get_tensor_backend(sched,
+                    graph->nodes[ni]);
+            GGML_ASSERT(actual == expected &&
+                "prefill region has mixed-backend nodes: "
+                "cross-backend tensor copy is not implemented");
+        }
+    }
+#endif
+
+    ggml_hpx_runtime_scratch_ensure(exec->runtime, plan->workspace_bytes);
+
+    prefill_run_ctx ctx{};
+    ctx.plan            = plan;
+    ctx.abort           = &exec->abort;
+    ctx.graph           = graph;
+    ctx.region_backends = region_backends.data();
     ggml_hpx_runtime_dispatch_prefill(
         exec->runtime, n_chunks, prefill_chunk_fn, &ctx);
 

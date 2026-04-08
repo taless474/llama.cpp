@@ -133,7 +133,7 @@ The region definition was intentionally kept simple:
 - `type`
 - `node_begin`
 - `node_end`
-- `dep_mask`
+- `prev_idx`
 
 That is enough to express coarse execution structure without coupling region objects to runtime-specific policy.
 
@@ -892,3 +892,261 @@ The exec layer is now wired end-to-end with the correct context shape. The next 
 3. Handle the `ggml_backend_graph_compute` return value and surface errors through the abort/status path.
 
 After that, the prefill chunk function needs the same treatment, driven from the scheduler-split model: backend per split derived from `sched` at run time, not from a static bundle.
+
+## 2026-04-08: llama.cpp end-to-end HPX exec smoke integration
+
+### Summary
+
+This change moves the project from isolated `ggml-hpx-exec` correctness tests to a tiny end-to-end llama.cpp integration path.
+
+The HPX execution layer is now wired into `llama_context::graph_compute` behind an opt-in environment variable (`LLAMA_USE_HPX`) when `GGML_HPX` is enabled at build time. The goal of this milestone is correctness, not performance: prove that HPX-backed orchestration can replace the scheduler’s compute call on a CPU-only inference path and produce the same outputs as the reference path.
+
+The initial llama integration was validated with a model-backed smoke test that compares HPX and reference logits on the same prompt. The integration also exposed three correctness bugs in region/dependency handling, all of which were fixed in this milestone.
+
+### Integration point
+
+The single replacement point is `src/llama-context.cpp`, inside:
+
+- `llama_context::graph_compute(ggml_cgraph * gf, bool batched)`
+
+The existing thread/threadpool setup in `graph_compute` remains unchanged. The only behavioral change is that, when `LLAMA_USE_HPX` is set and `hpx_exec` exists, the function routes compute through `ggml-hpx-exec` instead of calling the scheduler’s normal compute path.
+
+Mapping is:
+
+- `batched == false` → `ggml_hpx_exec_run_decode(...)`
+- `batched == true`  → `ggml_hpx_exec_run_prefill(...)`
+
+This keeps the hook at the narrowest possible point: all existing graph construction and llama-side batching logic remain intact.
+
+### Public/API surface
+
+No permanent public llama API knob was added for this milestone.
+
+Instead:
+
+- `llama_context` owns an optional private `ggml_hpx_exec * hpx_exec`
+- the constructor reads `LLAMA_USE_HPX`
+- when enabled, it creates the HPX exec object
+- the destructor destroys it
+
+This keeps the integration off by default and avoids exposing unstable HPX-exec plumbing through the public API before the path is better understood.
+
+### Current compute behavior
+
+#### Decode
+
+Decode remains structurally simple:
+
+- adaptation/build/cache still run through `ggml-hpx-exec`
+- live backends are assembled per run
+- the backend bundle currently uses:
+  - `cpu = backend_cpu`
+  - `blas = nullptr`
+
+This means any `blas_delegated` decode region falls back to CPU execution for now. That is semantically correct and sufficient for the CPU-only smoke path.
+
+#### Prefill
+
+Prefill currently executes **sequentially** for correctness.
+
+Earlier versions launched all prefill regions in parallel with `hpx::async`, but this was incorrect for sequential graphs because later regions consumed activations that earlier regions had not finished producing. The dispatch was changed to a serial loop, matching decode behavior for now.
+
+This is intentional. Prefill parallelism now depends on explicit dependency-aware scheduling and should not be re-enabled until that logic exists.
+
+### Real compute in chunk functions
+
+This milestone completed the intended transition from stub chunk functions to real region execution:
+
+- chunk functions now build region views with `ggml_graph_view(...)`
+- chunk functions call `ggml_backend_graph_compute(...)`
+- backend failures request abort and surface as exec failure
+
+There is no per-node private compute-forward loop and no heap-copy subgraph construction.
+
+### Scheduler / allocation contract
+
+For the llama smoke path, the HPX branch in `graph_compute` now does:
+
+1. `ggml_backend_sched_reset(sched.get())`
+2. `ggml_backend_sched_alloc_graph(sched.get(), gf)`
+3. route to HPX exec
+
+This is correctness-first behavior. It is acceptable for a smoke/integration milestone, but it does give up graph-reuse efficiency because the scheduler is reset and allocation is re-established on each HPX compute call.
+
+The project still needs a cleaner long-term allocation contract (for example, an explicit public “ensure allocated” helper or equivalent state tracking), but that is out of scope for this change.
+
+### Bugs found and fixed during end-to-end integration
+
+#### Bug 1: artificial 64-region cap
+
+**Root cause**
+
+`ggml_hpx_region` used:
+
+- `dep_mask : uint64_t`
+
+This imposed an artificial region limit because the old code assumed a bitmask dependency encoding. Real LLM graphs produce far more than 64 backend transitions, especially on macOS where Accelerate/BLAS and host CPU buffers alternate frequently.
+
+**Fix**
+
+Replaced:
+
+- `dep_mask : uint64_t`
+
+with:
+
+- `prev_idx : uint32_t`
+
+where:
+
+- `UINT32_MAX` = no predecessor
+- otherwise `prev_idx` is the immediate predecessor region
+
+This removed:
+
+- `GGML_HPX_MAX_REGIONS`
+- `sequential_dep()`
+- the related static assertion
+- all bitmask-based assumptions
+
+This is a more honest representation of the current execution model: regions are presently consumed as a linear chain, not a general DAG.
+
+#### Bug 2: double `split_graph` in prefill adaptation
+
+**Root cause**
+
+`adapt_prefill(...)` originally called `split_graph(...)` internally.
+
+After llama integration, the caller was already doing `ggml_backend_sched_alloc_graph(...)`, which itself populates scheduler split state. Calling `split_graph(...)` again inside the adapter changed scheduler state after allocation and invalidated assumptions about split counts.
+
+**Fix**
+
+Removed the internal `split_graph(...)` call from `adapt_prefill(...)`.
+
+Prefill adaptation is now a **pure reader** of scheduler state. The caller is responsible for ensuring split/allocation state has already been populated before calling the adapter or `run_prefill(...)`.
+
+Tests that called `adapt_prefill(...)` directly were updated to populate split state explicitly first.
+
+#### Bug 3: invalid `regions.size() == expected_splits` assumption
+
+**Root cause**
+
+The old prefill region builder assumed that the number of contiguous backend regions would match the scheduler split count.
+
+That was only valid before allocation. After `alloc_graph(...)`, the scheduler may insert extra copy nodes for backend transfers. Those nodes can create additional backend-type boundaries without changing the original split count in the way the adapter expected.
+
+**Fix**
+
+Removed the invalid equality assertion and the unused `expected_splits` parameter.
+
+The correct invariants now are structural only:
+
+- regions are non-empty
+- first region starts at node 0
+- last region ends at `ggml_graph_n_nodes(gf)`
+- regions are contiguous and ordered
+- each region is backend-uniform under current construction rules
+
+#### Bug 4: parallel prefill data races / NaN outputs
+
+**Root cause**
+
+The first real-compute prefill runtime launched all regions concurrently.
+
+For sequential graphs, region `N` depends on outputs from region `N-1`. Parallel launch allowed later regions to read tensors before their producers completed, causing bad values and NaNs.
+
+**Fix**
+
+Changed prefill dispatch to a sequential loop.
+
+The new `prev_idx` field is the correct place to encode ordering information for future dependency-aware prefill parallelism, but no such scheduler exists yet. Correctness takes priority.
+
+### Tests added / updated
+
+#### ggml-hpx exec tests
+
+Added real-compute correctness tests for both execution paths:
+
+- decode CPU-only correctness on a nontrivial graph (`mul_mat` + `neg`)
+- prefill CPU-only correctness on a scheduler-backed graph (`mul_mat` + `neg`)
+
+These compare HPX execution results against the plain backend/scheduler baseline and verify that the outputs match exactly.
+
+#### llama smoke test
+
+Added:
+
+- `tests/hpx/test_hpx_llama_smoke.cpp`
+
+This test:
+
+1. reads `LLAMACPP_TEST_MODELFILE`
+2. skips cleanly if no model is provided
+3. loads one model
+4. creates two contexts:
+   - reference path
+   - HPX path (`LLAMA_USE_HPX=1`)
+5. runs the same prompt through both
+6. compares logits element-by-element
+
+This is the first model-backed test proving that HPX exec can replace the normal compute call inside llama.cpp on a CPU-only path.
+
+### Files changed in this milestone
+
+- `ggml/src/ggml-hpx/ggml-hpx-region.h`
+  - replace `dep_mask` with `prev_idx`
+- `ggml/src/ggml-hpx/ggml-hpx-adapter.cpp`
+  - prefill adapter no longer calls `split_graph(...)`
+  - region construction updated for `prev_idx`
+  - invalid split-count equality assumption removed
+- `ggml/src/ggml-hpx/ggml-hpx-adapter.h`
+  - contract updated: caller must prepare scheduler split state
+- `ggml/src/ggml-hpx/ggml-hpx-exec.cpp`
+  - real compute in chunk functions via `ggml_graph_view(...)` + `ggml_backend_graph_compute(...)`
+  - prefill dispatch made sequential for correctness
+- `ggml/src/ggml-hpx/ggml-hpx-exec.h`
+  - exec entry points take `ggml_cgraph *`
+- `src/llama-context.h`
+  - private `ggml_hpx_exec * hpx_exec`
+- `src/llama-context.cpp`
+  - `LLAMA_USE_HPX` handling
+  - HPX branch inside `graph_compute(...)`
+- `src/CMakeLists.txt`
+  - link llama against `ggml-hpx` when `GGML_HPX` is enabled
+- `tests/hpx/test_hpx_exec.cpp`
+  - new real-compute exec tests
+- `tests/hpx/test_hpx_llama_smoke.cpp`
+  - new model-backed smoke test
+- `tests/hpx/CMakeLists.txt`
+  - add smoke test target
+
+### Current status after this milestone
+
+What is now true:
+
+- `ggml-hpx-exec` is wired into llama.cpp at a real end-to-end integration point
+- decode chunk functions run real backend compute
+- prefill chunk functions run real backend compute
+- the llama CPU-only smoke path is in place
+- the prior fake 64-region ceiling is gone
+- prefill no longer mutates scheduler split state during adaptation
+- prefill is correct, but currently sequential
+
+What is intentionally **not** solved yet:
+
+- no dependency-aware parallel prefill scheduling
+- no graph-reuse optimization for the HPX branch in `graph_compute`
+- no live BLAS backend in the llama decode bundle yet (`blas = nullptr`)
+- no llama-side abort plumbing into `ggml_hpx_exec_abort`
+- no tuning yet for `n_prefill_threads` / executor choice
+
+### Next steps
+
+1. Run `examples/simple` on the same model/prompt with and without `LLAMA_USE_HPX=1` and compare generated output.
+2. Add light timing for:
+   - prefill-heavy prompt
+   - single-token decode
+   - short decode loop
+3. Design dependency-aware prefill scheduling using `prev_idx`.
+4. Improve allocation reuse in the HPX llama path so `graph_compute` does not need reset+alloc on every call.
+5. Revisit decode BLAS backend plumbing once correctness/perf baselines are established.

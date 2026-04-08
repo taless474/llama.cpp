@@ -208,7 +208,7 @@ struct ggml_hpx_prefill_plan
 
 // Validate a topology snapshot before building a prefill plan. Returns false
 // if the topology is structurally invalid, for example: empty region list,
-// node range out of bounds, or a dep_mask bit references a non-existent
+// node range out of bounds, or a prev_idx references a non-existent
 // region index. Must be called before ggml_hpx_build_prefill_plan.
 //
 // Defined in ggml-hpx-plan.cpp.

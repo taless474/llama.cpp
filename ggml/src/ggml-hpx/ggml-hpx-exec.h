@@ -22,6 +22,10 @@
 //
 // Forward declarations for ggml_cgraph, ggml_backend, and ggml_backend_sched
 // are provided by ggml-hpx-fwd.h. ggml-backend.h must not be included here.
+//
+// Note: both run entry points take ggml_cgraph* (not const). The ggml graph
+// API is not const-correct: ggml_graph_view and ggml_graph_n_nodes both
+// require a non-const pointer even when only reading.
 
 #include "ggml-hpx-fwd.h"        // ggml_cgraph, ggml_backend_t, ggml_backend_sched_t
 #include "ggml-hpx-instrument.h" // ggml_hpx_metrics_hooks
@@ -122,7 +126,7 @@ struct ggml_hpx_decode_backends
 // Defined in ggml-hpx-exec.cpp.
 ggml_hpx_exec_status ggml_hpx_exec_run_decode(
     ggml_hpx_exec*                  exec,
-    ggml_cgraph const*              graph,
+    ggml_cgraph*                    graph,
     ggml_hpx_decode_backends const& backends);
 
 // Execute the graph on the prefill path (throughput-oriented prompt/batch).
@@ -135,4 +139,4 @@ ggml_hpx_exec_status ggml_hpx_exec_run_decode(
 //
 // Defined in ggml-hpx-exec.cpp.
 ggml_hpx_exec_status ggml_hpx_exec_run_prefill(
-    ggml_hpx_exec* exec, ggml_cgraph const* graph, ggml_backend_sched_t sched);
+    ggml_hpx_exec* exec, ggml_cgraph* graph, ggml_backend_sched_t sched);

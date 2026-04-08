@@ -153,8 +153,15 @@ void ggml_hpx_runtime_dispatch_decode(ggml_hpx_runtime* /*rt*/,
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch — prefill: parallel on default pool when n_chunks >= 2
+// Dispatch — prefill: sequential (temporary; parallel requires dep-aware
+// scheduling based on prev_idx, which is not yet implemented)
 // ---------------------------------------------------------------------------
+//
+// All graph regions form a strict sequential chain (each depends on the
+// previous via prev_idx). Until the runtime can track prev_idx and launch
+// independent regions in parallel, executing serially is correct and safe.
+// The hpx::async / hpx::wait_all infrastructure is kept in the header so
+// the transition to parallel dispatch is a runtime change only.
 
 void ggml_hpx_runtime_dispatch_prefill(ggml_hpx_runtime* /*rt*/,
     uint32_t n_chunks, ggml_hpx_chunk_fn fn, void* user_data)
@@ -164,23 +171,8 @@ void ggml_hpx_runtime_dispatch_prefill(ggml_hpx_runtime* /*rt*/,
         return;
     }
 
-    if (n_chunks < 2)
-    {
-        fn(0, user_data);
-        return;
-    }
-
-    std::vector<hpx::future<void>> futures;
-    futures.reserve(n_chunks);
-
     for (uint32_t i = 0; i < n_chunks; ++i)
     {
-        futures.push_back(
-            hpx::async(hpx::launch::async,
-                [fn, i, user_data]() { fn(i, user_data); }));
+        fn(i, user_data);
     }
-
-    // wait_all waits for all futures to become ready and rethrows any
-    // stored exceptions. No separate get() loop is needed.
-    hpx::wait_all(futures);
 }

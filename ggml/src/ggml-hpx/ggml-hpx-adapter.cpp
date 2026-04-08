@@ -208,40 +208,24 @@ static bool prefill_backend_is_cpu(ggml_backend_t backend) noexcept
 }
 
 // ---------------------------------------------------------------------------
-// Sequential dep_mask
-// ---------------------------------------------------------------------------
-
-// Returns the dep_mask for the next region to be appended: bit (size-1) set,
-// expressing "depends only on its immediate predecessor."
-//
-// Precondition: regions.size() < GGML_HPX_MAX_REGIONS.
-// The caller must assert this before calling. The static_assert in
-// ggml-hpx-region.h guarantees GGML_HPX_MAX_REGIONS <= 64, so the shift
-// is always within the uint64_t width.
-static uint64_t sequential_dep(
-    std::vector<ggml_hpx_region> const& regions) noexcept
-{
-    return regions.empty() ? 0ULL : (1ULL << (regions.size() - 1));
-}
-
-// ---------------------------------------------------------------------------
 // Region topology builders
 // ---------------------------------------------------------------------------
 
-// Append one region to `regions`, checking the MAX_REGIONS bound first.
-// This is the single point where sequential_dep is called; the guard here
-// ensures the shift inside sequential_dep is always in-range.
+// Append one region to `regions`.
+// prev_idx is set to the index of the current last region, or UINT32_MAX
+// when the new region has no predecessor (i.e. it is the first).
 static void push_region(
     std::vector<ggml_hpx_region>& regions,
     ggml_hpx_region_type type,
     uint32_t node_begin)
 {
-    GGML_ASSERT(regions.size() < GGML_HPX_MAX_REGIONS);
     ggml_hpx_region r{};
     r.type       = type;
     r.node_begin = node_begin;
     r.node_end   = node_begin + 1;
-    r.dep_mask   = sequential_dep(regions);
+    r.prev_idx   = regions.empty()
+        ? UINT32_MAX
+        : static_cast<uint32_t>(regions.size() - 1);
     regions.push_back(r);
 }
 
@@ -293,15 +277,16 @@ static std::vector<ggml_hpx_region> build_decode_regions(
 // scheduler splits that run on different ggml_backend_t objects as separate
 // regions, preserving the exact split structure produced by the scheduler.
 //
-// expected_splits is the authoritative split count from
-// ggml_backend_sched_get_n_splits; the resulting region count is checked
-// against it.
+// After ggml_backend_sched_alloc_graph the scheduler may have inserted
+// cross-backend copy nodes into the graph. The resulting region count
+// can exceed ggml_backend_sched_get_n_splits, which reflects only the
+// original split boundaries. No count assertion is made here.
 static std::vector<ggml_hpx_region> build_prefill_regions(
     ggml_tensor** nodes, uint32_t n,
-    ggml_backend_sched_t sched, int expected_splits)
+    ggml_backend_sched_t sched)
 {
     std::vector<ggml_hpx_region> regions;
-    bool have_prev       = false;
+    bool have_prev         = false;
     ggml_backend_t prev_be = nullptr;
 
     for (uint32_t i = 0; i < n; ++i)
@@ -323,11 +308,6 @@ static std::vector<ggml_hpx_region> build_prefill_regions(
             have_prev = true;
         }
     }
-
-    // Region count must match the scheduler's authoritative split count.
-    // A mismatch means the adapter diverged from the split structure.
-    GGML_ASSERT(n == 0 ||
-        static_cast<int>(regions.size()) == expected_splits);
 
     return regions;
 }
@@ -374,13 +354,10 @@ ggml_hpx_adapter_result ggml_hpx_adapt_prefill(
     // The ggml graph API is not const-correct. See ggml_hpx_adapt_decode.
     ggml_cgraph* const mut = const_cast<ggml_cgraph*>(graph);
 
-    // Materialise the scheduler's split state. This is the "split translation"
-    // step: the scheduler assigns each node to a backend and records the
-    // resulting split count. Subsequent get_tensor_backend queries reflect
-    // this assignment. The call does not allocate buffers and does not require
-    // a preceding ggml_backend_sched_reset.
-    ggml_backend_sched_split_graph(sched, mut);
-    int const n_splits = ggml_backend_sched_get_n_splits(sched);
+    // Precondition: the scheduler's split state must be populated before this
+    // call. In the llama integration, ggml_backend_sched_alloc_graph calls
+    // split_graph internally; direct callers (e.g. unit tests) must call
+    // ggml_backend_sched_split_graph themselves before calling this function.
 
     int const n_int           = ggml_graph_n_nodes(mut);
     uint32_t const n          = (n_int > 0) ? static_cast<uint32_t>(n_int) : 0u;
@@ -390,7 +367,7 @@ ggml_hpx_adapter_result ggml_hpx_adapt_prefill(
 
     ggml_hpx_adapter_result result{};
     result.topo.n_nodes = n;
-    result.topo.regions = build_prefill_regions(nodes, n, sched, n_splits);
+    result.topo.regions = build_prefill_regions(nodes, n, sched);
 
     result.key.mode           = ggml_hpx_mode::prefill;
     result.key.policy_version = policy_version;

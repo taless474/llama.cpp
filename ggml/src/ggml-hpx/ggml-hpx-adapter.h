@@ -5,9 +5,13 @@
 // Adapter interface: external graph/scheduler state → HPX-owned planning inputs.
 //
 // This header is the only place in the HPX layer that forward-declares types
-// from ggml-backend.h. The full header is included only by
-// ggml-hpx-adapter.cpp. No other .cpp in ggml-hpx/ may include
-// ggml-backend.h.
+// from ggml-backend.h for adapter purposes.  Two translation units include
+// ggml-backend.h:
+//   ggml-hpx-adapter.cpp  — scheduler coupling; reads split state
+//   ggml-hpx-exec.cpp     — calls ggml_backend_graph_compute and
+//                           ggml_backend_sched_get_tensor_backend at
+//                           run time; does not read scheduler internals
+// All other .cpp files in ggml-hpx/ must not include ggml-backend.h.
 //
 // The adapter produces ggml_hpx_adapter_result, which bundles an immutable
 // region topology snapshot and a fully populated plan key. The exec layer
@@ -72,13 +76,18 @@ ggml_hpx_adapter_result ggml_hpx_adapt_decode(
 // ---------------------------------------------------------------------------
 
 // Produce a prefill adapter result using a scheduler-driven split
-// translation. Asks the scheduler to derive the split structure, then
-// translates the result into an HPX-owned ggml_hpx_region_topology.
+// translation. Reads the existing split state from the scheduler and
+// translates it into an HPX-owned ggml_hpx_region_topology.
+//
+// Precondition: the split state of sched must already be populated by
+// the caller before this function is invoked. In the llama integration,
+// ggml_backend_sched_alloc_graph satisfies this. Direct callers must call
+// ggml_backend_sched_split_graph explicitly before calling this function.
 //
 // graph           - the graph to analyse alongside the scheduler split
-// sched           - caller-owned scheduler used only during this call.
-//                   The adapter may invoke split-related scheduler functions
-//                   to derive topology, but does not retain, reset, or own it.
+// sched           - caller-owned scheduler; split state must be populated.
+//                   The adapter does not call split_graph and does not
+//                   retain, reset, or own the scheduler.
 // policy_version  - written into key.policy_version unchanged
 //
 // The returned topology should be validated with

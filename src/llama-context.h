@@ -9,6 +9,10 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#ifdef GGML_HPX
+struct ggml_hpx_exec;
+#endif
+
 #include <map>
 #include <vector>
 
@@ -342,6 +346,12 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+#ifdef GGML_HPX
+    // env: LLAMA_USE_HPX — set to 1 to route graph_compute through HPX exec.
+    // Null when the env var is absent or GGML_HPX is not compiled in.
+    ggml_hpx_exec * hpx_exec = nullptr;
+#endif
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -9,6 +9,10 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 
+#ifdef GGML_HPX
+#include "ggml-hpx-exec.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -362,9 +366,26 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+#ifdef GGML_HPX
+    {
+        const char * env = getenv("LLAMA_USE_HPX");
+        if (env && atoi(env) != 0) {
+            ggml_hpx_exec_params hpx_params{};
+            hpx_exec = ggml_hpx_exec_create(hpx_params);
+            LLAMA_LOG_INFO("%s: HPX exec enabled (LLAMA_USE_HPX=1)\n", __func__);
+        }
+    }
+#endif
 }
 
 llama_context::~llama_context() {
+#ifdef GGML_HPX
+    if (hpx_exec != nullptr) {
+        ggml_hpx_exec_destroy(hpx_exec);
+        hpx_exec = nullptr;
+    }
+#endif
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -2183,6 +2204,22 @@ ggml_status llama_context::graph_compute(
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
+
+#ifdef GGML_HPX
+    if (hpx_exec != nullptr) {
+        ggml_backend_sched_reset(sched.get());
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        ggml_hpx_decode_backends bundle{backend_cpu, /*blas=*/nullptr};
+        ggml_hpx_exec_status hst = batched
+            ? ggml_hpx_exec_run_prefill(hpx_exec, gf, sched.get())
+            : ggml_hpx_exec_run_decode(hpx_exec, gf, bundle);
+        return (hst == ggml_hpx_exec_status::ok)
+            ? GGML_STATUS_SUCCESS
+            : GGML_STATUS_FAILED;
+    }
+#endif
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

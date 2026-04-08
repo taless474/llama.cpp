@@ -4,9 +4,11 @@
 # Included only when GGML_HPX is ON.
 #
 # Note:
-#   ggml-hpx-adapter.cpp is intended to be the only translation unit
-#   that includes ggml-backend.h. Enforce this in CI or with a source
-#   check target; this file only documents the rule.
+#   Two translation units include ggml-backend.h:
+#     ggml-hpx-adapter.cpp — scheduler coupling and split state
+#     ggml-hpx-exec.cpp    — ggml_backend_graph_compute and
+#                            ggml_backend_sched_get_tensor_backend at run time
+#   All other files in this directory must not include ggml-backend.h directly.
 
 find_package(HPX REQUIRED)
 

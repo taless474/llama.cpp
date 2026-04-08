@@ -162,6 +162,13 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (GGML_HPX)
+    target_link_libraries(llama PRIVATE ggml-hpx)
+    target_compile_definitions(llama PUBLIC GGML_HPX)
+    target_include_directories(llama PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-hpx)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
