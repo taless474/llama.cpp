@@ -491,3 +491,404 @@ After that, the executor can be upgraded from stub orchestration to a full path 
 - scratch ensure
 - region iteration
 - runtime dispatch
+
+
+## 2026-04-07 — Runtime dispatch switched from serial stub to real HPX-backed prefill dispatch
+
+### Summary
+
+`ggml-hpx-runtime.cpp` now performs real HPX-backed parallel dispatch for prefill work while keeping the public runtime interface unchanged.
+
+Current behavior:
+
+- `ggml_hpx_runtime_dispatch_decode(...)` remains serial by design.
+- `ggml_hpx_runtime_dispatch_prefill(...)` runs serially for `n_chunks < 2`.
+- `ggml_hpx_runtime_dispatch_prefill(...)` uses `hpx::async` on the default HPX pool for `n_chunks >= 2`.
+- The runtime still appears synchronous to callers: dispatch returns only after all chunk callbacks complete.
+
+### Why this change
+
+The earlier runtime implementation was only a structural stub:
+
+- decode dispatch looped serially
+- prefill dispatch looped serially
+- tests covered correctness of callback invocation, but runtime did not yet exercise HPX underneath
+
+A new runtime test was added to force the next step:
+
+- `DispatchPrefillReturnsOnlyAfterAllChunksFinish`
+
+This test blocks each chunk callback and waits until all chunks have started before releasing them. It fails against the serial stub and passes only once prefill dispatch launches chunks concurrently.
+
+### Public API constraints kept intact
+
+This change deliberately did **not** alter the public interface of `ggml-hpx-runtime.h`.
+
+Unchanged API surface:
+
+- `ggml_hpx_runtime_create(params)`
+- `ggml_hpx_runtime_destroy(rt)`
+- `ggml_hpx_runtime_scratch_ptr(rt)`
+- `ggml_hpx_runtime_scratch_ensure(rt, bytes)`
+- `ggml_hpx_runtime_dispatch_decode(rt, n_chunks, fn, user_data)`
+- `ggml_hpx_runtime_dispatch_prefill(rt, n_chunks, fn, user_data)`
+
+Important non-changes:
+
+- no plan-type unification at runtime level
+- no new runtime status return type
+- no abort token added to runtime dispatch
+- no public lane-scratch API
+- no change to decode semantics
+
+### HPX lifecycle decision
+
+A refcounted start/stop-per-runtime design was considered first, but abandoned.
+
+Reason:
+
+- HPX cannot be initialized more than once per process
+- HPX cannot be cleanly restarted for each `create()` / `destroy()` pair
+- `hpx::finalize()` must run on an HPX thread
+
+Final lifecycle design:
+
+- HPX is started once per process via `std::call_once`
+- startup happens on first `ggml_hpx_runtime_create(...)`
+- shutdown is registered with `std::atexit(...)`
+- the exit handler posts `hpx::finalize()` onto an HPX thread and then calls `hpx::stop()`
+- `ggml_hpx_runtime_destroy(...)` frees runtime-owned scratch and deletes the runtime object, but does **not** stop HPX
+
+This keeps the runtime wrapper compatible with unit tests, which create and destroy multiple runtime objects in one process.
+
+### Implementation notes
+
+Runtime struct currently stores:
+
+- `n_prefill_threads`
+- `scratch_ptr`
+- `scratch_bytes`
+
+Current dispatch policy:
+
+- decode: always serial
+- prefill:
+  - no-op for `fn == nullptr` or `n_chunks == 0`
+  - serial for `n_chunks < 2`
+  - otherwise launch one `hpx::async` task per chunk, `hpx::wait_all(...)`, then surface exceptions with `future::get()`
+
+The first implementation uses the default/global HPX pool.
+
+`n_prefill_threads` is stored but not yet used to cap task submission or bind work to a dedicated pool. That refinement is deferred.
+
+### Tests added
+
+Three runtime tests were added:
+
+- `DispatchPrefillReturnsOnlyAfterAllChunksFinish`
+- `DispatchDecodeSingleChunkRunsExactlyOnce`
+- `DispatchPrefillSingleChunkRunsExactlyOnce`
+
+These were added on top of the existing runtime tests.
+
+Interpretation:
+
+- the blocking prefill test proves that prefill dispatch is no longer a serial loop
+- the single-chunk tests protect the `n_chunks == 1` edge case, especially since prefill now has a serial fallback for tiny dispatches
+
+### Validation result
+
+After the runtime change:
+
+- `test_hpx_runtime`: 8 passed, 0 failed
+- full suite: 56 passed, 1 skipped, 0 failed
+
+Suite breakdown at this milestone:
+
+- `test_hpx_abort`: 7 passed
+- `test_hpx_cache`: 11 passed
+- `test_hpx_decode_plan`: 8 passed
+- `test_hpx_prefill_plan`: 5 passed
+- `test_hpx_adapter`: 8 passed, 1 skipped
+- `test_hpx_runtime`: 8 passed
+- `test_hpx_exec`: 6 passed
+
+### What this milestone means
+
+This is the first point where the runtime layer is doing real HPX work rather than only preserving structure.
+
+The system now has:
+
+- adapter tests green
+- decode/prefill plan tests green
+- cache tests green
+- exec tests green
+- runtime prefill dispatch actually using HPX underneath
+
+### Known limitations left intentionally for later
+
+- decode is still serial
+- prefill uses the default HPX pool rather than a pool isolated to `n_prefill_threads`
+- runtime dispatch still operates at callback/chunk level rather than on a richer execution object
+- runtime does not yet expose abort-aware dispatch directly
+- delegated-backend distinctness validation still depends on access to a second non-CPU backend
+
+### Best next step
+
+Wire `exec.cpp` through the real orchestration path:
+
+1. observe-and-consume abort at run entry
+2. adapt graph
+3. determine decode vs prefill mode
+4. build or fetch cached plan
+5. ensure runtime scratch
+6. dispatch through runtime
+7. preserve existing exec result semantics
+
+## 2026-04-08 — Exec wired through adapter → cache → runtime
+
+### Summary
+
+`ggml-hpx-exec.cpp` is now the real orchestration entry point for the HPX path. It owns a runtime, a structural plan cache, an abort token, and the policy version, and it drives both decode and prefill through the same high-level sequence: adapt, cache lookup/build, ensure scratch, then dispatch through the runtime. :contentReference[oaicite:0]{index=0}
+
+This is a meaningful milestone because the project is no longer just a collection of separately-tested pieces. The exec layer is now connected end-to-end to the adapter, plan/cache, and runtime layers. The chunk functions are still stubs, so this does **not** execute real ggml compute yet, but the orchestration path is now real. :contentReference[oaicite:1]{index=1}
+
+### Current exec shape
+
+`ggml_hpx_exec` currently contains:
+
+- `ggml_hpx_runtime* runtime`
+- `ggml_hpx_plan_cache cache`
+- `ggml_hpx_abort_token abort`
+- `uint32_t policy_version`
+
+This keeps plan caching and runtime ownership inside exec while leaving live backend handles out of the cached plan model. :contentReference[oaicite:2]{index=2}
+
+### Abort rule implemented in exec
+
+Abort semantics are now explicitly split across three stages:
+
+- **Entry:** observe-and-consume (`check`, `reset`, return `aborted`)
+- **Chunk fn:** check only, return early, never reset
+- **Post-dispatch:** observe-and-consume again
+
+The helper `consume_abort(...)` is the one place that resets the token. Chunk functions only call `check()`. 
+
+This gives exec cooperative abort behavior without forcing the runtime API itself to become abort-aware.
+
+### Decode path now wired
+
+`ggml_hpx_exec_run_decode(...)` currently does:
+
+1. entry abort consume
+2. `ggml_hpx_adapt_decode(graph, policy_version)`
+3. early-out if adapted topology has no regions
+4. cache lookup by structural key
+5. decode plan build + insert on cache miss
+6. `ggml_hpx_runtime_scratch_ensure(...)` sized to `plan->regions.size()`
+7. runtime dispatch using `ggml_hpx_runtime_dispatch_decode(...)`
+8. post-dispatch abort consume
+
+The decode dispatch context currently carries a decode plan pointer, abort token pointer, and scratch pointer fetched from the runtime. 
+
+### Prefill path now wired
+
+`ggml_hpx_exec_run_prefill(...)` mirrors the decode flow, with two notable differences:
+
+- it requires `sched`; `sched == nullptr` is an honest early-out
+- chunk count comes from `plan->topo.regions.size()`
+
+The prefill path currently does:
+
+1. entry abort consume
+2. early-out on `sched == nullptr`
+3. `ggml_hpx_adapt_prefill(graph, sched, policy_version)`
+4. early-out if adapted topology has no regions
+5. cache lookup by structural key
+6. prefill plan build + insert on cache miss
+7. `ggml_hpx_runtime_scratch_ensure(...)`
+8. runtime dispatch using `ggml_hpx_runtime_dispatch_prefill(...)`
+9. post-dispatch abort consume
+
+This keeps scheduler-derived execution decisions in the prefill run path instead of baking them into the cached plan. 
+
+### Chunk functions are still structural stubs
+
+The current decode and prefill chunk functions intentionally do **not** run real ggml operations yet.
+
+They currently:
+
+- cast `user_data` to a run-context struct
+- check abort and return early if requested
+- validate `chunk_idx` against the plan
+- validate region bounds
+- touch one byte of scratch at offset `chunk_idx` to prove execution reached that chunk
+
+This means the orchestration path is real, but compute semantics are still stubbed. The scratch touch is safe across chunks because each chunk writes only to its own byte offset. 
+
+### Current status of the design
+
+At this point the architecture is:
+
+- **abort:** real and tested
+- **adapter:** real and tested
+- **plan/cache:** real and tested
+- **runtime:** real HPX-backed prefill dispatch; decode remains serial by design
+- **exec:** fully wired through adapter → cache → runtime, but chunk execution is still stubbed
+
+This is the first point where the overall pipeline exists end-to-end even though the chunk body is still placeholder logic.
+
+---
+
+## Next agreed design step — live backends belong in run context, not in plans
+
+### Decision
+
+Plans remain **purely structural**. No live `ggml_backend_t` handles should be stored in a plan or in the plan cache.
+
+Live backend handles are execution-time resources and should be assembled in the **per-run context** passed to chunk functions.
+
+This preserves the invariant that cached plans are structural templates and avoids stale backend handles surviving a cache hit.
+
+### Decode API direction
+
+Decode can produce `blas_delegated` regions, so `run_decode(...)` should not be locked to a single backend handle.
+
+The agreed direction is to add a small per-run decode backend bundle:
+
+```cpp
+struct ggml_hpx_decode_backends
+{
+    ggml_backend_t cpu  = nullptr;  // required
+    ggml_backend_t blas = nullptr;  // optional
+};
+```
+
+The bundle is passed per-run so backend ownership stays with the caller. Plans remain structural templates with no live handles inside them.
+
+Prefill is unchanged: it already receives `sched` and derives backends per split at run time.
+
+### Fallback rule
+
+If a decode plan contains a `blas_delegated` region and `backends.blas` is `nullptr`, the region is routed to `backends.cpu`. This is semantically correct (CPU can execute any operation BLAS would handle, just slower) and requires no new status value.
+
+---
+
+## 2026-04-08 — Decode backend bundle implemented; HPX best-practices audit
+
+### Summary
+
+Two things happened in this session:
+
+1. The `ggml_hpx_decode_backends` bundle was designed, implemented, and tested across four files.
+2. A broader HPX best-practices audit was done, resulting in one concrete correction to the runtime.
+
+---
+
+### Decode backend bundle
+
+#### What changed
+
+**`ggml/src/ggml-hpx/ggml-hpx-fwd.h`**
+
+Added a forward declaration for `ggml_backend` and `ggml_backend_t` so that `exec.h` can use the type without pulling in `ggml-backend.h`. The annotation mirrors `ggml-backend.h` line 27.
+
+**`ggml/src/ggml-hpx/ggml-hpx-exec.h`**
+
+Added the `ggml_hpx_decode_backends` bundle struct and updated `ggml_hpx_exec_run_decode` to accept it as a third parameter. `run_prefill` is unchanged — it already receives `sched` and derives backends from it per split.
+
+**`ggml/src/ggml-hpx/ggml-hpx-exec.cpp`**
+
+Added a hard precondition near the top of `run_decode`, after the abort check:
+
+```cpp
+GGML_ASSERT(backends.cpu != nullptr);
+```
+
+This fires before any plan lookup or dispatch. A null CPU backend makes the bundle meaningless and is treated as a programmer error rather than a graceful fallback.
+
+Added a `backend_for_region` helper that selects `blas` for `blas_delegated` regions when `blas != nullptr`, and falls back to `cpu` otherwise.
+
+Updated `decode_run_ctx` to carry `ggml_hpx_decode_backends backends` instead of a bare cpu handle.
+
+Updated `decode_chunk_fn` to call `backend_for_region` and store the result in a local. This is **API and context shape change only** — no subgraph construction or `ggml_backend_graph_compute` call was added. Real compute semantics land when the subgraph_view constructor is implemented.
+
+**`tests/hpx/test_hpx_exec.cpp`**
+
+Added a RAII wrapper that owns backend lifetime automatically:
+
+```cpp
+struct cpu_backends_guard
+{
+    ggml_hpx_decode_backends b{};
+    explicit cpu_backends_guard() { b.cpu = ggml_backend_cpu_init(); }
+    ~cpu_backends_guard()        { ggml_backend_free(b.cpu); }
+    // deleted copy/assign
+};
+```
+
+All `run_decode` call sites declare a `cpu_backends_guard bg` and pass `bg.b`. No manual `ggml_backend_free` at call sites.
+
+#### Design decisions
+
+- **Plans stay structural.** No live `ggml_backend_t` handles are stored in the plan or plan cache. Cached plans are structural templates; handles are assembled per-run.
+- **CPU is a required precondition, not a comment.** `GGML_ASSERT` fires before any dispatch if `backends.cpu == nullptr`.
+- **BLAS fallback is silent and correct.** Missing `blas` routes to `cpu`. No new status value needed.
+- **`backend_for_region` is plumbing today.** It shapes the run context correctly for the eventual compute step but does not yet invoke `ggml_backend_graph_compute`.
+
+---
+
+### HPX best-practices audit
+
+#### Correct decisions
+
+- **Lifecycle (`hpx::start` + `atexit`)**: canonical embedded-HPX pattern. `hpx::start` lets the main thread return; `hpx::init`/`hpx::main` would block it, which is wrong for a library. The `hpx::post(finalize)` trick is required because `hpx::finalize()` must be called from within an HPX thread.
+- **`std::call_once` for the no-restart constraint**: correct.
+- **`hpx::wait_all`**: correct HPX barrier primitive — see correction below.
+
+#### Corrected: `wait_all` + `get()` loop was redundant
+
+The prior implementation followed `hpx::wait_all(futures)` with a `f.get()` loop under the assumption that `wait_all` was a barrier-only primitive and `get()` was needed to surface exceptions.
+
+This was wrong.
+
+In current HPX, `hpx::wait_all` waits for all futures to become ready **and** rethrows any stored exceptions. A following `get()` loop is redundant for `future<void>` — there are no results to extract and exceptions are already surfaced. The loop was removed from `ggml-hpx-runtime.cpp` and the file-top comment was corrected.
+
+A per-future `get()` loop is still acceptable if per-future error handling or explicit result consumption is needed, but it must not be added "for exception propagation" because that reason is incorrect.
+
+#### Acceptable but non-idiomatic
+
+- **`hpx::async` per chunk + manual future vector**: works, but HPX's idiomatic parallel loop is `hpx::experimental::for_loop` or `hpx::for_each` with `hpx::execution::par`. Those avoid the heap allocation for the future vector and compose better with executors. For the current small-N-chunks use case the difference is negligible, but this is a known style gap.
+
+#### Known gaps, deferred intentionally
+
+- **`n_prefill_threads` is stored but ignored.** The default HPX pool uses however many threads HPX was started with (env-controlled). Wiring `n_prefill_threads` to a per-dispatch executor is deferred until the dispatch model matures.
+- **No `hpx::init_params` at startup.** Thread count and scheduler config rely on HPX auto-detection or environment variables. Acceptable for now.
+
+---
+
+### Test result at this milestone
+
+No new tests were added in this session; the existing suite remained green:
+
+- `test_hpx_abort`: 7 passed
+- `test_hpx_cache`: 11 passed
+- `test_hpx_decode_plan`: 8 passed
+- `test_hpx_prefill_plan`: 5 passed
+- `test_hpx_adapter`: 8 passed, 1 skipped
+- `test_hpx_runtime`: 8 passed
+- `test_hpx_exec`: 6 passed
+
+**Total: 56 passed, 1 skipped, 0 failed**
+
+---
+
+### What remains next
+
+The exec layer is now wired end-to-end with the correct context shape. The next implementation step is to make chunk functions do real compute:
+
+1. Implement a `subgraph_view` constructor that presents `graph->nodes[begin..end)` as a complete `ggml_cgraph` without copying.
+2. Call `ggml_backend_graph_compute(backend, &subgraph_view)` inside `decode_chunk_fn`.
+3. Handle the `ggml_backend_graph_compute` return value and surface errors through the abort/status path.
+
+After that, the prefill chunk function needs the same treatment, driven from the scheduler-split model: backend per split derived from `sched` at run time, not from a static bundle.

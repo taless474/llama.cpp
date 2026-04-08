@@ -20,10 +20,10 @@
 // directly (that is runtime's responsibility) and does not read scheduler
 // state directly (that is the adapter's responsibility).
 //
-// Forward declarations for ggml_cgraph and ggml_backend_sched are provided
-// by ggml-hpx-fwd.h. ggml-backend.h must not be included here.
+// Forward declarations for ggml_cgraph, ggml_backend, and ggml_backend_sched
+// are provided by ggml-hpx-fwd.h. ggml-backend.h must not be included here.
 
-#include "ggml-hpx-fwd.h"        // ggml_cgraph, ggml_backend_sched, ggml_backend_sched_t
+#include "ggml-hpx-fwd.h"        // ggml_cgraph, ggml_backend_t, ggml_backend_sched_t
 #include "ggml-hpx-instrument.h" // ggml_hpx_metrics_hooks
 #include "ggml-hpx-runtime.h"    // ggml_hpx_runtime_params
 
@@ -90,6 +90,25 @@ void ggml_hpx_exec_destroy(ggml_hpx_exec* exec);
 void ggml_hpx_exec_abort(ggml_hpx_exec* exec);
 
 // ---------------------------------------------------------------------------
+// Backend bundle — decode
+// ---------------------------------------------------------------------------
+
+// Live backend handles passed to each decode run. Plans are structural and
+// carry no handles; callers supply the bundle per-run so backend ownership
+// stays with the caller.
+//
+// cpu  - required: used for all cpu_contiguous regions and as the fallback
+//        when blas is null or when blas_delegated regions appear in a run
+//        where blas was not provided
+// blas - optional (nullable): used for blas_delegated regions when non-null;
+//        omitting it silently falls back to cpu (slower, but correct)
+struct ggml_hpx_decode_backends
+{
+    ggml_backend_t cpu  = nullptr;  // required
+    ggml_backend_t blas = nullptr;  // nullable — BLAS is optional
+};
+
+// ---------------------------------------------------------------------------
 // Run entry points
 // ---------------------------------------------------------------------------
 
@@ -97,11 +116,14 @@ void ggml_hpx_exec_abort(ggml_hpx_exec* exec);
 // Uses a topology derived from an independent graph walk; does not touch
 // the scheduler.
 //
-// graph - the graph to execute; used only during this call, not retained
+// graph    - the graph to execute; used only during this call, not retained
+// backends - live backend handles; cpu must be non-null (asserted on entry)
 //
 // Defined in ggml-hpx-exec.cpp.
 ggml_hpx_exec_status ggml_hpx_exec_run_decode(
-    ggml_hpx_exec* exec, ggml_cgraph const* graph);
+    ggml_hpx_exec*                  exec,
+    ggml_cgraph const*              graph,
+    ggml_hpx_decode_backends const& backends);
 
 // Execute the graph on the prefill path (throughput-oriented prompt/batch).
 // Uses a topology derived from a scheduler-driven split translation performed
