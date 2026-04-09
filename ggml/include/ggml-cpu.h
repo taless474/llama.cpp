@@ -55,11 +55,17 @@ extern "C" {
     GGML_BACKEND_API float   ggml_get_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, int i3);
     GGML_BACKEND_API void    ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, int i3, float value);
 
+    // Executor lifecycle.  One executor may be shared across multiple CPU backend
+    // instances; attach it with ggml_backend_cpu_attach_threadpool (below) rather
+    // than ggml_backend_cpu_set_threadpool, so the backend does not assume ownership.
     GGML_BACKEND_API struct ggml_threadpool *      ggml_threadpool_new           (struct ggml_threadpool_params  * params);
     GGML_BACKEND_API void                          ggml_threadpool_free          (struct ggml_threadpool * threadpool);
     GGML_BACKEND_API int                           ggml_threadpool_get_n_threads (struct ggml_threadpool * threadpool);
     GGML_BACKEND_API void                          ggml_threadpool_pause         (struct ggml_threadpool * threadpool);
     GGML_BACKEND_API void                          ggml_threadpool_resume        (struct ggml_threadpool * threadpool);
+    // Returns true if the executor is currently in the paused state.
+    // Useful for testing and diagnostics; not needed for normal compute paths.
+    GGML_BACKEND_API bool                          ggml_threadpool_is_paused     (struct ggml_threadpool * threadpool);
 
     // ggml_graph_plan() has to be called before ggml_graph_compute()
     // when plan.work_size > 0, caller must allocate memory for plan.work_data
@@ -132,7 +138,11 @@ extern "C" {
 
     GGML_BACKEND_API bool ggml_backend_is_cpu                (ggml_backend_t backend);
     GGML_BACKEND_API void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
+    // Replace the backend's executor (backend pauses the previous one on replacement).
     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
+    // Attach an externally-owned executor.  Safe to share across backends; the
+    // backend will not pause or free it on replacement or teardown.
+    GGML_BACKEND_API void ggml_backend_cpu_attach_threadpool (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);

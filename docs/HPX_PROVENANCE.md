@@ -353,7 +353,73 @@ region execution
    ├── BLAS delegated region
    └── next ready region
 ```
+```
+Think of the whole system like shipping packages.
 
+llama/ggml = a pile of packages that must be delivered in the right order
+HPX = the delivery company
+
+Now the pieces:
+
+1. Adapter
+The adapter is the translator.
+
+ggml speaks one language.
+Our HPX code speaks another language.
+
+The adapter looks at the ggml graph and says:
+“Okay, here is the same work in a form HPX can understand.”
+
+Very simple:
+adapter = translator between ggml and HPX
+
+2. Plan
+The plan is the to-do list.
+
+Not the real work itself.
+Just the instructions for how to do it.
+
+Example:
+- first do section A
+- then do section B
+- section C uses BLAS
+- section D uses CPU
+
+So:
+plan = reusable instruction sheet
+
+3. Cache
+The cache is memory.
+
+If we already made the same instruction sheet before,
+do not make it again.
+Just reuse it.
+
+So:
+cache = drawer where we keep old plans
+
+4. Executor
+The executor is the manager.
+
+It does not do the heavy lifting itself.
+It checks:
+- do we already have a plan?
+- if not, make one
+- are we aborting?
+- is scratch memory ready?
+- okay, runtime, go do this job
+
+So:
+executor = manager that decides what happens next
+
+5. Runtime
+The runtime is the workers.
+
+This is the part that actually sends work to HPX and runs it.
+
+So:
+runtime = the workers that actually do the job
+```
 
 ## 2. Adapter, plan, cache, runtime scratch, and test baseline
 
@@ -1690,3 +1756,23 @@ This phase is recorded under:
 - `hpx-bench/results/2026-04-09-llama-simple-release-04-parallel-proj-prototype/`
 
 These directories capture the progression from initial integration, to correctness fix, to threshold policy, to the final negative-result prototype for intra-region parallel projection.
+
+```
+HPX SIDE                            PLAIN LLAMA/GGML SIDE
+
+adapter                             scheduler/split-prep world
+ggml_hpx_adapt_*                    ggml_backend_sched_alloc_graph(...)
+                                    split_graph(...)
+
+plan                                implicit scheduler/backend setup
+explicit HPX plan objects           graph + split/allocation state
+
+cache                               prepared scheduler/allocation state
+explicit plan cache                 what alloc_graph() has already set up
+
+executor / manager                  llama_context::graph_compute(...)
+ggml_hpx_exec_*                     src/llama-context.cpp
+
+runtime / workers                   backend compute path
+ggml-hpx-runtime                    ggml_backend_graph_compute(...)
+```

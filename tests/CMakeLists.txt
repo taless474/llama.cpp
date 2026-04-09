@@ -251,6 +251,15 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
+    llama_build_and_test(test-executor-sharing.cpp)
+
+    # White-box test: accesses struct ggml_threadpool fields directly.
+    # Needs the internal include dir so ggml-cpu-threadpool.h is visible.
+    set(LLAMA_TEST_NAME test-executor-sharing-wb)
+    llama_build_and_test(test-executor-sharing-wb.c)
+    target_include_directories(test-executor-sharing-wb
+        PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    unset(LLAMA_TEST_NAME)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)

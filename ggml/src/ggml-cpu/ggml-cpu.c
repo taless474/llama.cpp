@@ -457,32 +457,11 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
-// Threadpool def
-struct ggml_threadpool {
-    ggml_mutex_t mutex;       // mutex for cond.var
-    ggml_cond_t  cond;        // cond.var for waiting for new work
-
-    struct ggml_cgraph * cgraph;
-    struct ggml_cplan  * cplan;
-
-    // synchronization primitives
-    atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
-    atomic_int GGML_CACHE_ALIGN n_barrier;
-    atomic_int GGML_CACHE_ALIGN n_barrier_passed;
-    atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
-
-    // these are atomic as an annotation for thread-sanitizer
-    atomic_bool stop;         // Used for stopping the threadpool altogether
-    atomic_bool pause;        // Used for pausing the threadpool or individual threads
-    atomic_int  abort;        // Used for aborting processing of a graph
-
-    struct ggml_compute_state * workers;   // per thread state
-    int          n_threads;   // Number of threads in the pool
-    int32_t      prio;        // Scheduling priority
-    uint32_t     poll;        // Polling level (0 - no polling)
-
-    enum ggml_status ec;
-};
+// struct ggml_compute_job and struct ggml_threadpool are defined in the
+// internal header below.  Platform prerequisites (atomics, mutex types,
+// GGML_CACHE_ALIGN) are already set up above, so skip their redefinition.
+#define GGML_CPU_THREADPOOL_PREREQS_DONE
+#include "ggml-cpu-threadpool.h"
 
 // Per-thread state
 struct ggml_compute_state {
@@ -554,7 +533,8 @@ struct ggml_state {
 static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp) {
-    int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+    struct ggml_compute_job * job = tp->current_job;
+    int n_threads = job->n_active_threads;
     if (n_threads == 1) {
         return;
     }
@@ -562,29 +542,29 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 #ifdef GGML_USE_OPENMP
     #pragma omp barrier
 #else
-    int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
+    int n_passed = atomic_load_explicit(&job->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
-    int n_barrier = atomic_fetch_add_explicit(&tp->n_barrier, 1, memory_order_seq_cst);
+    int n_barrier = atomic_fetch_add_explicit(&job->n_barrier, 1, memory_order_seq_cst);
 
     if (n_barrier == (n_threads - 1)) {
         // last thread
-        atomic_store_explicit(&tp->n_barrier, 0, memory_order_relaxed);
+        atomic_store_explicit(&job->n_barrier, 0, memory_order_relaxed);
 
         // exit barrier (full seq-cst fence)
-        atomic_fetch_add_explicit(&tp->n_barrier_passed, 1, memory_order_seq_cst);
+        atomic_fetch_add_explicit(&job->n_barrier_passed, 1, memory_order_seq_cst);
         return;
     }
 
     // wait for other threads
-    while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+    while (atomic_load_explicit(&job->n_barrier_passed, memory_order_relaxed) == n_passed) {
         ggml_thread_cpu_relax();
     }
 
     // exit barrier (full seq-cst fence)
     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
     #ifdef GGML_TSAN_ENABLED
-    atomic_fetch_add_explicit(&tp->n_barrier_passed, 0, memory_order_seq_cst);
+    atomic_fetch_add_explicit(&job->n_barrier_passed, 0, memory_order_seq_cst);
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
@@ -592,11 +572,11 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 }
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
-    atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
+    atomic_store_explicit(&tp->current_job->current_chunk, value, memory_order_relaxed);
 }
 
 int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
-    return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
+    return atomic_fetch_add_explicit(&tp->current_job->current_chunk, value, memory_order_relaxed);
 }
 
 #if defined(__gnu_linux__)
@@ -1333,7 +1313,7 @@ UseGgmlGemm1:;
 
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        atomic_store_explicit(&params->threadpool->current_job->current_chunk, nth, memory_order_relaxed);
     }
 
     ggml_barrier(params->threadpool);
@@ -1422,7 +1402,7 @@ UseGgmlGemm2:;
             break;
         }
 
-        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_job->current_chunk, 1, memory_order_relaxed);
     }
 }
 
@@ -2724,6 +2704,15 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+bool ggml_threadpool_is_paused(struct ggml_threadpool * threadpool) {
+#ifndef GGML_USE_OPENMP
+    return atomic_load_explicit(&threadpool->pause, memory_order_relaxed);
+#else
+    UNUSED(threadpool);
+    return false;
+#endif
+}
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -2953,14 +2942,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
 
-    const struct ggml_cgraph * cgraph = tp->cgraph;
-    const struct ggml_cplan  * cplan  = tp->cplan;
+    struct ggml_compute_job   * job   = tp->current_job;
+    const struct ggml_cgraph  * cgraph = job->cgraph;
+    const struct ggml_cplan   * cplan  = job->cplan;
 
     set_numa_thread_affinity(state->ith);
 
     struct ggml_compute_params params = {
         /*.ith        =*/ state->ith,
-        /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
+        /*.nth        =*/ job->n_active_threads,
         /*.wsize      =*/ cplan->work_size,
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
@@ -2973,7 +2963,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-    for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+    for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&job->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
@@ -2989,8 +2979,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
-            atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
-            tp->ec    = GGML_STATUS_ABORTED;
+            atomic_store_explicit(&job->abort, node_n + 1, memory_order_relaxed);
+            job->ec = GGML_STATUS_ABORTED;
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
@@ -3125,6 +3115,9 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
     GGML_PRINT_DEBUG("compute-kickoff: n_threads %d n_graph %d\n", n_threads, n_graph);
 
+    // Record active thread count on the job before publishing via n_graph
+    threadpool->current_job->n_active_threads = n_threads;
+
     // Indicate the graph is ready to be processed
     // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
     atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
@@ -3155,20 +3148,22 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool * threadpool =
         ggml_aligned_malloc(sizeof(struct ggml_threadpool));
     {
-        threadpool->cgraph           = cgraph;
-        threadpool->cplan            = cplan;
-        threadpool->n_graph          = 0;
-        threadpool->n_barrier        = 0;
-        threadpool->n_barrier_passed = 0;
-        threadpool->current_chunk    = 0;
-        threadpool->stop             = false;
-        threadpool->pause            = tpp->paused;
-        threadpool->abort            = -1;
-        threadpool->workers          = NULL;
-        threadpool->n_threads        = tpp->n_threads;
-        threadpool->poll             = tpp->poll;
-        threadpool->prio             = tpp->prio;
-        threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->job.cgraph           = cgraph;
+        threadpool->job.cplan            = cplan;
+        threadpool->job.n_active_threads = 0;
+        threadpool->job.n_barrier        = 0;
+        threadpool->job.n_barrier_passed = 0;
+        threadpool->job.current_chunk    = 0;
+        threadpool->job.abort            = -1;
+        threadpool->job.ec               = GGML_STATUS_SUCCESS;
+        threadpool->current_job          = &threadpool->job;
+        threadpool->n_graph              = 0;
+        threadpool->stop                 = false;
+        threadpool->pause                = tpp->paused;
+        threadpool->workers              = NULL;
+        threadpool->n_threads            = tpp->n_threads;
+        threadpool->poll                 = tpp->poll;
+        threadpool->prio                 = tpp->prio;
     }
 
     // Allocate and init workers state
@@ -3231,10 +3226,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
-    int n_threads                               = cplan->n_threads;
+    int n_threads             = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
     bool disposable_threadpool = false;
+
+    // job for the reuse path; lifetime covers the entire dispatch (until all workers
+    // pass the final barrier and ggml_graph_compute_thread returns).
+    // disposable path uses the job embedded in the freshly allocated threadpool.
+    struct ggml_compute_job local_job;
 
     if (threadpool == NULL) {
         //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
@@ -3242,14 +3242,20 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        // current_job = &threadpool->job, set inside ggml_threadpool_new_impl
     } else {
-        // Reset some of the parameters that need resetting
-        // No worker threads should be accessing the parameters below at this stage
-        threadpool->cgraph           = cgraph;
-        threadpool->cplan            = cplan;
-        threadpool->current_chunk    = 0;
-        threadpool->abort            = -1;
-        threadpool->ec               = GGML_STATUS_SUCCESS;
+        // Initialize job fully before assigning to current_job.
+        // n_active_threads is written by kickoff/omp before n_graph is published.
+        local_job.cgraph           = cgraph;
+        local_job.cplan            = cplan;
+        local_job.n_active_threads = 0;
+        local_job.n_barrier        = 0;
+        local_job.n_barrier_passed = 0;
+        local_job.current_chunk    = 0;
+        local_job.abort            = -1;
+        local_job.ec               = GGML_STATUS_SUCCESS;
+        threadpool->current_job    = &local_job;
+        // published via n_graph in kickoff / omp paths below
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3260,6 +3266,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
+                threadpool->current_job->n_active_threads = n_threads;
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 
@@ -3273,6 +3280,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
     } else {
+        threadpool->current_job->n_active_threads = 1;
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
         ggml_graph_compute_thread(&threadpool->workers[0]);
     }
@@ -3292,7 +3300,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
 
-    enum ggml_status ret = threadpool->ec;
+    // Read result while current_job is still live (reuse path: local_job is on our stack).
+    enum ggml_status ret = threadpool->current_job->ec;
+
+    // Reset current_job to the embedded job so the pointer is never left dangling
+    // between dispatches. Does not affect the disposable path: that threadpool is
+    // freed immediately below and current_job already points to its embedded job.
+    threadpool->current_job = &threadpool->job;
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);

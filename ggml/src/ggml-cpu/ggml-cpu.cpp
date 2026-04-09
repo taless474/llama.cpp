@@ -99,6 +99,9 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 struct ggml_backend_cpu_context {
     int                 n_threads;
     ggml_threadpool_t   threadpool;
+    // When true the executor was attached via ggml_backend_cpu_attach_threadpool:
+    // the backend does not pause it on replacement and does not own its lifetime.
+    bool                threadpool_external;
 
     uint8_t *           work_data;
     size_t              work_size;
@@ -223,6 +226,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
 
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->threadpool          = NULL;
+    ctx->threadpool_external = false;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
@@ -260,11 +264,25 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
 
-    if (ctx->threadpool && ctx->threadpool != threadpool) {
-        // already had a different threadpool, pause/suspend it before switching
+    if (ctx->threadpool && ctx->threadpool != threadpool && !ctx->threadpool_external) {
+        // pause the previous executor only when this backend owns it
         ggml_threadpool_pause(ctx->threadpool);
     }
-    ctx->threadpool = threadpool;
+    ctx->threadpool          = threadpool;
+    ctx->threadpool_external = false;
+}
+
+// Attach an externally-owned executor to this backend.
+// The caller retains ownership and lifetime responsibility for the executor.
+// The backend will not pause or free it on replacement or teardown, making it
+// safe to share one executor across multiple CPU backend instances.
+void ggml_backend_cpu_attach_threadpool(ggml_backend_t backend_cpu, ggml_threadpool_t threadpool) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+
+    ctx->threadpool          = threadpool;
+    ctx->threadpool_external = true;
 }
 
 void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
@@ -671,6 +689,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_cpu_set_threadpool;
+    }
+    if (strcmp(name, "ggml_backend_cpu_attach_threadpool") == 0) {
+        return (void *)ggml_backend_cpu_attach_threadpool;
     }
 
     return NULL;
