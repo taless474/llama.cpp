@@ -1245,7 +1245,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), (int)ubatch.n_tokens);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2188,7 +2188,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                    int   n_tokens) {
+    const bool batched   = n_tokens > 1;
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2207,17 +2208,22 @@ ggml_status llama_context::graph_compute(
 
 #ifdef GGML_HPX
     if (hpx_exec != nullptr) {
-        ggml_backend_sched_reset(sched.get());
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            return GGML_STATUS_ALLOC_FAILED;
+        // Tiny prefill batches pay more in HPX dispatch overhead than they
+        // gain from parallel execution.  Route them through the normal
+        // scheduler path instead.  Threshold is tunable; 16 tokens is a
+        // conservative starting point — revisit once profiling data exists.
+        static constexpr int GGML_HPX_PREFILL_MIN_TOKENS = 16;
+        if (batched && n_tokens < GGML_HPX_PREFILL_MIN_TOKENS) {
+            // fall through to ggml_backend_sched_graph_compute_async below
+        } else {
+            ggml_hpx_decode_backends bundle{backend_cpu, /*blas=*/nullptr};
+            ggml_hpx_exec_status hst = batched
+                ? ggml_hpx_exec_run_prefill(hpx_exec, gf, sched.get())
+                : ggml_hpx_exec_run_decode(hpx_exec, gf, bundle);
+            return (hst == ggml_hpx_exec_status::ok)
+                ? GGML_STATUS_SUCCESS
+                : GGML_STATUS_FAILED;
         }
-        ggml_hpx_decode_backends bundle{backend_cpu, /*blas=*/nullptr};
-        ggml_hpx_exec_status hst = batched
-            ? ggml_hpx_exec_run_prefill(hpx_exec, gf, sched.get())
-            : ggml_hpx_exec_run_decode(hpx_exec, gf, bundle);
-        return (hst == ggml_hpx_exec_status::ok)
-            ? GGML_STATUS_SUCCESS
-            : GGML_STATUS_FAILED;
     }
 #endif
 

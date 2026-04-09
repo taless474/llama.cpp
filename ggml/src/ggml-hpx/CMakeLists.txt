@@ -33,6 +33,11 @@ target_include_directories(ggml-hpx
 target_link_libraries(ggml-hpx
     PRIVATE
         HPX::hpx
+        # ggml-cpu: needed by the parallel-chain prototype in ggml-hpx-exec.cpp
+        # to create per-chain CPU backends (ggml_backend_cpu_init /
+        # ggml_backend_cpu_set_n_threads).  Remove when the prototype is
+        # replaced by a registration-based backend factory.
+        ggml-cpu
 )
 
 target_compile_features(ggml-hpx PRIVATE cxx_std_17)

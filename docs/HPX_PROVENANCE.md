@@ -1150,3 +1150,543 @@ What is intentionally **not** solved yet:
 3. Design dependency-aware prefill scheduling using `prev_idx`.
 4. Improve allocation reuse in the HPX llama path so `graph_compute` does not need reset+alloc on every call.
 5. Revisit decode BLAS backend plumbing once correctness/perf baselines are established.
+
+## 2026-04-08: llama.cpp end-to-end HPX exec smoke integration (updated after TinyLlama validation)
+
+### Summary
+
+This milestone wires `ggml-hpx-exec` into a real llama.cpp inference path and validates it end-to-end on a CPU-only TinyLlama smoke run.
+
+The HPX execution layer is now integrated behind `LLAMA_USE_HPX` inside `llama_context::graph_compute`. The purpose of this milestone is correctness-first integration: prove that HPX-backed orchestration can replace the scheduler compute call on a real inference path while preserving outputs.
+
+After integration and follow-up fixes, all tested scenarios now match the reference path exactly, including a long-prompt prefill-heavy case that initially exposed a correctness bug.
+
+### Integration point
+
+The single hook remains:
+
+- `src/llama-context.cpp`
+- `llama_context::graph_compute(ggml_cgraph * gf, bool batched)`
+
+Behavior:
+- `batched == false` → `ggml_hpx_exec_run_decode(...)`
+- `batched == true`  → `ggml_hpx_exec_run_prefill(...)`
+
+The rest of llama-side graph construction and batching logic is unchanged.
+
+### Enabling HPX exec
+
+This milestone keeps HPX integration private and opt-in:
+
+- `llama_context` owns an optional private `ggml_hpx_exec * hpx_exec`
+- the constructor reads `LLAMA_USE_HPX`
+- when enabled, it creates the HPX exec object
+- the destructor destroys it
+
+No permanent public llama API surface was added.
+
+### Important contract clarification: allocation happens before compute
+
+The correct llama-side sequencing is:
+
+1. `ggml_backend_sched_reset(...)`
+2. `ggml_backend_sched_alloc_graph(...)`
+3. `set_inputs(...)`
+4. `graph_compute(...)`
+
+This means `graph_compute(...)` must be **compute-only**.
+
+An earlier HPX integration attempt incorrectly repeated:
+
+- `ggml_backend_sched_reset(...)`
+- `ggml_backend_sched_alloc_graph(...)`
+
+inside the HPX branch of `graph_compute(...)`. That destroyed backend allocations **after** `set_inputs(...)` had already written data, causing input clobbering.
+
+This bug was the root cause of the long-prompt prefill divergence described below. The fix was to remove the redundant reset/allocation from the HPX compute branch and rely on the caller-prepared scheduler state.
+
+### Current compute behavior
+
+#### Decode
+
+Decode now runs real region compute through `ggml-hpx-exec` and is correct on end-to-end llama inference.
+
+Current decode backend bundle in llama integration:
+- `cpu = backend_cpu`
+- `blas = nullptr`
+
+So any `blas_delegated` region falls back to CPU execution for now. This is correct for the current CPU-only smoke path.
+
+#### Prefill
+
+Prefill now runs correctly end-to-end, but remains **sequential** for correctness.
+
+Earlier attempts launched all prefill regions concurrently. That was wrong for sequential graphs because later regions depend on activations produced by earlier regions. Prefill dispatch was therefore changed to a serial loop. Future prefill parallelism must respect explicit region dependencies.
+
+### Bugs found and fixed during end-to-end integration
+
+#### Bug 1: artificial 64-region cap
+
+**Root cause**
+
+`ggml_hpx_region` used a `uint64_t dep_mask`, which imposed an artificial upper bound on region count. Real LLM graphs can produce well over 64 backend transitions.
+
+**Fix**
+
+Replaced:
+- `dep_mask : uint64_t`
+
+with:
+- `prev_idx : uint32_t`
+
+where:
+- `UINT32_MAX` = no predecessor
+- otherwise `prev_idx` = immediate predecessor region
+
+Removed:
+- `GGML_HPX_MAX_REGIONS`
+- `sequential_dep()`
+- static assertion / bitmask assumptions
+
+This better reflects the current execution model: a linear predecessor chain, not a general DAG.
+
+#### Bug 2: double `split_graph(...)` in prefill adaptation
+
+**Root cause**
+
+`adapt_prefill(...)` called `split_graph(...)` internally, even though llama integration already called `ggml_backend_sched_alloc_graph(...)`, which itself populates scheduler split state.
+
+Calling `split_graph(...)` again after allocation changed scheduler state and invalidated split assumptions.
+
+**Fix**
+
+Removed the internal `split_graph(...)` call from `adapt_prefill(...)`.
+
+Prefill adaptation is now a pure reader of already-populated scheduler state. Callers must ensure split/allocation state exists before calling prefill adaptation or `run_prefill(...)`.
+
+#### Bug 3: invalid `regions.size() == expected_splits` assumption
+
+**Root cause**
+
+The prefill region builder assumed region count would match scheduler split count.
+
+That ceased to be true after allocation, because the scheduler may insert copy nodes for backend transfers. Those nodes can increase contiguous backend-region count without preserving the earlier equality.
+
+**Fix**
+
+Removed:
+- the `expected_splits` parameter
+- the invalid equality assertion
+
+Retained only structural invariants:
+- regions are non-empty
+- first region starts at node 0
+- last region ends at `ggml_graph_n_nodes(gf)`
+- regions are contiguous and ordered
+- each region is backend-uniform under current construction rules
+
+#### Bug 4: parallel prefill data races / NaN outputs
+
+**Root cause**
+
+Prefill regions were launched concurrently even though sequential graphs require region `N-1` to complete before region `N` consumes its outputs.
+
+**Fix**
+
+Changed prefill dispatch to a sequential loop.
+
+`prev_idx` is now the honest place to carry dependency information for future dependency-aware prefill parallelism.
+
+#### Bug 5: HPX `graph_compute(...)` branch clobbered already-written inputs
+
+**Root cause**
+
+The first llama integration added:
+
+- `ggml_backend_sched_reset(...)`
+- `ggml_backend_sched_alloc_graph(...)`
+
+inside the HPX branch of `llama_context::graph_compute(...)`.
+
+But llama had already done:
+
+- reset
+- alloc_graph
+- `set_inputs(...)`
+
+before entering `graph_compute(...)`.
+
+So the HPX branch destroyed and recreated backend allocations after input tensors had already been populated. On small decode graphs this sometimes appeared to work by coincidence because memory was reused similarly; on a long-prompt prefill graph the input data was genuinely lost and output diverged.
+
+**Observed symptom**
+
+On a long-prompt, prefill-heavy TinyLlama run:
+- reference path generated a whitespace token
+- HPX path generated `<unk>`
+
+This was a real correctness failure.
+
+**Fix**
+
+Removed the redundant scheduler reset/allocation from the HPX branch in `graph_compute(...)`.
+
+The contract is now explicit:
+- caller prepares scheduler state and writes inputs
+- `graph_compute(...)` performs compute only
+
+After this fix, the long-prompt divergence disappeared and all tested scenarios matched.
+
+### Tests added / updated
+
+#### ggml-hpx exec tests
+
+Real-compute correctness tests were added for both execution paths:
+- decode CPU-only correctness on a nontrivial graph (`mul_mat` + `neg`)
+- prefill CPU-only correctness on a scheduler-backed graph (`mul_mat` + `neg`)
+
+These compare HPX results against backend/scheduler baselines and verify exact output match.
+
+#### llama smoke test
+
+Added:
+- `tests/hpx/test_hpx_llama_smoke.cpp`
+
+The test:
+1. reads `LLAMACPP_TEST_MODELFILE`
+2. skips cleanly if absent
+3. loads one model
+4. creates two contexts:
+   - reference
+   - HPX (`LLAMA_USE_HPX=1`)
+5. runs the same prompt through both
+6. compares logits element-by-element
+
+This is the first model-backed test proving that HPX exec can replace the normal compute call inside llama.cpp on a CPU-only inference path.
+
+### End-to-end TinyLlama results
+
+Model used:
+- TinyLlama-1.1B-Chat-v1.0.Q4_K_M
+
+Driver:
+- `llama-simple`
+
+Runs were compared with the same binary:
+- baseline
+- `LLAMA_USE_HPX=1`
+
+#### Correctness scenarios
+
+All three scenarios match after the input-clobber fix:
+
+- short prompt, `-n 32` → match
+- long prompt (~202 tokens), `-n 1` → match
+- short prompt, `-n 128` → match
+
+The earlier long-prompt `<unk>` divergence is fixed.
+
+#### Performance signals (Release, CPU-only)
+
+Observed trends after the correctness fix:
+
+- **small prompt eval / prefill (2–5 tokens):**
+  HPX is still substantially slower (~3–4×), consistent with dispatch/setup overhead dominating very small batches
+
+- **large prefill (~202 tokens):**
+  HPX is only about ~1.1× slower, indicating overhead amortizes as batch size grows
+
+- **decode-heavy runs:**
+  HPX decode is near parity with baseline (within noise / small regression range)
+
+This is the current baseline:
+- correctness is clean
+- decode is roughly at parity
+- prefill overhead shrinks as batch size grows
+- tiny prefill batches remain the obvious weak spot
+
+### Files changed in this milestone
+
+- `ggml/src/ggml-hpx/ggml-hpx-region.h`
+  - replace `dep_mask` with `prev_idx`
+- `ggml/src/ggml-hpx/ggml-hpx-adapter.cpp`
+  - remove internal `split_graph(...)`
+  - update prefill region construction
+  - remove invalid region/split equality assumption
+- `ggml/src/ggml-hpx/ggml-hpx-adapter.h`
+  - document caller-populated scheduler-state precondition
+- `ggml/src/ggml-hpx/ggml-hpx-exec.cpp`
+  - real compute in chunk functions
+  - prefill dispatch made sequential for correctness
+- `ggml/src/ggml-hpx/ggml-hpx-exec.h`
+  - exec entry points take `ggml_cgraph *`
+- `src/llama-context.h`
+  - private `ggml_hpx_exec * hpx_exec`
+- `src/llama-context.cpp`
+  - `LLAMA_USE_HPX` integration
+  - HPX branch inside `graph_compute(...)`
+  - remove redundant scheduler reset/allocation from HPX compute path
+- `src/CMakeLists.txt`
+  - link llama against `ggml-hpx` when `GGML_HPX` is enabled
+- `tests/hpx/test_hpx_exec.cpp`
+  - real-compute exec tests
+- `tests/hpx/test_hpx_llama_smoke.cpp`
+  - model-backed smoke test
+- `tests/hpx/CMakeLists.txt`
+  - smoke test target
+
+### Current status after this update
+
+What is now true:
+
+- `ggml-hpx-exec` is integrated into a real llama.cpp inference path
+- decode and prefill chunk functions execute real backend compute
+- TinyLlama smoke validation passes end-to-end
+- all tested prompt/decode scenarios now match reference outputs
+- the fake 64-region cap is gone
+- prefill adaptation reads scheduler state instead of mutating it
+- prefill is correct, but currently sequential
+- decode is roughly at parity in Release CPU-only runs
+- HPX overhead amortizes as prefill batch size grows
+
+What remains intentionally unsolved:
+
+- no dependency-aware parallel prefill scheduling yet
+- no tiny-prefill fallback threshold yet
+- no live BLAS backend in llama decode bundle yet
+- no llama-side abort plumbing into `ggml_hpx_exec_abort`
+- no deeper performance tuning yet for executor/pool choice or `n_prefill_threads`
+
+### Next steps
+
+1. Add a small-batch prefill fallback to the normal scheduler path.
+2. Measure/tune the cutoff where HPX becomes worthwhile for prefill.
+3. Design dependency-aware prefill scheduling using `prev_idx`.
+4. Revisit allocation reuse / scheduler-state assumptions only if needed for further optimization.
+5. Revisit decode BLAS backend plumbing once correctness/perf baselines are stable.
+
+
+### 2026-04-09: scattered-node compute viability confirmed
+
+A follow-on experiment tested whether `ggml_backend_graph_compute(...)` requires a contiguous `[node_begin, node_end)` slice from an original graph, or whether it can execute an arbitrary node list.
+
+#### Result
+
+It can execute an arbitrary node list.
+
+A synthetic test graph was built with:
+- `x` as input
+- `A = neg(x)`
+- `B = neg(A)` (dependent, interleaved)
+- `C = relu(x)`
+- `D = abs(x)`
+
+A custom `ggml_cgraph` was then constructed whose `nodes[]` contained only the scattered subset `{A, C, D}` in topological order. The backend compute call executed `A`, `C`, and `D` correctly while skipping `B`. This shows that `ggml_backend_graph_compute(...)` is effectively node-list driven: it executes the supplied `nodes[0..n_nodes)` and resolves inputs through tensor `src[]` pointers rather than requiring a contiguous slice from a larger graph.
+
+Implication: the current HPX design is not limited to contiguous region views. A future dispatch primitive can represent non-contiguous independent node groups and still use `ggml_backend_graph_compute(...)` as the execution primitive.
+
+#### Important test/debugging note: gallocr aliasing
+
+The first version of the scattered-node test failed for a misleading reason: `ggml_gallocr` reused buffers aggressively via in-place aliasing. In the diagnostic graph:
+
+- `x->data == D->data`
+- `A->data == B->data`
+
+and after full-graph compute, `x` no longer held the original input values; it had been overwritten by `abs(x)`. This showed that zeroing or reusing “output” tensors in the test also clobbered inputs/intermediates through aliasing. The diagnostic output explicitly showed both pointer aliasing and the post-compute mutation of `x`. :contentReference[oaicite:0]{index=0}
+
+To avoid false negatives, the scattered-node viability test was switched from `ggml_gallocr` to `ggml_backend_alloc_ctx_tensors(...)`, which gives each tensor its own storage slice for the purposes of the test. With aliasing removed, the scattered-node test passed (10/10 suite green).
+
+#### Design implication
+
+This changes the next-step decision materially:
+
+- The limiting factor is **not** `ggml_backend_graph_compute(...)`.
+- The project can support a **scattered-node dispatch primitive** for CPU prefill work.
+- The real opportunity remains the intra-region parallel groups already identified in prefill CPU regions:
+  - the contiguous FFN gate/up pair
+  - the scattered Q/K/V projection paths
+  - the scattered reshape/rope/view/cache-write follow-on groups
+
+The most promising next prototype is therefore **not** more runtime-level parallelism over existing whole regions. It is a narrow scattered-node dispatch prototype inside one CPU prefill region, targeting the obvious independent Q/K/V groups first.
+
+#### Current conclusion
+
+The contiguous-range `ggml_graph_view(...)` model is no longer the hard boundary. Parallelism exists inside CPU prefill regions, and the backend execution primitive can support it. The remaining work is representational and scheduling work:
+- identify independent node subsets,
+- package them as scattered node lists,
+- dispatch them safely in parallel,
+- and preserve topological ordering between dependent groups.
+
+## 2026-04-09: end-to-end validation, small-batch bypass, and outer-parallelism limit
+
+### Summary
+
+This update closes the current “HPX above ggml” phase.
+
+The llama.cpp integration is now correct end-to-end on CPU-only TinyLlama runs, including the previously failing long-prompt prefill-heavy case. A small-batch prefill bypass was added to avoid obvious HPX overhead on tiny prompts. Follow-on experiments then established two important limits of the current design:
+
+1. `ggml_backend_graph_compute(...)` can execute arbitrary scattered node lists correctly, so the execution primitive is more flexible than a simple contiguous `[begin, end)` graph view.
+2. Even with that flexibility, outer orchestration above ggml does **not** yield a speedup for intra-region CPU parallelism, because separate `ggml_backend_cpu_init()` instances create separate ggml CPU threadpools that do not share a thread budget.
+
+The resulting conclusion is clear: correctness is in place, decode is near parity, large prefill overhead amortizes, but further wins likely require integration at ggml’s internal CPU executor/threadpool layer rather than outside it.
+
+### Llama integration correctness fix
+
+The initial HPX llama integration had a correctness bug in `llama_context::graph_compute(...)`.
+
+The correct llama-side sequence is:
+
+1. `ggml_backend_sched_reset(...)`
+2. `ggml_backend_sched_alloc_graph(...)`
+3. `set_inputs(...)`
+4. `graph_compute(...)`
+
+An earlier HPX branch inside `graph_compute(...)` incorrectly repeated:
+
+- `ggml_backend_sched_reset(...)`
+- `ggml_backend_sched_alloc_graph(...)`
+
+This destroyed and recreated backend allocations **after** `set_inputs(...)` had already written prompt data. Small decode graphs often still appeared correct by coincidence because memory reuse was similar, but long-prompt prefill graphs diverged because input data was actually lost.
+
+The fix was to remove the redundant scheduler reset/allocation from the HPX branch in `graph_compute(...)` and make that path compute-only.
+
+After this fix, all tested TinyLlama scenarios matched the reference path exactly.
+
+### End-to-end TinyLlama status
+
+Using `llama-simple` with TinyLlama in CPU-only mode:
+
+- short prompt, `-n 32` → match
+- long prompt (~202 tokens), `-n 1` → match
+- short prompt, `-n 128` → match
+
+There are now no observed correctness divergences in the tested end-to-end scenarios.
+
+### Small-batch prefill bypass
+
+A prefill threshold bypass was added:
+
+- `GGML_HPX_PREFILL_MIN_TOKENS = 16`
+
+Behavior:
+
+- small prefill batches below the threshold use the normal scheduler path
+- larger prefill batches continue to use HPX prefill
+
+Observed effect:
+
+- short prompt cases improved meaningfully
+- long-prompt prefill remained only modestly slower than baseline
+- decode remained near parity
+- very small overall workloads are still weak because the decode loop itself still goes through HPX and its overhead dominates at tiny scale
+
+This threshold is currently a pragmatic policy knob, not a fundamental solution.
+
+### Scattered-node compute experiment
+
+A dedicated experiment tested whether `ggml_backend_graph_compute(...)` requires a contiguous node slice or whether it can execute an arbitrary node list.
+
+Result:
+
+- arbitrary scattered node lists work correctly, as long as the supplied nodes are topologically valid and data-independent with respect to skipped nodes
+- a test graph with interleaved nodes showed that a custom graph containing only `{A, C, D}` executed those nodes correctly while skipping `B`
+
+This means the backend execution primitive is effectively node-list driven, not inherently tied to contiguous `[node_begin, node_end)` region views.
+
+### Important allocator finding
+
+The first version of the scattered-node test failed for a misleading reason:
+
+- `ggml_gallocr` aggressively reuses buffers through in-place aliasing
+- in the diagnostic graph, `x->data == D->data` and `A->data == B->data`
+- zeroing “outputs” therefore also clobbered inputs/intermediates
+
+For the scattered-node viability test, the allocation strategy was switched to `ggml_backend_alloc_ctx_tensors(...)`, which gives tensors distinct storage for the purposes of the experiment. With aliasing removed, the scattered-node experiment passed.
+
+This is an important testing note: gallocr aliasing can invalidate naive correctness experiments that assume tensor outputs are independently owned.
+
+### Intra-region parallel projection prototype
+
+A narrow prototype then used the scattered-node capability to parallelize one obvious independent pattern inside a CPU prefill region:
+
+- the FFN `gate` / `up` projection pair
+
+The prototype decomposed a CPU region into:
+
+- `before`
+- `chain0`
+- `chain1`
+- `after`
+
+and ran `chain0` and `chain1` in parallel via HPX while keeping the surrounding work serial.
+
+#### Correctness
+
+Correctness passed:
+
+- baseline
+- HPX serial
+- HPX parallel prototype
+
+all produced bit-exact outputs across the tested scenarios.
+
+So the decomposition and orchestration were valid.
+
+#### Performance
+
+Performance did **not** improve.
+
+A shared-budget check gave:
+
+- serial HPX (4 threads, 1 pool): 410 ms
+- parallel HPX (2 chains × 2 threads): 631 ms
+
+So the parallel prototype was **1.54× slower** than the serial HPX version.
+
+### Why the prototype lost
+
+The slowdown is structural at this layer.
+
+Each parallel chain used its own `ggml_backend_cpu_init()` backend, and each such backend creates its own independent ggml CPU threadpool. That means:
+
+- the prototype did **not** redistribute the original thread budget across two chains
+- instead, it created new threadpools on top of the existing backend/threadpool arrangement
+- the original scheduler-owned threads sat idle during the parallel phase
+- the new per-chain backends paid their own threadpool/setup/cache costs
+
+Therefore, “2+2 threads” in the prototype was not a true shared 4-thread budget. It was two additional 2-thread ggml pools layered outside the original ggml CPU threading model.
+
+This is the key negative result of the current branch:
+
+**Outer HPX orchestration above ggml backends does not compose with ggml’s internal CPU threading model for intra-region parallelism.**
+
+### Current conclusion
+
+At the end of this phase:
+
+- llama.cpp integration through `ggml-hpx-exec` is correct end-to-end
+- decode is near parity on CPU-only TinyLlama runs
+- prefill overhead shrinks as prompt size grows
+- a small-batch prefill bypass helps the obvious tiny-prompt cases
+- scattered-node execution is semantically viable
+- but outer-parallel intra-region CPU execution is slower, because ggml backend thread ownership sits below the current orchestration layer
+
+### What this means for next work
+
+This branch has reached a clean stopping point.
+
+The current “HPX above ggml” design has been explored enough to establish both:
+- what works
+- where the boundary is
+
+The next meaningful performance-oriented project is **not** more polishing of outer-region orchestration. It is a deeper integration where ggml’s internal CPU execution resource (threadpool / executor ownership) becomes shareable or replaceable, so multiple logical computations can draw from one common execution substrate instead of each spawning a new ggml CPU backend pool.
+
+### Results folders
+
+This phase is recorded under:
+
+- `hpx-bench/results/2026-04-08-llama-simple-release-01-initial/`
+- `hpx-bench/results/2026-04-08-llama-simple-release-02-post-sched-reset-fix/`
+- `hpx-bench/results/2026-04-08-llama-simple-release-03-prefill-threshold-16/`
+- `hpx-bench/results/2026-04-09-llama-simple-release-04-parallel-proj-prototype/`
+
+These directories capture the progression from initial integration, to correctness fix, to threshold policy, to the final negative-result prototype for intra-region parallel projection.
