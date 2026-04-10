@@ -5,11 +5,11 @@
 
 This file explains **why this HPX layer exists**, **what problem it is trying to solve**, and **why the code is organized the way it is**.
 
-It is written for a reader who may know C/C++ and parallel programming in general, but may **not** already know:
-- `llama.cpp`
-- `ggml`
-- HPX
-- why “decode” and “prefill” are treated differently
+### How to read this document
+
+This document is chronological.
+
+It records what happened in the order it actually happened, including intermediate benchmark results and design interpretations that were later corrected. Later sections sometimes revise earlier conclusions rather than replacing them.
 
 ---
 
@@ -44,9 +44,7 @@ That design direction is already reflected in the headers:
 - BLAS is treated as delegated work, not something reimplemented inside HPX
 - scheduler coupling is isolated to the adapter layer
 
----
-
-## 2. Why HPX is being considered
+### Why HPX?
 
 HPX is a C++ runtime for asynchronous and parallel execution. It provides facilities for:
 - task scheduling
@@ -57,7 +55,7 @@ HPX is a C++ runtime for asynchronous and parallel execution. It provides facili
 
 A naive idea would be:
 
-> “Replace the old threadpool with HPX and everything gets faster.” which we did in another branch :D
+> “Replace the old threadpool with HPX and everything gets faster.”
 
 That is **not** the assumption here.
 
@@ -72,13 +70,11 @@ It starts from:
 
 > “What is the right execution contract if we know we have two different workloads: decode and prefill?”
 
----
-
-## 3. Decode and prefill are different problems
+### Decode and prefill are different problems
 
 This project treats model inference as having **two major execution modes**.
 
-### Decode
+#### Decode
 Decode is the low-latency path used during token generation, often one token at a time.
 
 Its priorities are:
@@ -94,7 +90,7 @@ That is why the decode plan in `ggml-hpx-plan.h` is intentionally lean and store
 - chunking policy
 - workspace size
 
-### Prefill
+#### Prefill
 Prefill is the prompt/batch path. It is usually larger and more throughput-oriented.
 
 Its priorities are different:
@@ -113,9 +109,7 @@ That is why the prefill plan stores:
 
 This decode/prefill split is one of the central outcomes of the redesign.
 
----
-
-## 4. The execution unit is not a ggml op
+### The execution unit is not a ggml op
 
 A very tempting design would be:
 
@@ -137,9 +131,7 @@ The region definition was intentionally kept simple:
 
 That is enough to express coarse execution structure without coupling region objects to runtime-specific policy.
 
----
-
-## 5. Scheduler coupling is isolated to the adapter
+### _Decision_: Scheduler coupling is isolated to the adapter
 
 > **Only one translation unit should know about scheduler internals.**
 
@@ -154,9 +146,9 @@ This is why:
 - `ggml-hpx-exec.cpp` must not read scheduler state directly
 - `ggml-backend.h` is allowed only in the adapter implementation path, not throughout the HPX layer
 
-This decision has two big benefits:
+This decision has two big benefits.
 
-### Benefit 1: cleaner planning
+#### Benefit 1: cleaner planning
 The plan builder consumes an immutable snapshot, not a live scheduler object.
 
 That makes planning:
@@ -164,7 +156,7 @@ That makes planning:
 - easier to cache
 - less sensitive to scheduler lifetime/reset rules
 
-### Benefit 2: clearer ownership
+#### Benefit 2: clearer ownership
 The scheduler remains a ggml concern.  
 The HPX planner/executor consumes a translated result.
 
@@ -172,9 +164,7 @@ This is especially important because prefill is intentionally **scheduler-driven
 - `ggml_hpx_adapt_decode(...)`
 - `ggml_hpx_adapt_prefill(...)`
 
----
-
-## 6. BLAS is delegated instead of planned internally
+### BLAS is delegated instead of planned internally
 
 This project keeps BLAS support.
 
@@ -190,11 +180,9 @@ So the chosen approach is:
 - HPX may add dependencies before and after them
 - HPX does not plan inside them
 
-That is why region type includes `blas_delegated` as a first-class category. 
+That is why region type includes `blas_delegated` as a first-class category.
 
----
-
-## 7. Why plans are cached
+### Plans are cached
 
 Planning has a cost.  
 If the graph shape and execution assumptions are compatible across runs, rebuilding the plan every time is wasted work.
@@ -221,9 +209,7 @@ from
 
 Those are very different reasons for cache invalidation.
 
----
-
-## 8. Abort is cooperative, not preemptive
+### Abort is cooperative, not preemptive
 
 The abort model is intentionally simple and conservative.
 
@@ -233,11 +219,11 @@ The abort model is intentionally simple and conservative.
 - `reset()`
 
 The contract is:
-
 - no new region starts after abort is observed
 - a running CPU region stops at the next safe checkpoint
 - in-flight delegated work such as BLAS is not forcibly preempted
 - the executor returns an aborted status once cleanup is done
+
 Why not preemptive cancellation?
 
 Because preempting arbitrary low-level computation safely is much harder, especially when:
@@ -249,13 +235,11 @@ So the executor’s job is to **observe** abort and stop launching more work, no
 
 That model also appears cleanly in `ggml-hpx-exec.h`, where abort is exposed as an executor-level operation and the run status distinguishes `ok` from `aborted`.
 
----
+### _Decision_: Runtime and executor are separate
 
-## 9. Runtime and executor are separate
+Another key design decision is the split between `runtime` and `exec`.
 
-Another key design decision is the split between `runtime` and `exec`
-
-### Runtime
+#### Runtime
 The runtime owns long-lived HPX-related state:
 - runtime lifecycle
 - persistent worker teams
@@ -265,7 +249,7 @@ It also exposes the primitive parallel dispatch operations:
 - dispatch on decode team
 - dispatch on prefill team
 
-### Executor
+#### Executor
 The executor owns orchestration:
 - reset abort token
 - call adapter
@@ -285,9 +269,31 @@ Instead:
 
 That keeps the architecture easier to explain and easier to evolve.
 
+```text
+HPX SIDE                            PLAIN LLAMA/GGML SIDE
+
+adapter                             scheduler/split-prep world
+ggml_hpx_adapt_*                    ggml_backend_sched_alloc_graph(...)
+                                    split_graph(...)
+
+plan                                implicit scheduler/backend setup
+explicit HPX plan objects           graph + split/allocation state
+
+cache                               prepared scheduler/allocation state
+explicit plan cache                 what alloc_graph() has already set up
+
+executor / manager                  llama_context::graph_compute(...)
+ggml_hpx_exec_*                     src/llama-context.cpp
+
+runtime / workers                   backend compute path
+ggml-hpx-runtime                    ggml_backend_graph_compute(...)
+```
+
 ---
-### Implementation
-## 1. Instrumentation is passive first
+
+## 2. Early implementation: adapter, plan, cache, runtime, and executor
+
+### Instrumentation is passive first
 
 Instrumentation often grows until it starts distorting the design.
 
@@ -298,7 +304,7 @@ To avoid that, the first instrumentation layer is intentionally passive.
 - timing accumulators
 - scoped timers
 - run and region identifiers
-- optional benchmark-facing hooks 
+- optional benchmark-facing hooks
 
 What it does **not** do yet:
 - HPX performance counter integration
@@ -312,9 +318,9 @@ The first job of instrumentation here is to help answer simple questions:
 
 Those questions matter immediately, and they do not require deep integration with runtime-specific tooling.
 
-Later, if we want richer tracing, we can add it without making the core contract depend on it.
+### HPX orchestration pipeline
 
-```
+```text
 ggml graph
    │
    ▼
@@ -353,142 +359,55 @@ region execution
    ├── BLAS delegated region
    └── next ready region
 ```
-```
-Think of the whole system like shipping packages.
 
-llama/ggml = a pile of packages that must be delivered in the right order
-HPX = the delivery company
+### Adapter, plan, cache, runtime scratch, and test baseline
 
-Now the pieces:
+The HPX layer first moved from header-only design into a working implementation slice. The biggest completed piece at this stage was the **adapter / plan / cache path**.
 
-1. Adapter
-The adapter is the translator.
+The adapter has separate decode and prefill entry points, as intended by the contract.
 
-ggml speaks one language.
-Our HPX code speaks another language.
+- The **decode** path performs an independent graph walk and produces an HPX-owned topology plus a structural plan key.
+- The **prefill** path is scheduler-informed: it materializes scheduler split state, then reconstructs regions from scheduler-assigned backend identity and verifies the resulting region count against the scheduler’s split count.
 
-The adapter looks at the ggml graph and says:
-“Okay, here is the same work in a form HPX can understand.”
+This means the prefill path is no longer a generic graph walk, but it is still a **verified reconstruction** rather than a direct export of scheduler split boundaries.
 
-Very simple:
-adapter = translator between ggml and HPX
+The **plan layer** became a real structural transformation rather than just a design sketch. Decode plan building copies regions and creates default chunk specs. Prefill plan building copies topology and creates default per-region policies. Both decode and prefill plan checks now return precise mismatch reasons:
+- `stale_graph_shape`
+- `stale_backend_assign`
+- `stale_workspace`
+- `stale_policy`
 
-2. Plan
-The plan is the to-do list.
+One consistency fix made during this step was to treat **empty topology as valid everywhere**. That matches the decode path, matches what the adapter can produce for empty graphs, and keeps malformed-topology death tests focused on actual structural errors such as out-of-bounds spans or empty spans inside a region.
 
-Not the real work itself.
-Just the instructions for how to do it.
+The **cache layer** became real and intentionally simple. It is a value-style cache, not a heap-owned opaque service. It stores at most one decode plan and one prefill plan, and the lookup/insert API returns `const*` so the execution layer can use cached plans without ambiguity about ownership. Inserting a second plan of the same mode replaces the first cleanly.
 
-Example:
-- first do section A
-- then do section B
-- section C uses BLAS
-- section D uses CPU
+The **runtime** was still only partially implemented, but it had moved beyond a pure stub. Scratch buffer support became real: the runtime owns a scratch pointer and size, allocates on demand, grows when needed, and keeps the pointer stable when no grow is required. Dispatch was still synchronous and serial on the caller thread for now, so HPX worker teams were not yet wired.
 
-So:
-plan = reusable instruction sheet
+The **executor** remained a stub at that point. It could be created and destroyed, and it owned an abort token, but it did not yet orchestrate the full adapt → cache → scratch → dispatch flow.
 
-3. Cache
-The cache is memory.
+### What was implemented at this stage
 
-If we already made the same instruction sheet before,
-do not make it again.
-Just reuse it.
-
-So:
-cache = drawer where we keep old plans
-
-4. Executor
-The executor is the manager.
-
-It does not do the heavy lifting itself.
-It checks:
-- do we already have a plan?
-- if not, make one
-- are we aborting?
-- is scratch memory ready?
-- okay, runtime, go do this job
-
-So:
-executor = manager that decides what happens next
-
-5. Runtime
-The runtime is the workers.
-
-This is the part that actually sends work to HPX and runs it.
-
-So:
-runtime = the workers that actually do the job
-```
-
-## 2. Adapter, plan, cache, runtime scratch, and test baseline
-
-Since the last note (“Instrumentation is passive first”), the HPX layer moved from header-only design into a first working implementation slice.
-
-The biggest completed piece is the **adapter / plan / cache path**. The adapter now has separate decode and prefill entry points, as intended by the contract. The decode path performs an independent graph walk and produces an HPX-owned topology plus a structural plan key. The prefill path is scheduler-informed: it materializes scheduler split state, then reconstructs regions from scheduler-assigned backend identity and verifies the resulting region count against the scheduler’s split count. This means the prefill path is no longer a generic graph walk, but it is still a **verified reconstruction** rather than a direct export of scheduler split boundaries. That distinction matters for future refinement. :contentReference[oaicite:0]{index=0}
-
-The **plan layer** is now implemented as a real structural transformation rather than just a design sketch. Decode plan building copies regions and creates default chunk specs; prefill plan building copies topology and creates default per-region policies. Both decode and prefill plan checks now return precise mismatch reasons (`stale_graph_shape`, `stale_backend_assign`, `stale_workspace`, `stale_policy`) rather than a single stale/not-stale result. One consistency fix made during this step was to treat **empty topology as valid everywhere**. That matches the decode path, matches what the adapter can produce for empty graphs, and keeps the malformed-topology death tests focused on actual structural errors such as out-of-bounds spans or empty spans inside a region. 
-
-The **cache layer** is now real and intentionally simple. It is a value-style cache, not a heap-owned opaque service. It stores at most one decode plan and one prefill plan, and the lookup/insert API returns `const*` so the execution layer can use cached plans without ambiguity about ownership. Inserting a second plan of the same mode replaces the first cleanly. This is enough for a first execution layer and keeps cache semantics easy to test and reason about.
-
-The **runtime** is still only partially implemented, but it has moved beyond a pure stub. Scratch buffer support is now real: the runtime owns a scratch pointer and size, allocates on demand, grows when needed, and keeps the pointer stable when no grow is required. Dispatch is still synchronous and serial on the caller thread for now, so HPX worker teams are not yet wired, but the runtime contract for scratch ownership and “run each chunk exactly once” is already pinned down by tests. This means the next runtime step is narrower: replace the serial dispatch loops with HPX-backed dispatch without changing scratch semantics.
-
-The **executor** remains a stub at this point. It can be created and destroyed, and it owns an abort token, but it does not yet orchestrate the real flow of reset-abort → adapt → validate → cache lookup/build → scratch ensure → region iteration → runtime dispatch. That flow is the next major implementation target.
-
-A major outcome of today’s work is that the project now has a meaningful **test baseline**. The following suites are passing:
-- abort token tests: 7/7
-- decode plan tests: 8/8
-- prefill plan tests: 5/5
-- cache tests: 11/11
-- adapter tests: 6/6 on the implemented decode path, plus 3 skipped prefill tests that still need broader backend coverage or helper support :contentReference[oaicite:1]{index=1}
-
-The adapter tests are especially important because they now cover:
-- stable key generation for the same decode graph
-- propagation of `policy_version`
-- bounded decode topology with no `sched_split` regions
-- ownership-by-value of returned topology
-- empty-graph decode behavior
-- single-node decode behavior
-- CPU-backed prefill split distinctness, once two distinct CPU backend handles are created in the test helper :contentReference[oaicite:2]{index=2}
-
-One design clarification emerged during testing: for CPU-backed prefill split tests, using a generic “initialize backend by type” path can accidentally return the same backend object twice, which would hide split boundaries. The safer test strategy is to construct **distinct CPU backend instances** explicitly so adjacent CPU splits can be observed as separate `sched_split` regions. This reinforces a broader lesson from the adapter work: backend identity, not just backend category (“CPU” vs “non-CPU”), matters for preserving topology boundaries.
-
-In short, the project is no longer just a contract and file layout. It now has:
-1. a real adapter,
-2. real plan validation/building,
-3. a real cache,
-4. a partially real runtime (scratch yes, HPX dispatch not yet),
-5. a broad green test floor for the implemented pieces. 
-
-## Update: tested implementation baseline established
-
-Since the previous note (“Instrumentation is passive first”), the HPX layer has moved from interface design into a tested implementation baseline.
-
-### What is implemented now
-
-The adapter, plan, cache, runtime, and executor layers all have concrete `.cpp` files. The current state is intentionally incremental:
-
-- **adapter** is real
+- **adapter** was real
   - decode path performs an independent graph walk
   - prefill path is scheduler-informed
   - both return an HPX-owned topology snapshot plus a fully populated plan key
-- **plan** is real
-  - decode and prefill plan builders are implemented
-  - topology validation is implemented
+- **plan** was real
+  - decode and prefill plan builders implemented
+  - topology validation implemented
   - plan check returns specific mismatch reasons
-- **cache** is real
+- **cache** was real
   - value-style cache
   - one decode plan slot and one prefill plan slot
-  - replacement semantics are tested
-- **runtime** is partially real
-  - scratch buffer support is implemented
-  - dispatch is still serial/synchronous for now
-- **executor** is partially real
+  - replacement semantics tested
+- **runtime** was partially real
+  - scratch buffer support implemented
+  - dispatch still serial/synchronous
+- **executor** was partially real
   - create/destroy implemented
-  - abort is observed and consumed at run entry
+  - abort observed and consumed at run entry
   - empty/stub decode and prefill runs return correct status
 
-### Important design choices that were exercised in code
+### _Decision_: Important design choices exercised in code
 
 #### 1. Empty topology is valid
 The design was made consistent so that empty topology is accepted everywhere it needs to be:
@@ -504,14 +423,14 @@ Malformed topology is still rejected where appropriate, for example:
 #### 2. Prefill is scheduler-informed, but still reconstructed
 The current prefill adapter is no longer a generic graph walk. It calls into the scheduler, materializes split state, and reconstructs regions from scheduler-assigned backend identity. It then verifies the resulting region count against the scheduler’s split count.
 
-This means the prefill path is stronger than a naive backend-classification pass, but it is still a **verified reconstruction**, not a direct export of scheduler split boundaries. That distinction remains important for future refinement.
+This means the prefill path is stronger than a naive backend-classification pass, but it is still a **verified reconstruction**, not a direct export of scheduler split boundaries.
 
 #### 3. Backend identity matters
 Testing made it clear that backend identity, not just backend category (“CPU” vs “non-CPU”), matters for preserving region boundaries.
 
 For CPU-backed prefill tests, the fixture must use **distinct CPU backend instances**. Reusing one shared backend would hide boundaries and make the test meaningless. This was an important clarification for the adapter contract.
 
-#### 4. Abort semantics are now observable
+#### 4. Abort semantics are observable
 The executor now uses an **observe-and-consume** abort rule at run entry:
 - if abort is already set, the run returns `aborted`
 - the abort flag is cleared at the same time
@@ -519,9 +438,7 @@ The executor now uses an **observe-and-consume** abort rule at run entry:
 
 This keeps the current stub executor behavior honest and matches the intended test contract.
 
-### Test baseline
-
-At this point the implementation baseline is:
+### Test baseline at this stage
 
 - `test_hpx_abort`: **7 passed**
 - `test_hpx_cache`: **11 passed**
@@ -531,57 +448,22 @@ At this point the implementation baseline is:
 - `test_hpx_runtime`: **5 passed**
 - `test_hpx_exec`: **6 passed**
 
-Total: **50 passed, 1 skipped, 0 failed**. The one skipped test is intentional: it requires a second non-CPU backend to verify delegated-backend distinctness in prefill. :contentReference[oaicite:0]{index=0}
+Total: **50 passed, 1 skipped, 0 failed**
 
-### What this milestone means
+The one skipped test is intentional: it requires a second non-CPU backend to verify delegated-backend distinctness in prefill.
 
-The project is no longer just a design and file layout. It now has:
+### Runtime dispatch switched from serial stub to real HPX-backed prefill dispatch
 
-1. a real adapter,
-2. real plan validation/building,
-3. a real cache,
-4. a partially real runtime (scratch yes, HPX dispatch not yet),
-5. a partially real executor with observable abort behavior,
-6. a broad green test floor for the implemented pieces. 
+The next runtime step was to replace the serial prefill dispatch stub with real HPX-backed dispatch while keeping the public runtime interface unchanged.
 
-### What remains next
-
-The next implementation step is to replace serial runtime dispatch with real HPX-backed dispatch while preserving the now-established runtime contract:
-- scratch ownership stays the same
-- each chunk still runs exactly once
-- dispatch remains synchronous from the caller’s perspective
-
-After that, the executor can be upgraded from stub orchestration to a full path that actually uses:
-- adapter
-- plan/cache
-- scratch ensure
-- region iteration
-- runtime dispatch
+Current behavior after this change:
+- `ggml_hpx_runtime_dispatch_decode(...)` remains serial by design
+- `ggml_hpx_runtime_dispatch_prefill(...)` runs serially for `n_chunks < 2`
+- `ggml_hpx_runtime_dispatch_prefill(...)` uses `hpx::async` on the default HPX pool for `n_chunks >= 2`
+- the runtime still appears synchronous to callers: dispatch returns only after all chunk callbacks complete
 
 
-## 2026-04-07 — Runtime dispatch switched from serial stub to real HPX-backed prefill dispatch
-
-### Summary
-
-`ggml-hpx-runtime.cpp` now performs real HPX-backed parallel dispatch for prefill work while keeping the public runtime interface unchanged.
-
-Current behavior:
-
-- `ggml_hpx_runtime_dispatch_decode(...)` remains serial by design.
-- `ggml_hpx_runtime_dispatch_prefill(...)` runs serially for `n_chunks < 2`.
-- `ggml_hpx_runtime_dispatch_prefill(...)` uses `hpx::async` on the default HPX pool for `n_chunks >= 2`.
-- The runtime still appears synchronous to callers: dispatch returns only after all chunk callbacks complete.
-
-### Why this change
-
-The earlier runtime implementation was only a structural stub:
-
-- decode dispatch looped serially
-- prefill dispatch looped serially
-- tests covered correctness of callback invocation, but runtime did not yet exercise HPX underneath
-
-A new runtime test was added to force the next step:
-
+A new runtime test forced the next step:
 - `DispatchPrefillReturnsOnlyAfterAllChunksFinish`
 
 This test blocks each chunk callback and waits until all chunks have started before releasing them. It fails against the serial stub and passes only once prefill dispatch launches chunks concurrently.
@@ -590,35 +472,22 @@ This test blocks each chunk callback and waits until all chunks have started bef
 
 This change deliberately did **not** alter the public interface of `ggml-hpx-runtime.h`.
 
-Unchanged API surface:
-
-- `ggml_hpx_runtime_create(params)`
-- `ggml_hpx_runtime_destroy(rt)`
-- `ggml_hpx_runtime_scratch_ptr(rt)`
-- `ggml_hpx_runtime_scratch_ensure(rt, bytes)`
-- `ggml_hpx_runtime_dispatch_decode(rt, n_chunks, fn, user_data)`
-- `ggml_hpx_runtime_dispatch_prefill(rt, n_chunks, fn, user_data)`
-
-Important non-changes:
-
 - no plan-type unification at runtime level
 - no new runtime status return type
 - no abort token added to runtime dispatch
 - no public lane-scratch API
 - no change to decode semantics
 
-### HPX lifecycle decision
+### _Decision_: HPX runtime lifecycle starts once per process
 
 A refcounted start/stop-per-runtime design was considered first, but abandoned.
 
 Reason:
-
 - HPX cannot be initialized more than once per process
 - HPX cannot be cleanly restarted for each `create()` / `destroy()` pair
 - `hpx::finalize()` must run on an HPX thread
 
 Final lifecycle design:
-
 - HPX is started once per process via `std::call_once`
 - startup happens on first `ggml_hpx_runtime_create(...)`
 - shutdown is registered with `std::atexit(...)`
@@ -627,50 +496,37 @@ Final lifecycle design:
 
 This keeps the runtime wrapper compatible with unit tests, which create and destroy multiple runtime objects in one process.
 
-### Implementation notes
+### Implementation notes at this stage
 
 Runtime struct currently stores:
-
 - `n_prefill_threads`
 - `scratch_ptr`
 - `scratch_bytes`
 
 Current dispatch policy:
-
 - decode: always serial
 - prefill:
   - no-op for `fn == nullptr` or `n_chunks == 0`
   - serial for `n_chunks < 2`
-  - otherwise launch one `hpx::async` task per chunk, `hpx::wait_all(...)`, then surface exceptions with `future::get()`
+  - otherwise launch one `hpx::async` task per chunk, `hpx::wait_all(...)`, then surface exceptions
 
 The first implementation uses the default/global HPX pool.
-
-`n_prefill_threads` is stored but not yet used to cap task submission or bind work to a dedicated pool. That refinement is deferred.
 
 ### Tests added
 
 Three runtime tests were added:
-
 - `DispatchPrefillReturnsOnlyAfterAllChunksFinish`
 - `DispatchDecodeSingleChunkRunsExactlyOnce`
 - `DispatchPrefillSingleChunkRunsExactlyOnce`
 
 These were added on top of the existing runtime tests.
 
-Interpretation:
+### Validation result after the runtime change
 
-- the blocking prefill test proves that prefill dispatch is no longer a serial loop
-- the single-chunk tests protect the `n_chunks == 1` edge case, especially since prefill now has a serial fallback for tiny dispatches
-
-### Validation result
-
-After the runtime change:
-
-- `test_hpx_runtime`: 8 passed, 0 failed
-- full suite: 56 passed, 1 skipped, 0 failed
+- `test_hpx_runtime`: **8 passed**
+- full suite: **56 passed, 1 skipped, 0 failed**
 
 Suite breakdown at this milestone:
-
 - `test_hpx_abort`: 7 passed
 - `test_hpx_cache`: 11 passed
 - `test_hpx_decode_plan`: 8 passed
@@ -679,19 +535,18 @@ Suite breakdown at this milestone:
 - `test_hpx_runtime`: 8 passed
 - `test_hpx_exec`: 6 passed
 
-### What this milestone means
+### What this milestone meant
 
-This is the first point where the runtime layer is doing real HPX work rather than only preserving structure.
+This was the first point where the runtime layer was doing real HPX work rather than only preserving structure.
 
-The system now has:
-
+The system now had:
 - adapter tests green
 - decode/prefill plan tests green
 - cache tests green
 - exec tests green
 - runtime prefill dispatch actually using HPX underneath
 
-### Known limitations left intentionally for later
+### Known limitations intentionally left for later
 
 - decode is still serial
 - prefill uses the default HPX pool rather than a pool isolated to `n_prefill_threads`
@@ -699,53 +554,46 @@ The system now has:
 - runtime does not yet expose abort-aware dispatch directly
 - delegated-backend distinctness validation still depends on access to a second non-CPU backend
 
-### Best next step
+### Exec wired through adapter → cache → runtime
 
-Wire `exec.cpp` through the real orchestration path:
+The next step was to make `ggml-hpx-exec.cpp` the real orchestration entry point.
 
-1. observe-and-consume abort at run entry
-2. adapt graph
-3. determine decode vs prefill mode
-4. build or fetch cached plan
-5. ensure runtime scratch
-6. dispatch through runtime
-7. preserve existing exec result semantics
+`ggml-hpx-exec.cpp` now owned:
+- a runtime
+- a structural plan cache
+- an abort token
+- the policy version
 
-## 2026-04-08 — Exec wired through adapter → cache → runtime
+Both decode and prefill were driven through the same high-level sequence:
+- adapt
+- cache lookup/build
+- ensure scratch
+- dispatch through the runtime
 
-### Summary
+This was a meaningful milestone because the project was no longer just a collection of separately-tested pieces. The exec layer was connected end-to-end to the adapter, plan/cache, and runtime layers. The chunk functions were still stubs, so this did **not** yet execute real ggml compute, but the orchestration path was real.
 
-`ggml-hpx-exec.cpp` is now the real orchestration entry point for the HPX path. It owns a runtime, a structural plan cache, an abort token, and the policy version, and it drives both decode and prefill through the same high-level sequence: adapt, cache lookup/build, ensure scratch, then dispatch through the runtime. :contentReference[oaicite:0]{index=0}
+### Current exec shape at this stage
 
-This is a meaningful milestone because the project is no longer just a collection of separately-tested pieces. The exec layer is now connected end-to-end to the adapter, plan/cache, and runtime layers. The chunk functions are still stubs, so this does **not** execute real ggml compute yet, but the orchestration path is now real. :contentReference[oaicite:1]{index=1}
-
-### Current exec shape
-
-`ggml_hpx_exec` currently contains:
-
+`ggml_hpx_exec` currently contained:
 - `ggml_hpx_runtime* runtime`
 - `ggml_hpx_plan_cache cache`
 - `ggml_hpx_abort_token abort`
 - `uint32_t policy_version`
 
-This keeps plan caching and runtime ownership inside exec while leaving live backend handles out of the cached plan model. :contentReference[oaicite:2]{index=2}
+This kept plan caching and runtime ownership inside exec while leaving live backend handles out of the cached plan model.
 
 ### Abort rule implemented in exec
 
-Abort semantics are now explicitly split across three stages:
-
+Abort semantics were explicitly split across three stages:
 - **Entry:** observe-and-consume (`check`, `reset`, return `aborted`)
 - **Chunk fn:** check only, return early, never reset
 - **Post-dispatch:** observe-and-consume again
 
-The helper `consume_abort(...)` is the one place that resets the token. Chunk functions only call `check()`. 
+The helper `consume_abort(...)` is the one place that resets the token. Chunk functions only call `check()`.
 
-This gives exec cooperative abort behavior without forcing the runtime API itself to become abort-aware.
+### Decode path wired
 
-### Decode path now wired
-
-`ggml_hpx_exec_run_decode(...)` currently does:
-
+`ggml_hpx_exec_run_decode(...)` did:
 1. entry abort consume
 2. `ggml_hpx_adapt_decode(graph, policy_version)`
 3. early-out if adapted topology has no regions
@@ -755,17 +603,13 @@ This gives exec cooperative abort behavior without forcing the runtime API itsel
 7. runtime dispatch using `ggml_hpx_runtime_dispatch_decode(...)`
 8. post-dispatch abort consume
 
-The decode dispatch context currently carries a decode plan pointer, abort token pointer, and scratch pointer fetched from the runtime. 
+### Prefill path wired
 
-### Prefill path now wired
+`ggml_hpx_exec_run_prefill(...)` mirrored the decode flow, with two notable differences:
+- it required `sched`; `sched == nullptr` was an honest early-out
+- chunk count came from `plan->topo.regions.size()`
 
-`ggml_hpx_exec_run_prefill(...)` mirrors the decode flow, with two notable differences:
-
-- it requires `sched`; `sched == nullptr` is an honest early-out
-- chunk count comes from `plan->topo.regions.size()`
-
-The prefill path currently does:
-
+The prefill path did:
 1. entry abort consume
 2. early-out on `sched == nullptr`
 3. `ggml_hpx_adapt_prefill(graph, sched, policy_version)`
@@ -776,51 +620,34 @@ The prefill path currently does:
 8. runtime dispatch using `ggml_hpx_runtime_dispatch_prefill(...)`
 9. post-dispatch abort consume
 
-This keeps scheduler-derived execution decisions in the prefill run path instead of baking them into the cached plan. 
+This kept scheduler-derived execution decisions in the prefill run path instead of baking them into the cached plan.
 
-### Chunk functions are still structural stubs
+### Chunk functions were still structural stubs
 
-The current decode and prefill chunk functions intentionally do **not** run real ggml operations yet.
+The current decode and prefill chunk functions intentionally did **not** run real ggml operations yet.
 
-They currently:
-
+They:
 - cast `user_data` to a run-context struct
 - check abort and return early if requested
 - validate `chunk_idx` against the plan
 - validate region bounds
 - touch one byte of scratch at offset `chunk_idx` to prove execution reached that chunk
 
-This means the orchestration path is real, but compute semantics are still stubbed. The scratch touch is safe across chunks because each chunk writes only to its own byte offset. 
+This meant the orchestration path was real, but compute semantics were still stubbed.
 
-### Current status of the design
+### _Decision_: live backends belong in run context, not in plans
 
-At this point the architecture is:
-
-- **abort:** real and tested
-- **adapter:** real and tested
-- **plan/cache:** real and tested
-- **runtime:** real HPX-backed prefill dispatch; decode remains serial by design
-- **exec:** fully wired through adapter → cache → runtime, but chunk execution is still stubbed
-
-This is the first point where the overall pipeline exists end-to-end even though the chunk body is still placeholder logic.
-
----
-
-## Next agreed design step — live backends belong in run context, not in plans
-
-### Decision
-
-Plans remain **purely structural**. No live `ggml_backend_t` handles should be stored in a plan or in the plan cache.
+Plans remained **purely structural**. No live `ggml_backend_t` handles should be stored in a plan or in the plan cache.
 
 Live backend handles are execution-time resources and should be assembled in the **per-run context** passed to chunk functions.
 
-This preserves the invariant that cached plans are structural templates and avoids stale backend handles surviving a cache hit.
+This preserved the invariant that cached plans are structural templates and avoided stale backend handles surviving a cache hit.
 
 ### Decode API direction
 
 Decode can produce `blas_delegated` regions, so `run_decode(...)` should not be locked to a single backend handle.
 
-The agreed direction is to add a small per-run decode backend bundle:
+The agreed direction was to add a small per-run decode backend bundle:
 
 ```cpp
 struct ggml_hpx_decode_backends
@@ -832,110 +659,48 @@ struct ggml_hpx_decode_backends
 
 The bundle is passed per-run so backend ownership stays with the caller. Plans remain structural templates with no live handles inside them.
 
-Prefill is unchanged: it already receives `sched` and derives backends per split at run time.
-
 ### Fallback rule
 
-If a decode plan contains a `blas_delegated` region and `backends.blas` is `nullptr`, the region is routed to `backends.cpu`. This is semantically correct (CPU can execute any operation BLAS would handle, just slower) and requires no new status value.
+If a decode plan contains a `blas_delegated` region and `backends.blas` is `nullptr`, the region is routed to `backends.cpu`. This is semantically correct and requires no new status value.
 
----
+### Decode backend bundle implemented
 
-## 2026-04-08 — Decode backend bundle implemented; HPX best-practices audit
-
-### Summary
-
-Two things happened in this session:
-
-1. The `ggml_hpx_decode_backends` bundle was designed, implemented, and tested across four files.
-2. A broader HPX best-practices audit was done, resulting in one concrete correction to the runtime.
-
----
-
-### Decode backend bundle
-
-#### What changed
-
-**`ggml/src/ggml-hpx/ggml-hpx-fwd.h`**
-
-Added a forward declaration for `ggml_backend` and `ggml_backend_t` so that `exec.h` can use the type without pulling in `ggml-backend.h`. The annotation mirrors `ggml-backend.h` line 27.
-
-**`ggml/src/ggml-hpx/ggml-hpx-exec.h`**
-
-Added the `ggml_hpx_decode_backends` bundle struct and updated `ggml_hpx_exec_run_decode` to accept it as a third parameter. `run_prefill` is unchanged — it already receives `sched` and derives backends from it per split.
-
-**`ggml/src/ggml-hpx/ggml-hpx-exec.cpp`**
-
-Added a hard precondition near the top of `run_decode`, after the abort check:
-
-```cpp
-GGML_ASSERT(backends.cpu != nullptr);
-```
-
-This fires before any plan lookup or dispatch. A null CPU backend makes the bundle meaningless and is treated as a programmer error rather than a graceful fallback.
-
-Added a `backend_for_region` helper that selects `blas` for `blas_delegated` regions when `blas != nullptr`, and falls back to `cpu` otherwise.
-
-Updated `decode_run_ctx` to carry `ggml_hpx_decode_backends backends` instead of a bare cpu handle.
-
-Updated `decode_chunk_fn` to call `backend_for_region` and store the result in a local. This is **API and context shape change only** — no subgraph construction or `ggml_backend_graph_compute` call was added. Real compute semantics land when the subgraph_view constructor is implemented.
-
-**`tests/hpx/test_hpx_exec.cpp`**
-
-Added a RAII wrapper that owns backend lifetime automatically:
-
-```cpp
-struct cpu_backends_guard
-{
-    ggml_hpx_decode_backends b{};
-    explicit cpu_backends_guard() { b.cpu = ggml_backend_cpu_init(); }
-    ~cpu_backends_guard()        { ggml_backend_free(b.cpu); }
-    // deleted copy/assign
-};
-```
-
-All `run_decode` call sites declare a `cpu_backends_guard bg` and pass `bg.b`. No manual `ggml_backend_free` at call sites.
-
-#### Design decisions
-
-- **Plans stay structural.** No live `ggml_backend_t` handles are stored in the plan or plan cache. Cached plans are structural templates; handles are assembled per-run.
-- **CPU is a required precondition, not a comment.** `GGML_ASSERT` fires before any dispatch if `backends.cpu == nullptr`.
-- **BLAS fallback is silent and correct.** Missing `blas` routes to `cpu`. No new status value needed.
-- **`backend_for_region` is plumbing today.** It shapes the run context correctly for the eventual compute step but does not yet invoke `ggml_backend_graph_compute`.
-
----
+Implementation highlights:
+- forward declarations added so exec headers could mention `ggml_backend_t` without pulling in heavy backend headers
+- `ggml_hpx_exec_run_decode` updated to accept the backend bundle
+- a hard precondition was added:
+  ```cpp
+  GGML_ASSERT(backends.cpu != nullptr);
+  ```
+- `backend_for_region` selects BLAS when available and otherwise falls back to CPU
+- decode run context now carries the full backend bundle
 
 ### HPX best-practices audit
 
-#### Correct decisions
+A broader HPX best-practices audit was done, resulting in one concrete correction to the runtime.
 
-- **Lifecycle (`hpx::start` + `atexit`)**: canonical embedded-HPX pattern. `hpx::start` lets the main thread return; `hpx::init`/`hpx::main` would block it, which is wrong for a library. The `hpx::post(finalize)` trick is required because `hpx::finalize()` must be called from within an HPX thread.
-- **`std::call_once` for the no-restart constraint**: correct.
-- **`hpx::wait_all`**: correct HPX barrier primitive — see correction below.
-
-#### Corrected: `wait_all` + `get()` loop was redundant
+- **Lifecycle (`hpx::start` + `atexit`)**: canonical embedded-HPX pattern
+- **`std::call_once` for the no-restart constraint**: correct
+- **`hpx::wait_all`**: the earlier `wait_all` + `get()` loop was redundant
 
 The prior implementation followed `hpx::wait_all(futures)` with a `f.get()` loop under the assumption that `wait_all` was a barrier-only primitive and `get()` was needed to surface exceptions.
 
 This was wrong.
 
-In current HPX, `hpx::wait_all` waits for all futures to become ready **and** rethrows any stored exceptions. A following `get()` loop is redundant for `future<void>` — there are no results to extract and exceptions are already surfaced. The loop was removed from `ggml-hpx-runtime.cpp` and the file-top comment was corrected.
-
-A per-future `get()` loop is still acceptable if per-future error handling or explicit result consumption is needed, but it must not be added "for exception propagation" because that reason is incorrect.
+In current HPX, `hpx::wait_all` waits for all futures to become ready **and** rethrows any stored exceptions. A following `get()` loop is redundant for `future<void>`. The loop was removed from `ggml-hpx-runtime.cpp` and the file-top comment was corrected.
 
 #### Acceptable but non-idiomatic
 
-- **`hpx::async` per chunk + manual future vector**: works, but HPX's idiomatic parallel loop is `hpx::experimental::for_loop` or `hpx::for_each` with `hpx::execution::par`. Those avoid the heap allocation for the future vector and compose better with executors. For the current small-N-chunks use case the difference is negligible, but this is a known style gap.
+- **`hpx::async` per chunk + manual future vector**: works, but HPX's more idiomatic parallel loop tools are `hpx::experimental::for_loop` or `hpx::for_each` with `hpx::execution::par`. Those avoid the heap allocation for a future vector and compose better with executors. For the current small-`N` chunk counts, the practical difference is negligible, so this was left as a style gap rather than treated as a correctness issue.
 
 #### Known gaps, deferred intentionally
 
-- **`n_prefill_threads` is stored but ignored.** The default HPX pool uses however many threads HPX was started with (env-controlled). Wiring `n_prefill_threads` to a per-dispatch executor is deferred until the dispatch model matures.
-- **No `hpx::init_params` at startup.** Thread count and scheduler config rely on HPX auto-detection or environment variables. Acceptable for now.
+- **`n_prefill_threads` is stored but ignored.** The default HPX pool still uses however many threads HPX was started with. Wiring `n_prefill_threads` to a dedicated pool or executor was deferred until the dispatch model stabilized.
+- **No `hpx::init_params` at startup.** Thread count and scheduler configuration still rely on HPX auto-detection or environment variables. This was acceptable for the current phase.
 
----
+### Test result at this stage
 
-### Test result at this milestone
-
-No new tests were added in this session; the existing suite remained green:
+No new tests were added in that session; the existing suite remained green:
 
 - `test_hpx_abort`: 7 passed
 - `test_hpx_cache`: 11 passed
@@ -947,82 +712,70 @@ No new tests were added in this session; the existing suite remained green:
 
 **Total: 56 passed, 1 skipped, 0 failed**
 
+At this point the architecture had:
+- real and tested abort
+- real and tested adapter
+- real and tested plan/cache
+- real HPX-backed prefill runtime, with decode still serial
+- exec fully wired through adapter → cache → runtime, but chunk execution still stubbed
+
 ---
 
-### What remains next
+## 3. End-to-end llama.cpp integration and the limit of “HPX above ggml”
 
-The exec layer is now wired end-to-end with the correct context shape. The next implementation step is to make chunk functions do real compute:
+At this point the HPX layer was no longer just an internal library. The next question was whether it could replace the normal compute path inside a real llama.cpp run.
 
-1. Implement a `subgraph_view` constructor that presents `graph->nodes[begin..end)` as a complete `ggml_cgraph` without copying.
-2. Call `ggml_backend_graph_compute(backend, &subgraph_view)` inside `decode_chunk_fn`.
-3. Handle the `ggml_backend_graph_compute` return value and surface errors through the abort/status path.
+This phase also turned out to be the point where the first hard limit of the “outer HPX above ggml” design became visible.
 
-After that, the prefill chunk function needs the same treatment, driven from the scheduler-split model: backend per split derived from `sched` at run time, not from a static bundle.
+### Llama.cpp end-to-end HPX exec smoke integration
 
-## 2026-04-08: llama.cpp end-to-end HPX exec smoke integration
+The HPX execution layer was wired into `llama_context::graph_compute(...)` behind an opt-in environment variable (`LLAMA_USE_HPX`) when `GGML_HPX` is enabled at build time.
 
-### Summary
-
-This change moves the project from isolated `ggml-hpx-exec` correctness tests to a tiny end-to-end llama.cpp integration path.
-
-The HPX execution layer is now wired into `llama_context::graph_compute` behind an opt-in environment variable (`LLAMA_USE_HPX`) when `GGML_HPX` is enabled at build time. The goal of this milestone is correctness, not performance: prove that HPX-backed orchestration can replace the scheduler’s compute call on a CPU-only inference path and produce the same outputs as the reference path.
-
-The initial llama integration was validated with a model-backed smoke test that compares HPX and reference logits on the same prompt. The integration also exposed three correctness bugs in region/dependency handling, all of which were fixed in this milestone.
+The goal of this milestone was correctness, not performance:
+- prove that HPX-backed orchestration can replace the scheduler’s compute call on a CPU-only inference path
+- produce the same outputs as the reference path
 
 ### Integration point
 
 The single replacement point is `src/llama-context.cpp`, inside:
-
 - `llama_context::graph_compute(ggml_cgraph * gf, bool batched)`
 
-The existing thread/threadpool setup in `graph_compute` remains unchanged. The only behavioral change is that, when `LLAMA_USE_HPX` is set and `hpx_exec` exists, the function routes compute through `ggml-hpx-exec` instead of calling the scheduler’s normal compute path.
+The existing thread/threadpool setup in `graph_compute` remained unchanged. The only behavioral change was that, when `LLAMA_USE_HPX` is set and `hpx_exec` exists, the function routed compute through `ggml-hpx-exec` instead of calling the scheduler’s normal compute path.
 
-Mapping is:
-
+Mapping:
 - `batched == false` → `ggml_hpx_exec_run_decode(...)`
 - `batched == true`  → `ggml_hpx_exec_run_prefill(...)`
-
-This keeps the hook at the narrowest possible point: all existing graph construction and llama-side batching logic remain intact.
 
 ### Public/API surface
 
 No permanent public llama API knob was added for this milestone.
 
 Instead:
-
 - `llama_context` owns an optional private `ggml_hpx_exec * hpx_exec`
 - the constructor reads `LLAMA_USE_HPX`
 - when enabled, it creates the HPX exec object
 - the destructor destroys it
 
-This keeps the integration off by default and avoids exposing unstable HPX-exec plumbing through the public API before the path is better understood.
-
-### Current compute behavior
+### Current compute behavior at first integration
 
 #### Decode
-
-Decode remains structurally simple:
-
+Decode remained structurally simple:
 - adaptation/build/cache still run through `ggml-hpx-exec`
 - live backends are assembled per run
 - the backend bundle currently uses:
   - `cpu = backend_cpu`
   - `blas = nullptr`
 
-This means any `blas_delegated` decode region falls back to CPU execution for now. That is semantically correct and sufficient for the CPU-only smoke path.
+This means any `blas_delegated` decode region falls back to CPU execution for now.
 
 #### Prefill
-
-Prefill currently executes **sequentially** for correctness.
-
-Earlier versions launched all prefill regions in parallel with `hpx::async`, but this was incorrect for sequential graphs because later regions consumed activations that earlier regions had not finished producing. The dispatch was changed to a serial loop, matching decode behavior for now.
+Prefill initially launched regions in parallel, but that was found to be incorrect for sequential graphs. It was changed to a **sequential loop for correctness**.
 
 This is intentional. Prefill parallelism now depends on explicit dependency-aware scheduling and should not be re-enabled until that logic exists.
 
 ### Real compute in chunk functions
 
 This milestone completed the intended transition from stub chunk functions to real region execution:
-
 - chunk functions now build region views with `ggml_graph_view(...)`
 - chunk functions call `ggml_backend_graph_compute(...)`
 - backend failures request abort and surface as exec failure
@@ -1031,121 +784,84 @@ There is no per-node private compute-forward loop and no heap-copy subgraph cons
 
 ### Scheduler / allocation contract
 
-For the llama smoke path, the HPX branch in `graph_compute` now does:
-
+For the llama smoke path, the HPX branch originally did:
 1. `ggml_backend_sched_reset(sched.get())`
 2. `ggml_backend_sched_alloc_graph(sched.get(), gf)`
 3. route to HPX exec
 
-This is correctness-first behavior. It is acceptable for a smoke/integration milestone, but it does give up graph-reuse efficiency because the scheduler is reset and allocation is re-established on each HPX compute call.
+This turned out to be wrong, because llama had already done:
+1. reset
+2. alloc_graph
+3. `set_inputs(...)`
+4. `graph_compute(...)`
 
-The project still needs a cleaner long-term allocation contract (for example, an explicit public “ensure allocated” helper or equivalent state tracking), but that is out of scope for this change.
+Repeating reset/allocation inside the HPX branch destroyed and recreated backend allocations **after** input tensors had already been populated.
 
 ### Bugs found and fixed during end-to-end integration
 
 #### Bug 1: artificial 64-region cap
+**Root cause:** `ggml_hpx_region` used a `uint64_t dep_mask`, which imposed an artificial region limit.
 
-**Root cause**
-
-`ggml_hpx_region` used:
-
-- `dep_mask : uint64_t`
-
-This imposed an artificial region limit because the old code assumed a bitmask dependency encoding. Real LLM graphs produce far more than 64 backend transitions, especially on macOS where Accelerate/BLAS and host CPU buffers alternate frequently.
-
-**Fix**
-
-Replaced:
-
-- `dep_mask : uint64_t`
-
-with:
-
-- `prev_idx : uint32_t`
-
-where:
-
+**Fix:** replaced `dep_mask` with `prev_idx : uint32_t`, using:
 - `UINT32_MAX` = no predecessor
-- otherwise `prev_idx` is the immediate predecessor region
+- otherwise `prev_idx` = immediate predecessor region
 
-This removed:
-
+This also removed the old scaffolding tied to the bitmask model:
 - `GGML_HPX_MAX_REGIONS`
 - `sequential_dep()`
 - the related static assertion
-- all bitmask-based assumptions
 
-This is a more honest representation of the current execution model: regions are presently consumed as a linear chain, not a general DAG.
+This removed the fake region ceiling and also matched the actual current execution model more honestly.
 
 #### Bug 2: double `split_graph` in prefill adaptation
+**Root cause:** `adapt_prefill(...)` originally called `split_graph(...)` internally, even after the caller had already done `ggml_backend_sched_alloc_graph(...)`.
 
-**Root cause**
-
-`adapt_prefill(...)` originally called `split_graph(...)` internally.
-
-After llama integration, the caller was already doing `ggml_backend_sched_alloc_graph(...)`, which itself populates scheduler split state. Calling `split_graph(...)` again inside the adapter changed scheduler state after allocation and invalidated assumptions about split counts.
-
-**Fix**
-
-Removed the internal `split_graph(...)` call from `adapt_prefill(...)`.
-
-Prefill adaptation is now a **pure reader** of scheduler state. The caller is responsible for ensuring split/allocation state has already been populated before calling the adapter or `run_prefill(...)`.
-
-Tests that called `adapt_prefill(...)` directly were updated to populate split state explicitly first.
+**Fix:** removed the internal `split_graph(...)` call.  
+Prefill adaptation is now a **pure reader** of scheduler state.
 
 #### Bug 3: invalid `regions.size() == expected_splits` assumption
+**Root cause:** the old prefill region builder assumed the number of contiguous backend regions would match the scheduler split count.
 
-**Root cause**
+That was only valid before allocation. After `alloc_graph(...)`, the scheduler may insert extra copy nodes for backend transfers.
 
-The old prefill region builder assumed that the number of contiguous backend regions would match the scheduler split count.
-
-That was only valid before allocation. After `alloc_graph(...)`, the scheduler may insert extra copy nodes for backend transfers. Those nodes can create additional backend-type boundaries without changing the original split count in the way the adapter expected.
-
-**Fix**
-
-Removed the invalid equality assertion and the unused `expected_splits` parameter.
-
-The correct invariants now are structural only:
-
-- regions are non-empty
-- first region starts at node 0
-- last region ends at `ggml_graph_n_nodes(gf)`
-- regions are contiguous and ordered
-- each region is backend-uniform under current construction rules
+**Fix:** removed the invalid equality assertion and the unused `expected_splits` parameter. The remaining invariants are structural only.
 
 #### Bug 4: parallel prefill data races / NaN outputs
+**Root cause:** the first real-compute prefill runtime launched all regions concurrently, even though later regions depended on earlier ones.
 
-**Root cause**
+**Fix:** changed prefill dispatch to a **sequential loop**.
 
-The first real-compute prefill runtime launched all regions concurrently.
+#### Bug 5: HPX `graph_compute(...)` branch clobbered already-written inputs
+**Root cause:** the HPX branch in `llama_context::graph_compute(...)` repeated:
+- `ggml_backend_sched_reset(...)`
+- `ggml_backend_sched_alloc_graph(...)`
 
-For sequential graphs, region `N` depends on outputs from region `N-1`. Parallel launch allowed later regions to read tensors before their producers completed, causing bad values and NaNs.
+after `set_inputs(...)` had already written prompt data.
 
-**Fix**
+**Observed symptom:** on a long-prompt, prefill-heavy TinyLlama run:
+- reference path generated a whitespace token
+- HPX path generated `<unk>`
 
-Changed prefill dispatch to a sequential loop.
+**Fix:** removed the redundant scheduler reset/allocation from the HPX branch in `graph_compute(...)`.
 
-The new `prev_idx` field is the correct place to encode ordering information for future dependency-aware prefill parallelism, but no such scheduler exists yet. Correctness takes priority.
+The contract is now explicit:
+- caller prepares scheduler state and writes inputs
+- `graph_compute(...)` performs compute only
 
-### Tests added / updated
+After this fix, the long-prompt divergence disappeared.
+
+### Tests added and updated
 
 #### ggml-hpx exec tests
-
 Added real-compute correctness tests for both execution paths:
-
 - decode CPU-only correctness on a nontrivial graph (`mul_mat` + `neg`)
 - prefill CPU-only correctness on a scheduler-backed graph (`mul_mat` + `neg`)
 
-These compare HPX execution results against the plain backend/scheduler baseline and verify that the outputs match exactly.
-
 #### llama smoke test
-
 Added:
-
 - `tests/hpx/test_hpx_llama_smoke.cpp`
 
 This test:
-
 1. reads `LLAMACPP_TEST_MODELFILE`
 2. skips cleanly if no model is provided
 3. loads one model
@@ -1157,278 +873,6 @@ This test:
 
 This is the first model-backed test proving that HPX exec can replace the normal compute call inside llama.cpp on a CPU-only path.
 
-### Files changed in this milestone
-
-- `ggml/src/ggml-hpx/ggml-hpx-region.h`
-  - replace `dep_mask` with `prev_idx`
-- `ggml/src/ggml-hpx/ggml-hpx-adapter.cpp`
-  - prefill adapter no longer calls `split_graph(...)`
-  - region construction updated for `prev_idx`
-  - invalid split-count equality assumption removed
-- `ggml/src/ggml-hpx/ggml-hpx-adapter.h`
-  - contract updated: caller must prepare scheduler split state
-- `ggml/src/ggml-hpx/ggml-hpx-exec.cpp`
-  - real compute in chunk functions via `ggml_graph_view(...)` + `ggml_backend_graph_compute(...)`
-  - prefill dispatch made sequential for correctness
-- `ggml/src/ggml-hpx/ggml-hpx-exec.h`
-  - exec entry points take `ggml_cgraph *`
-- `src/llama-context.h`
-  - private `ggml_hpx_exec * hpx_exec`
-- `src/llama-context.cpp`
-  - `LLAMA_USE_HPX` handling
-  - HPX branch inside `graph_compute(...)`
-- `src/CMakeLists.txt`
-  - link llama against `ggml-hpx` when `GGML_HPX` is enabled
-- `tests/hpx/test_hpx_exec.cpp`
-  - new real-compute exec tests
-- `tests/hpx/test_hpx_llama_smoke.cpp`
-  - new model-backed smoke test
-- `tests/hpx/CMakeLists.txt`
-  - add smoke test target
-
-### Current status after this milestone
-
-What is now true:
-
-- `ggml-hpx-exec` is wired into llama.cpp at a real end-to-end integration point
-- decode chunk functions run real backend compute
-- prefill chunk functions run real backend compute
-- the llama CPU-only smoke path is in place
-- the prior fake 64-region ceiling is gone
-- prefill no longer mutates scheduler split state during adaptation
-- prefill is correct, but currently sequential
-
-What is intentionally **not** solved yet:
-
-- no dependency-aware parallel prefill scheduling
-- no graph-reuse optimization for the HPX branch in `graph_compute`
-- no live BLAS backend in the llama decode bundle yet (`blas = nullptr`)
-- no llama-side abort plumbing into `ggml_hpx_exec_abort`
-- no tuning yet for `n_prefill_threads` / executor choice
-
-### Next steps
-
-1. Run `examples/simple` on the same model/prompt with and without `LLAMA_USE_HPX=1` and compare generated output.
-2. Add light timing for:
-   - prefill-heavy prompt
-   - single-token decode
-   - short decode loop
-3. Design dependency-aware prefill scheduling using `prev_idx`.
-4. Improve allocation reuse in the HPX llama path so `graph_compute` does not need reset+alloc on every call.
-5. Revisit decode BLAS backend plumbing once correctness/perf baselines are established.
-
-## 2026-04-08: llama.cpp end-to-end HPX exec smoke integration (updated after TinyLlama validation)
-
-### Summary
-
-This milestone wires `ggml-hpx-exec` into a real llama.cpp inference path and validates it end-to-end on a CPU-only TinyLlama smoke run.
-
-The HPX execution layer is now integrated behind `LLAMA_USE_HPX` inside `llama_context::graph_compute`. The purpose of this milestone is correctness-first integration: prove that HPX-backed orchestration can replace the scheduler compute call on a real inference path while preserving outputs.
-
-After integration and follow-up fixes, all tested scenarios now match the reference path exactly, including a long-prompt prefill-heavy case that initially exposed a correctness bug.
-
-### Integration point
-
-The single hook remains:
-
-- `src/llama-context.cpp`
-- `llama_context::graph_compute(ggml_cgraph * gf, bool batched)`
-
-Behavior:
-- `batched == false` → `ggml_hpx_exec_run_decode(...)`
-- `batched == true`  → `ggml_hpx_exec_run_prefill(...)`
-
-The rest of llama-side graph construction and batching logic is unchanged.
-
-### Enabling HPX exec
-
-This milestone keeps HPX integration private and opt-in:
-
-- `llama_context` owns an optional private `ggml_hpx_exec * hpx_exec`
-- the constructor reads `LLAMA_USE_HPX`
-- when enabled, it creates the HPX exec object
-- the destructor destroys it
-
-No permanent public llama API surface was added.
-
-### Important contract clarification: allocation happens before compute
-
-The correct llama-side sequencing is:
-
-1. `ggml_backend_sched_reset(...)`
-2. `ggml_backend_sched_alloc_graph(...)`
-3. `set_inputs(...)`
-4. `graph_compute(...)`
-
-This means `graph_compute(...)` must be **compute-only**.
-
-An earlier HPX integration attempt incorrectly repeated:
-
-- `ggml_backend_sched_reset(...)`
-- `ggml_backend_sched_alloc_graph(...)`
-
-inside the HPX branch of `graph_compute(...)`. That destroyed backend allocations **after** `set_inputs(...)` had already written data, causing input clobbering.
-
-This bug was the root cause of the long-prompt prefill divergence described below. The fix was to remove the redundant reset/allocation from the HPX compute branch and rely on the caller-prepared scheduler state.
-
-### Current compute behavior
-
-#### Decode
-
-Decode now runs real region compute through `ggml-hpx-exec` and is correct on end-to-end llama inference.
-
-Current decode backend bundle in llama integration:
-- `cpu = backend_cpu`
-- `blas = nullptr`
-
-So any `blas_delegated` region falls back to CPU execution for now. This is correct for the current CPU-only smoke path.
-
-#### Prefill
-
-Prefill now runs correctly end-to-end, but remains **sequential** for correctness.
-
-Earlier attempts launched all prefill regions concurrently. That was wrong for sequential graphs because later regions depend on activations produced by earlier regions. Prefill dispatch was therefore changed to a serial loop. Future prefill parallelism must respect explicit region dependencies.
-
-### Bugs found and fixed during end-to-end integration
-
-#### Bug 1: artificial 64-region cap
-
-**Root cause**
-
-`ggml_hpx_region` used a `uint64_t dep_mask`, which imposed an artificial upper bound on region count. Real LLM graphs can produce well over 64 backend transitions.
-
-**Fix**
-
-Replaced:
-- `dep_mask : uint64_t`
-
-with:
-- `prev_idx : uint32_t`
-
-where:
-- `UINT32_MAX` = no predecessor
-- otherwise `prev_idx` = immediate predecessor region
-
-Removed:
-- `GGML_HPX_MAX_REGIONS`
-- `sequential_dep()`
-- static assertion / bitmask assumptions
-
-This better reflects the current execution model: a linear predecessor chain, not a general DAG.
-
-#### Bug 2: double `split_graph(...)` in prefill adaptation
-
-**Root cause**
-
-`adapt_prefill(...)` called `split_graph(...)` internally, even though llama integration already called `ggml_backend_sched_alloc_graph(...)`, which itself populates scheduler split state.
-
-Calling `split_graph(...)` again after allocation changed scheduler state and invalidated split assumptions.
-
-**Fix**
-
-Removed the internal `split_graph(...)` call from `adapt_prefill(...)`.
-
-Prefill adaptation is now a pure reader of already-populated scheduler state. Callers must ensure split/allocation state exists before calling prefill adaptation or `run_prefill(...)`.
-
-#### Bug 3: invalid `regions.size() == expected_splits` assumption
-
-**Root cause**
-
-The prefill region builder assumed region count would match scheduler split count.
-
-That ceased to be true after allocation, because the scheduler may insert copy nodes for backend transfers. Those nodes can increase contiguous backend-region count without preserving the earlier equality.
-
-**Fix**
-
-Removed:
-- the `expected_splits` parameter
-- the invalid equality assertion
-
-Retained only structural invariants:
-- regions are non-empty
-- first region starts at node 0
-- last region ends at `ggml_graph_n_nodes(gf)`
-- regions are contiguous and ordered
-- each region is backend-uniform under current construction rules
-
-#### Bug 4: parallel prefill data races / NaN outputs
-
-**Root cause**
-
-Prefill regions were launched concurrently even though sequential graphs require region `N-1` to complete before region `N` consumes its outputs.
-
-**Fix**
-
-Changed prefill dispatch to a sequential loop.
-
-`prev_idx` is now the honest place to carry dependency information for future dependency-aware prefill parallelism.
-
-#### Bug 5: HPX `graph_compute(...)` branch clobbered already-written inputs
-
-**Root cause**
-
-The first llama integration added:
-
-- `ggml_backend_sched_reset(...)`
-- `ggml_backend_sched_alloc_graph(...)`
-
-inside the HPX branch of `llama_context::graph_compute(...)`.
-
-But llama had already done:
-
-- reset
-- alloc_graph
-- `set_inputs(...)`
-
-before entering `graph_compute(...)`.
-
-So the HPX branch destroyed and recreated backend allocations after input tensors had already been populated. On small decode graphs this sometimes appeared to work by coincidence because memory was reused similarly; on a long-prompt prefill graph the input data was genuinely lost and output diverged.
-
-**Observed symptom**
-
-On a long-prompt, prefill-heavy TinyLlama run:
-- reference path generated a whitespace token
-- HPX path generated `<unk>`
-
-This was a real correctness failure.
-
-**Fix**
-
-Removed the redundant scheduler reset/allocation from the HPX branch in `graph_compute(...)`.
-
-The contract is now explicit:
-- caller prepares scheduler state and writes inputs
-- `graph_compute(...)` performs compute only
-
-After this fix, the long-prompt divergence disappeared and all tested scenarios matched.
-
-### Tests added / updated
-
-#### ggml-hpx exec tests
-
-Real-compute correctness tests were added for both execution paths:
-- decode CPU-only correctness on a nontrivial graph (`mul_mat` + `neg`)
-- prefill CPU-only correctness on a scheduler-backed graph (`mul_mat` + `neg`)
-
-These compare HPX results against backend/scheduler baselines and verify exact output match.
-
-#### llama smoke test
-
-Added:
-- `tests/hpx/test_hpx_llama_smoke.cpp`
-
-The test:
-1. reads `LLAMACPP_TEST_MODELFILE`
-2. skips cleanly if absent
-3. loads one model
-4. creates two contexts:
-   - reference
-   - HPX (`LLAMA_USE_HPX=1`)
-5. runs the same prompt through both
-6. compares logits element-by-element
-
-This is the first model-backed test proving that HPX exec can replace the normal compute call inside llama.cpp on a CPU-only inference path.
-
 ### End-to-end TinyLlama results
 
 Model used:
@@ -1437,106 +881,49 @@ Model used:
 Driver:
 - `llama-simple`
 
-Runs were compared with the same binary:
+Runs compared:
 - baseline
 - `LLAMA_USE_HPX=1`
 
 #### Correctness scenarios
-
-All three scenarios match after the input-clobber fix:
-
+All three scenarios matched after the input-clobber fix:
 - short prompt, `-n 32` → match
 - long prompt (~202 tokens), `-n 1` → match
 - short prompt, `-n 128` → match
 
-The earlier long-prompt `<unk>` divergence is fixed.
+The earlier long-prompt `<unk>` divergence was fixed.
 
 #### Performance signals (Release, CPU-only)
-
 Observed trends after the correctness fix:
+- **small prompt eval / prefill (2–5 tokens):** HPX still substantially slower (~3–4×), consistent with dispatch/setup overhead dominating very small batches
+- **large prefill (~202 tokens):** HPX only about ~1.1× slower, indicating overhead amortizes as batch size grows
+- **decode-heavy runs:** HPX decode near parity with baseline
 
-- **small prompt eval / prefill (2–5 tokens):**
-  HPX is still substantially slower (~3–4×), consistent with dispatch/setup overhead dominating very small batches
+This established the first clean baseline:
+- correctness was clean
+- decode was roughly at parity
+- prefill overhead shrank as batch size grew
+- tiny prefill batches remained the obvious weak spot
 
-- **large prefill (~202 tokens):**
-  HPX is only about ~1.1× slower, indicating overhead amortizes as batch size grows
+### Small-batch prefill bypass
 
-- **decode-heavy runs:**
-  HPX decode is near parity with baseline (within noise / small regression range)
+A prefill threshold bypass was added:
+- `GGML_HPX_PREFILL_MIN_TOKENS = 16`
 
-This is the current baseline:
-- correctness is clean
-- decode is roughly at parity
-- prefill overhead shrinks as batch size grows
-- tiny prefill batches remain the obvious weak spot
+Behavior:
+- small prefill batches below the threshold use the normal scheduler path
+- larger prefill batches continue to use HPX prefill
 
-### Files changed in this milestone
+Observed effect:
+- short prompt cases improved meaningfully
+- long-prompt prefill remained only modestly slower than baseline
+- decode remained near parity
 
-- `ggml/src/ggml-hpx/ggml-hpx-region.h`
-  - replace `dep_mask` with `prev_idx`
-- `ggml/src/ggml-hpx/ggml-hpx-adapter.cpp`
-  - remove internal `split_graph(...)`
-  - update prefill region construction
-  - remove invalid region/split equality assumption
-- `ggml/src/ggml-hpx/ggml-hpx-adapter.h`
-  - document caller-populated scheduler-state precondition
-- `ggml/src/ggml-hpx/ggml-hpx-exec.cpp`
-  - real compute in chunk functions
-  - prefill dispatch made sequential for correctness
-- `ggml/src/ggml-hpx/ggml-hpx-exec.h`
-  - exec entry points take `ggml_cgraph *`
-- `src/llama-context.h`
-  - private `ggml_hpx_exec * hpx_exec`
-- `src/llama-context.cpp`
-  - `LLAMA_USE_HPX` integration
-  - HPX branch inside `graph_compute(...)`
-  - remove redundant scheduler reset/allocation from HPX compute path
-- `src/CMakeLists.txt`
-  - link llama against `ggml-hpx` when `GGML_HPX` is enabled
-- `tests/hpx/test_hpx_exec.cpp`
-  - real-compute exec tests
-- `tests/hpx/test_hpx_llama_smoke.cpp`
-  - model-backed smoke test
-- `tests/hpx/CMakeLists.txt`
-  - smoke test target
-
-### Current status after this update
-
-What is now true:
-
-- `ggml-hpx-exec` is integrated into a real llama.cpp inference path
-- decode and prefill chunk functions execute real backend compute
-- TinyLlama smoke validation passes end-to-end
-- all tested prompt/decode scenarios now match reference outputs
-- the fake 64-region cap is gone
-- prefill adaptation reads scheduler state instead of mutating it
-- prefill is correct, but currently sequential
-- decode is roughly at parity in Release CPU-only runs
-- HPX overhead amortizes as prefill batch size grows
-
-What remains intentionally unsolved:
-
-- no dependency-aware parallel prefill scheduling yet
-- no tiny-prefill fallback threshold yet
-- no live BLAS backend in llama decode bundle yet
-- no llama-side abort plumbing into `ggml_hpx_exec_abort`
-- no deeper performance tuning yet for executor/pool choice or `n_prefill_threads`
-
-### Next steps
-
-1. Add a small-batch prefill fallback to the normal scheduler path.
-2. Measure/tune the cutoff where HPX becomes worthwhile for prefill.
-3. Design dependency-aware prefill scheduling using `prev_idx`.
-4. Revisit allocation reuse / scheduler-state assumptions only if needed for further optimization.
-5. Revisit decode BLAS backend plumbing once correctness/perf baselines are stable.
-
-
-### 2026-04-09: scattered-node compute viability confirmed
+### Scattered-node compute viability confirmed
 
 A follow-on experiment tested whether `ggml_backend_graph_compute(...)` requires a contiguous `[node_begin, node_end)` slice from an original graph, or whether it can execute an arbitrary node list.
 
 #### Result
-
 It can execute an arbitrary node list.
 
 A synthetic test graph was built with:
@@ -1546,138 +933,27 @@ A synthetic test graph was built with:
 - `C = relu(x)`
 - `D = abs(x)`
 
-A custom `ggml_cgraph` was then constructed whose `nodes[]` contained only the scattered subset `{A, C, D}` in topological order. The backend compute call executed `A`, `C`, and `D` correctly while skipping `B`. This shows that `ggml_backend_graph_compute(...)` is effectively node-list driven: it executes the supplied `nodes[0..n_nodes)` and resolves inputs through tensor `src[]` pointers rather than requiring a contiguous slice from a larger graph.
+A custom `ggml_cgraph` was then constructed whose `nodes[]` contained only the scattered subset `{A, C, D}` in topological order. The backend compute call executed `A`, `C`, and `D` correctly while skipping `B`.
 
-Implication: the current HPX design is not limited to contiguous region views. A future dispatch primitive can represent non-contiguous independent node groups and still use `ggml_backend_graph_compute(...)` as the execution primitive.
-
-#### Important test/debugging note: gallocr aliasing
-
-The first version of the scattered-node test failed for a misleading reason: `ggml_gallocr` reused buffers aggressively via in-place aliasing. In the diagnostic graph:
-
-- `x->data == D->data`
-- `A->data == B->data`
-
-and after full-graph compute, `x` no longer held the original input values; it had been overwritten by `abs(x)`. This showed that zeroing or reusing “output” tensors in the test also clobbered inputs/intermediates through aliasing. The diagnostic output explicitly showed both pointer aliasing and the post-compute mutation of `x`. :contentReference[oaicite:0]{index=0}
-
-To avoid false negatives, the scattered-node viability test was switched from `ggml_gallocr` to `ggml_backend_alloc_ctx_tensors(...)`, which gives each tensor its own storage slice for the purposes of the test. With aliasing removed, the scattered-node test passed (10/10 suite green).
-
-#### Design implication
-
-This changes the next-step decision materially:
-
-- The limiting factor is **not** `ggml_backend_graph_compute(...)`.
-- The project can support a **scattered-node dispatch primitive** for CPU prefill work.
-- The real opportunity remains the intra-region parallel groups already identified in prefill CPU regions:
-  - the contiguous FFN gate/up pair
-  - the scattered Q/K/V projection paths
-  - the scattered reshape/rope/view/cache-write follow-on groups
-
-The most promising next prototype is therefore **not** more runtime-level parallelism over existing whole regions. It is a narrow scattered-node dispatch prototype inside one CPU prefill region, targeting the obvious independent Q/K/V groups first.
-
-#### Current conclusion
-
-The contiguous-range `ggml_graph_view(...)` model is no longer the hard boundary. Parallelism exists inside CPU prefill regions, and the backend execution primitive can support it. The remaining work is representational and scheduling work:
-- identify independent node subsets,
-- package them as scattered node lists,
-- dispatch them safely in parallel,
-- and preserve topological ordering between dependent groups.
-
-## 2026-04-09: end-to-end validation, small-batch bypass, and outer-parallelism limit
-
-### Summary
-
-This update closes the current “HPX above ggml” phase.
-
-The llama.cpp integration is now correct end-to-end on CPU-only TinyLlama runs, including the previously failing long-prompt prefill-heavy case. A small-batch prefill bypass was added to avoid obvious HPX overhead on tiny prompts. Follow-on experiments then established two important limits of the current design:
-
-1. `ggml_backend_graph_compute(...)` can execute arbitrary scattered node lists correctly, so the execution primitive is more flexible than a simple contiguous `[begin, end)` graph view.
-2. Even with that flexibility, outer orchestration above ggml does **not** yield a speedup for intra-region CPU parallelism, because separate `ggml_backend_cpu_init()` instances create separate ggml CPU threadpools that do not share a thread budget.
-
-The resulting conclusion is clear: correctness is in place, decode is near parity, large prefill overhead amortizes, but further wins likely require integration at ggml’s internal CPU executor/threadpool layer rather than outside it.
-
-### Llama integration correctness fix
-
-The initial HPX llama integration had a correctness bug in `llama_context::graph_compute(...)`.
-
-The correct llama-side sequence is:
-
-1. `ggml_backend_sched_reset(...)`
-2. `ggml_backend_sched_alloc_graph(...)`
-3. `set_inputs(...)`
-4. `graph_compute(...)`
-
-An earlier HPX branch inside `graph_compute(...)` incorrectly repeated:
-
-- `ggml_backend_sched_reset(...)`
-- `ggml_backend_sched_alloc_graph(...)`
-
-This destroyed and recreated backend allocations **after** `set_inputs(...)` had already written prompt data. Small decode graphs often still appeared correct by coincidence because memory reuse was similar, but long-prompt prefill graphs diverged because input data was actually lost.
-
-The fix was to remove the redundant scheduler reset/allocation from the HPX branch in `graph_compute(...)` and make that path compute-only.
-
-After this fix, all tested TinyLlama scenarios matched the reference path exactly.
-
-### End-to-end TinyLlama status
-
-Using `llama-simple` with TinyLlama in CPU-only mode:
-
-- short prompt, `-n 32` → match
-- long prompt (~202 tokens), `-n 1` → match
-- short prompt, `-n 128` → match
-
-There are now no observed correctness divergences in the tested end-to-end scenarios.
-
-### Small-batch prefill bypass
-
-A prefill threshold bypass was added:
-
-- `GGML_HPX_PREFILL_MIN_TOKENS = 16`
-
-Behavior:
-
-- small prefill batches below the threshold use the normal scheduler path
-- larger prefill batches continue to use HPX prefill
-
-Observed effect:
-
-- short prompt cases improved meaningfully
-- long-prompt prefill remained only modestly slower than baseline
-- decode remained near parity
-- very small overall workloads are still weak because the decode loop itself still goes through HPX and its overhead dominates at tiny scale
-
-This threshold is currently a pragmatic policy knob, not a fundamental solution.
-
-### Scattered-node compute experiment
-
-A dedicated experiment tested whether `ggml_backend_graph_compute(...)` requires a contiguous node slice or whether it can execute an arbitrary node list.
-
-Result:
-
-- arbitrary scattered node lists work correctly, as long as the supplied nodes are topologically valid and data-independent with respect to skipped nodes
-- a test graph with interleaved nodes showed that a custom graph containing only `{A, C, D}` executed those nodes correctly while skipping `B`
-
-This means the backend execution primitive is effectively node-list driven, not inherently tied to contiguous `[node_begin, node_end)` region views.
-
-### Important allocator finding
-
+#### Important allocator finding
 The first version of the scattered-node test failed for a misleading reason:
-
 - `ggml_gallocr` aggressively reuses buffers through in-place aliasing
 - in the diagnostic graph, `x->data == D->data` and `A->data == B->data`
 - zeroing “outputs” therefore also clobbered inputs/intermediates
 
 For the scattered-node viability test, the allocation strategy was switched to `ggml_backend_alloc_ctx_tensors(...)`, which gives tensors distinct storage for the purposes of the experiment. With aliasing removed, the scattered-node experiment passed.
 
-This is an important testing note: gallocr aliasing can invalidate naive correctness experiments that assume tensor outputs are independently owned.
+#### Design implication
+- the limiting factor is **not** `ggml_backend_graph_compute(...)`
+- the project can support a **scattered-node dispatch primitive** for CPU prefill work
+- the real opportunity remains the intra-region parallel groups already identified in prefill CPU regions
 
 ### Intra-region parallel projection prototype
 
 A narrow prototype then used the scattered-node capability to parallelize one obvious independent pattern inside a CPU prefill region:
-
 - the FFN `gate` / `up` projection pair
 
 The prototype decomposed a CPU region into:
-
 - `before`
 - `chain0`
 - `chain1`
@@ -1686,25 +962,19 @@ The prototype decomposed a CPU region into:
 and ran `chain0` and `chain1` in parallel via HPX while keeping the surrounding work serial.
 
 #### Correctness
-
 Correctness passed:
-
 - baseline
 - HPX serial
 - HPX parallel prototype
 
 all produced bit-exact outputs across the tested scenarios.
 
-So the decomposition and orchestration were valid.
-
 #### Performance
-
 Performance did **not** improve.
 
 A shared-budget check gave:
-
-- serial HPX (4 threads, 1 pool): 410 ms
-- parallel HPX (2 chains × 2 threads): 631 ms
+- serial HPX (4 threads, 1 pool): **410 ms**
+- parallel HPX (2 chains × 2 threads): **631 ms**
 
 So the parallel prototype was **1.54× slower** than the serial HPX version.
 
@@ -1713,66 +983,352 @@ So the parallel prototype was **1.54× slower** than the serial HPX version.
 The slowdown is structural at this layer.
 
 Each parallel chain used its own `ggml_backend_cpu_init()` backend, and each such backend creates its own independent ggml CPU threadpool. That means:
-
 - the prototype did **not** redistribute the original thread budget across two chains
 - instead, it created new threadpools on top of the existing backend/threadpool arrangement
 - the original scheduler-owned threads sat idle during the parallel phase
 - the new per-chain backends paid their own threadpool/setup/cache costs
 
-Therefore, “2+2 threads” in the prototype was not a true shared 4-thread budget. It was two additional 2-thread ggml pools layered outside the original ggml CPU threading model.
-
 This is the key negative result of the current branch:
 
 **Outer HPX orchestration above ggml backends does not compose with ggml’s internal CPU threading model for intra-region parallelism.**
 
-### Current conclusion
+That negative result is what motivated the next architectural pivot: move inside ggml’s CPU executor ownership instead of layering more orchestration above it.
+
+### Phase conclusion
 
 At the end of this phase:
+- llama.cpp integration through `ggml-hpx-exec` was correct end-to-end
+- decode was near parity on CPU-only TinyLlama runs
+- prefill overhead shrank as prompt size grew
+- a small-batch prefill bypass helped the obvious tiny-prompt cases
+- scattered-node execution was semantically viable
+- but outer-parallel intra-region CPU execution was slower, because ggml backend thread ownership sits below the current orchestration layer
 
-- llama.cpp integration through `ggml-hpx-exec` is correct end-to-end
-- decode is near parity on CPU-only TinyLlama runs
-- prefill overhead shrinks as prompt size grows
-- a small-batch prefill bypass helps the obvious tiny-prompt cases
-- scattered-node execution is semantically viable
-- but outer-parallel intra-region CPU execution is slower, because ggml backend thread ownership sits below the current orchestration layer
+---
 
-### What this means for next work
+## 4. Shared executor attachment semantics and internal executor seam
 
-This branch has reached a clean stopping point.
+At this point the outer-HPX approach had reached its limit, which led to the next design change: make ggml’s CPU executor ownership explicit and injectable.
 
-The current “HPX above ggml” design has been explored enough to establish both:
-- what works
-- where the boundary is
+### Goal
 
-The next meaningful performance-oriented project is **not** more polishing of outer-region orchestration. It is a deeper integration where ggml’s internal CPU execution resource (threadpool / executor ownership) becomes shareable or replaceable, so multiple logical computations can draw from one common execution substrate instead of each spawning a new ggml CPU backend pool.
+After separating per-dispatch job state from executor state, the next goal was to make executor sharing safe and to create a narrow internal seam so HPX could replace only the CPU executor substrate without changing kernels or higher-level ggml execution logic.
 
-### Results folders
+### Shared executor attachment semantics
 
-This phase is recorded under:
+The CPU backend originally had only `ggml_backend_cpu_set_threadpool(...)`. That API had a silent side effect: replacing the backend’s threadpool paused the previous threadpool. This was fine for a private backend↔threadpool relationship, but incorrect once the same executor could be shared across multiple backends.
 
-- `hpx-bench/results/2026-04-08-llama-simple-release-01-initial/`
-- `hpx-bench/results/2026-04-08-llama-simple-release-02-post-sched-reset-fix/`
-- `hpx-bench/results/2026-04-08-llama-simple-release-03-prefill-threshold-16/`
-- `hpx-bench/results/2026-04-09-llama-simple-release-04-parallel-proj-prototype/`
+To fix this, the backend context gained a mode bit distinguishing:
+- **managed association** via `ggml_backend_cpu_set_threadpool(...)`
+- **borrowed/shared association** via `ggml_backend_cpu_attach_threadpool(...)`
 
-These directories capture the progression from initial integration, to correctness fix, to threshold policy, to the final negative-result prototype for intra-region parallel projection.
+Semantics:
+- `set_threadpool(...)` preserves legacy behavior and may pause the previously managed executor on replacement
+- `attach_threadpool(...)` never pauses on behalf of the current backend and is safe for sharing one executor across multiple backends
 
-```
-HPX SIDE                            PLAIN LLAMA/GGML SIDE
+### Validation
 
-adapter                             scheduler/split-prep world
-ggml_hpx_adapt_*                    ggml_backend_sched_alloc_graph(...)
-                                    split_graph(...)
+Added coverage for:
+- two backends attached to the same executor, both computing correctly
+- alternating dispatches across two backends sharing one executor
+- replacing one backend’s executor does **not** pause the shared executor used by the other backend
+- legacy managed `set_threadpool(...)` semantics remain unchanged
 
-plan                                implicit scheduler/backend setup
-explicit HPX plan objects           graph + split/allocation state
+Both black-box compute tests and white-box pause-state checks passed.
 
-cache                               prepared scheduler/allocation state
-explicit plan cache                 what alloc_graph() has already set up
+### Executor/job ownership split
 
-executor / manager                  llama_context::graph_compute(...)
-ggml_hpx_exec_*                     src/llama-context.cpp
+With sharing semantics validated, the CPU threadpool implementation was split into:
+- long-lived **executor/substrate** state
+- per-dispatch **job** state
 
-runtime / workers                   backend compute path
-ggml-hpx-runtime                    ggml_backend_graph_compute(...)
-```
+This created a clean publication model:
+- executor owns worker lifetime, wake/sleep policy, and long-lived control state
+- job owns graph, plan, barrier state, chunk state, abort, and status
+
+This split is what made a real HPX-backed executor substrate possible.
+
+### Internal executor seam
+
+After the ownership split, an internal executor-ops seam was added so the CPU layer could route only substrate-specific behavior through an internal interface:
+- `init`
+- `kickoff`
+- `worker_wait`
+- `destroy`
+
+The first implementation was the existing pthread path, wired through the new seam with no intended behavior change.
+
+### Header cleanup for C/C++
+
+To support an HPX executor implementation from C++, a thin internal header was added with zero atomics/platform-type dependencies:
+- `ggml-cpu-executor.h`
+
+This exposes only the executor ops interface and cross-translation-unit function declarations needed by the HPX implementation, while keeping threadpool internals in CPU-only headers.
+
+### Result of this phase
+
+At this point:
+- per-dispatch job ownership was separated cleanly from executor ownership
+- shared executor attachment was safe and tested
+- the CPU layer had a narrow internal executor seam
+- pthread remained the first executor implementation
+- the codebase was ready for an HPX executor substrate swap without rewriting kernels
+
+---
+
+## 5. CPU-side performance investigation
+
+With the CPU executor seam in place, the next phase was empirical validation: swap in an HPX executor substrate and see what actually happens.
+
+Some interpretations in this section were later revised. They are kept here in chronological order.
+
+### HPX executor substrate integration
+
+An HPX executor implementation was added under the internal CPU executor seam.
+
+New pieces:
+- `ggml-hpx-tpool.h`
+- `ggml-hpx-tpool.cpp`
+
+HPX runtime registration installs HPX executor ops during `hpx_acquire()` and restores pthread ops at shutdown.
+
+The HPX executor implementation keeps the existing ggml job model intact:
+- same `current_job` publication contract
+- same barrier/chunk/job logic
+- one active dispatch at a time
+- no kernel rewrites
+
+### Initial end-to-end validation
+
+TinyLlama end-to-end output matched baseline exactly.
+
+In the default Metal-enabled run:
+- correctness passed
+- timing was near parity
+- CPU buffer remained very small, so this was not a meaningful CPU executor benchmark
+
+This validated correctness but did not yet say much about HPX CPU-side speedup.
+
+---
+
+### Initial CPU-only benchmark campaign
+
+**Goal:** establish a clean baseline for the HPX threadpool substrate.
+
+All runs in this campaign were CPU-only (`GGML_METAL=OFF`). Two matrices were built:
+- no-BLAS
+- BLAS
+
+Model:
+- TinyLlama-1.1B Q4_K_M
+
+
+#### Correctness
+Pass. Generated text was bit-for-bit identical. The only diff was the `llama_context: HPX exec enabled` log line and timing noise.
+
+#### Throughput summary (initial campaign)
+
+**No-BLAS** (build-base-cpu vs build-hpx-cpu):
+
+| threads | case         | base pp | hpx pp | base tg | hpx tg | tg delta |
+|---------|--------------|---------|--------|---------|--------|----------|
+| 1       | prefill_long | 83.0    | 82.3   | 52.4    | 48.5   | -7%      |
+| 1       | decode_heavy | 85.7    | 84.7   | 44.7    | 44.2   | -1%      |
+| 2       | prefill_long | 128.4   | 126.8  | 66.8    | 54.3   | -19%     |
+| 2       | decode_heavy | 130.1   | 127.3  | 56.4    | 57.6   | +2%      |
+| 4       | prefill_long | 171.4   | 161.5  | 82.4    | 60.1   | -27%     |
+| 4       | prefill_mid  | 196.2   | 196.7  | 90.0    | 87.3   | -3%      |
+| 4       | decode_heavy | 160.3   | 141.9  | 52.7    | 35.0   | -34%     |
+| 4       | decode_light | 161.4   | 160.3  | 59.3    | 74.1   | +25%*    |
+| 8       | all cases    | (noisy) | (noisy)| (noisy) | (noisy)| unreliable |
+
+**BLAS** (build-base-cpu-blas vs build-hpx-cpu-blas):
+
+| threads | case         | base pp | hpx pp | base tg | hpx tg | tg delta |
+|---------|--------------|---------|--------|---------|--------|----------|
+| 1       | prefill_long | 88.1    | 87.6   | 48.7    | 45.5   | -7%      |
+| 1       | decode_heavy | 89.2    | 86.7   | 45.2    | 45.1   | 0%       |
+| 2       | prefill_long | 137.6   | 135.4  | 70.4    | 68.2   | -3%      |
+| 2       | decode_heavy | 130.6   | 133.1  | 58.1    | 56.0   | -4%      |
+| 4       | prefill_long | 185.0   | 176.2  | 85.6    | 82.6   | -4%      |
+| 4       | prefill_mid  | 202.0   | 203.0  | 84.4    | 85.1   | +1%      |
+| 4       | decode_heavy | 170.9   | 154.5  | 70.6    | 59.0   | -16%     |
+| 4       | decode_light | 178.4   | 166.9  | 79.6    | 71.4   | -10%     |
+| 8       | all cases    | (noisy) | (noisy)| (noisy) | (noisy)| unreliable |
+
+\* No-BLAS decode_light t=4 HPX tg outlier (74.1 vs 59.3) is within the error bar and likely noise.
+
+#### Initial interpretation at this stage
+
+- t=1 and t=2 looked close
+- t=4 prefill looked roughly near parity
+- t=4 decode looked meaningfully slower on HPX
+- BLAS helped both variants similarly
+
+At this stage the working interpretation was:
+- HPX threadpool substrate adds negligible overhead at t=1 and t=2
+- prefill amortizes overhead
+- decode suffers because short per-token graphs do not amortize per-dispatch cost
+
+This interpretation was later corrected.
+
+---
+
+### Correction: the first CPU-only interpretation was wrong
+
+The first CPU-only HPX campaign was later found to be **invalid for parallel HPX claims**.
+
+Cause:
+- the nested-HPX guard in `hpx_kickoff` used:
+  - `hpx::get_worker_thread_num() != size_t(-1)`
+- after `hpx::start`, HPX registers the main OS thread as worker 0
+- so the guard fired even on the main thread
+- as a result, every kickoff fell back to single-thread execution
+
+This means the earlier CPU-only HPX numbers did **not** measure real parallel HPX execution and should not be used for HPX speedup conclusions.
+
+### Guard fix
+
+The guard was corrected to detect only HPX lightweight threads/coroutines, not OS threads registered with the runtime.
+
+After the fix:
+- HPX kickoff began posting real parallel work
+- instrumentation showed nonzero `parallel-kickoffs` and `posts`
+- the normal inference path was confirmed to use real HPX task posting
+
+### Focused benchmark after the guard fix
+
+With the guard fixed, real HPX parallel execution was active.
+
+Focused decode/prefill benchmarks then showed:
+- `pp32`: HPX still significantly slower than base
+- `pp512`: HPX much closer to base
+- `tg128`: HPX still behind base even with real parallel task posting
+
+Instrumentation showed:
+- task posting cost was only a few microseconds per post
+- total posting overhead across the decode benchmark was tiny relative to the observed slowdown
+- task posting itself explained only a very small fraction of the regression
+
+#### Takeaway
+The guard fix changed the question. The remaining decode slowdown could no longer be blamed on “HPX never parallelized.”
+
+---
+
+### Isolation: exec adapter vs threadpool substrate
+
+To isolate the remaining decode regression, a temporary `GGML_HPX_TPOOL_ONLY=1` path was added so the HPX executor substrate could be measured both:
+1. with the HPX exec/adapter layer enabled
+2. with the exec/adapter layer bypassed, using only the HPX-backed threadpool substrate
+
+#### Results
+
+##### tg128 (decode)
+- base: **99 t/s**
+- HPX + exec layer: **67 t/s** (**−32%**)
+- HPX + tpool only: **65 t/s** (**−35%**)
+
+Posting cost remained small:
+- HPX + exec layer: about **3.5 μs/post**
+- HPX + tpool only: about **11.5 μs/post**
+
+##### pp512 (prefill)
+- base: **276 t/s**
+- HPX + exec layer: **260 t/s** (**−6%**)
+- HPX + tpool only: **260 t/s** (**−6%**)
+
+#### Interpretation at this stage
+
+This isolation showed that the HPX exec/adapter layer is **not** the dominant bottleneck for decode.
+
+Evidence:
+- removing the exec layer did **not** improve decode
+- in fact, `tpool-only` was slightly worse than `exec + tpool`
+- prefill results were identical between the two HPX modes
+
+The working interpretation after this result was:
+- the dominant remaining decode regression is **not** graph adaptation overhead above the executor
+- the next plausible culprit is **per-dispatch HPX worker wake/scheduling latency**
+- the natural next design step is **persistent HPX worker tasks** that stay alive across dispatches and wait on a signal/semaphore
+
+#### Takeaway
+This result redirected the investigation away from adapter caching and toward persistent-worker executor design.
+
+---
+
+### Persistent HPX workers
+
+To reduce decode overhead from post-per-kickoff HPX tasks, the HPX executor was changed to keep persistent worker tasks alive across dispatches.
+
+Each persistent worker waits on a signal/semaphore and runs the next dispatch when woken, instead of creating fresh HPX tasks for every kickoff.
+
+#### Focused results
+
+| test       | base         | post-per-kickoff (Option A) | persistent workers (Option B) |
+|------------|--------------|-----------------------------|--------------------------------|
+| tg128 t=4  | 14.62 t/s    | ~10 t/s (**−32%**)          | 12.70 t/s (**−13%**)           |
+| pp512 t=4  | 42.04 t/s    | ~39.5 t/s (**−6%**)         | 42.89 t/s (**about +2%**)      |
+
+#### Interpretation
+
+Persistent workers materially improved decode performance, recovering roughly 19 percentage points relative to the earlier post-per-kickoff HPX design.
+
+This supported the conclusion that the dominant decode penalty in Option A was not graph adaptation overhead, but per-dispatch worker cold-start behavior and associated synchronization latency.
+
+Prefill remained healthy under the persistent-worker design, indicating that the change improved decode without harming larger work-unit behavior.
+
+#### Takeaway
+Persistent HPX workers were the right executor design change for decode-sized dispatches.
+
+---
+
+### Wake-latency follow-up
+
+Because a meaningful but smaller decode gap still remained after switching to persistent workers, the next step was to measure wake latency directly.
+
+Measured values:
+- **avg-wake-latency-us:** **1.73 μs**
+- **avg-entry-latency-us:** **0.03 μs**
+- **avg-total-wake-to-run-us:** **1.76 μs per worker per dispatch**
+
+For `tg128`:
+- 3 secondary workers
+- 129 dispatches total (128 decode steps + 1 prefill)
+
+Estimated overhead:
+- `1.76 μs × 3 × 128 ≈ 676 μs`
+
+That is a tiny fraction of the total run time, so simple semaphore wake latency is **not** large enough to explain the remaining gap by itself.
+
+### Revised interpretation after wake-latency measurement
+
+This measurement weakened the earlier guess that the remaining decode gap was mostly raw wake/sleep latency.
+
+What it now supports instead is:
+- persistent workers removed the large task-creation / cold-start penalty
+- the remaining gap is much smaller
+- the remaining gap is **not** explained by simple wake latency alone
+- the residual difference is more likely a combination of smaller effects such as synchronization structure, mutex/barrier behavior, or scheduler/cache effects
+
+---
+
+### Current status
+
+- end-to-end llama.cpp integration through the HPX path is correct on the tested TinyLlama scenarios
+- the outer “HPX above ggml backends” approach hit a structural limit for intra-region CPU parallelism
+- ggml-cpu now has a clean executor/job split and an internal executor seam
+- shared executor attachment semantics are implemented and tested
+- HPX has a real executor substrate implementation under that seam
+- post-per-kickoff HPX workers were not good enough for decode
+- persistent HPX workers materially improved decode and preserved healthy prefill behavior
+
+Current performance conclusion:
+- the large decode regression from the first HPX executor substrate design has been reduced substantially
+- persistent workers recovered most of that loss
+- prefill is effectively at parity in the focused persistent-worker result
+- the remaining decode gap is small and is **not** explained by simple wake latency alone
+
+What remains open:
+- identify the source of the remaining small decode gap
+- decide whether that remaining gap is worth another optimization phase
+- continue only if the next phase has a clear, measurable target

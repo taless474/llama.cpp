@@ -371,9 +371,20 @@ llama_context::llama_context(
     {
         const char * env = getenv("LLAMA_USE_HPX");
         if (env && atoi(env) != 0) {
-            ggml_hpx_exec_params hpx_params{};
-            hpx_exec = ggml_hpx_exec_create(hpx_params);
-            LLAMA_LOG_INFO("%s: HPX exec enabled (LLAMA_USE_HPX=1)\n", __func__);
+            const char * tpool_only = getenv("GGML_HPX_TPOOL_ONLY");
+            if (tpool_only && atoi(tpool_only) != 0) {
+                // Tpool-only mode: start HPX and redirect new threadpools to
+                // the HPX substrate, but do NOT create the exec adapter.
+                // graph_compute falls through to the standard backend path.
+                // Use this to measure pure threadpool overhead in isolation
+                // from the exec orchestration layer.
+                ggml_hpx_tpool_start();
+                LLAMA_LOG_INFO("%s: HPX tpool-only mode (GGML_HPX_TPOOL_ONLY=1)\n", __func__);
+            } else {
+                ggml_hpx_exec_params hpx_params{};
+                hpx_exec = ggml_hpx_exec_create(hpx_params);
+                LLAMA_LOG_INFO("%s: HPX exec enabled (LLAMA_USE_HPX=1)\n", __func__);
+            }
         }
     }
 #endif

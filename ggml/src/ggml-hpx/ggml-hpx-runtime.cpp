@@ -12,6 +12,7 @@
 // they do not bracket HPX startup/shutdown.
 
 #include "ggml-hpx-runtime.h"
+#include "ggml-hpx-tpool.h"    // ggml_hpx_tpool_get_ops, ggml_cpu_set_executor_ops
 
 #include <hpx/async_combinators/wait_all.hpp>
 #include <hpx/future.hpp>
@@ -42,9 +43,11 @@ void hpx_acquire()
 {
     std::call_once(g_hpx_start_flag, []() {
         hpx::start(nullptr, 0, nullptr);
+        ggml_cpu_set_executor_ops(ggml_hpx_tpool_get_ops());
         std::atexit([]() {
             hpx::post([]() { hpx::finalize(); });
             hpx::stop();
+            ggml_cpu_set_executor_ops(nullptr);    // restore pthread ops
         });
     });
 }
@@ -67,6 +70,11 @@ struct ggml_hpx_runtime
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+void ggml_hpx_tpool_start()
+{
+    hpx_acquire();
+}
 
 ggml_hpx_runtime* ggml_hpx_runtime_create(
     ggml_hpx_runtime_params const& params)

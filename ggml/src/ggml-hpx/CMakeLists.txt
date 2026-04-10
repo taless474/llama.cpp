@@ -20,6 +20,7 @@ ggml_add_backend_library(ggml-hpx
     ggml-hpx-exec.cpp
     ggml-hpx-plan.cpp
     ggml-hpx-runtime.cpp
+    ggml-hpx-tpool.cpp
     ggml-hpx-instrument.cpp
 )
 
@@ -27,6 +28,7 @@ target_include_directories(ggml-hpx
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cpu
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 

@@ -2640,24 +2640,7 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     const int n_threads = threadpool->n_threads;
 
 #ifndef GGML_USE_OPENMP
-    struct ggml_compute_state* workers = threadpool->workers;
-
-    ggml_mutex_lock(&threadpool->mutex);
-
-    threadpool->stop = true;
-    threadpool->pause = false;
-
-    ggml_cond_broadcast(&threadpool->cond);
-    ggml_mutex_unlock(&threadpool->mutex);
-
-    for (int j = 1; j < n_threads; j++) {
-        int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
-        GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
-        UNUSED(rc);
-    }
-
-    ggml_mutex_destroy(&threadpool->mutex);
-    ggml_cond_destroy(&threadpool->cond);
+    threadpool->ops->destroy(threadpool);
 #endif // GGML_USE_OPENMP
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
@@ -2999,6 +2982,51 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     return 0;
 }
 
+// Non-static shim: lets HPX code in a separate TU submit one worker as an
+// HPX task without crossing the static-linkage boundary.
+void ggml_graph_compute_thread_run(struct ggml_compute_state * state) {
+    ggml_graph_compute_thread(state);
+}
+
+struct ggml_compute_state * ggml_threadpool_worker(
+    struct ggml_threadpool * tp, int j) {
+    return &tp->workers[j];
+}
+
+void ggml_threadpool_destroy_substrate(struct ggml_threadpool * tp) {
+    tp->stop = true;
+    ggml_mutex_destroy(&tp->mutex);
+    ggml_cond_destroy(&tp->cond);
+}
+
+void ggml_threadpool_set_active_threads(struct ggml_threadpool * tp, int n) {
+    tp->current_job->n_active_threads = n;
+}
+
+int ggml_threadpool_n_threads(const struct ggml_threadpool * tp) {
+    return tp->n_threads;
+}
+
+void ggml_threadpool_set_priv(struct ggml_threadpool * tp, void * priv) {
+    tp->executor_priv = priv;
+}
+
+void * ggml_threadpool_get_priv(const struct ggml_threadpool * tp) {
+    return tp->executor_priv;
+}
+
+int64_t ggml_threadpool_last_node_ne1(const struct ggml_threadpool * tp) {
+    if (!tp || !tp->current_job || !tp->current_job->cgraph) {
+        return -1;
+    }
+    const struct ggml_cgraph * g = tp->current_job->cgraph;
+    if (g->n_nodes <= 0) {
+        return -1;
+    }
+    const struct ggml_tensor * last = g->nodes[g->n_nodes - 1];
+    return last ? last->ne[1] : -1;
+}
+
 #ifndef GGML_USE_OPENMP
 
 // check if thread is ready to proceed (exit from polling or sleeping)
@@ -3065,6 +3093,103 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
     return state->pending;
 }
 
+// ---------------------------------------------------------------------------
+// Pthread executor ops (default substrate)
+// ---------------------------------------------------------------------------
+
+// Called with tp->mutex held (exclusive).
+static void ggml_pthread_kickoff(struct ggml_threadpool * tp, int n_threads) {
+    UNUSED(n_threads);
+    if (tp->pause) {
+        // Update main-thread priority/affinity to match the pool, then wake.
+        ggml_thread_apply_priority(tp->prio);
+        if (ggml_thread_cpumask_is_valid(tp->workers[0].cpumask)) {
+            ggml_thread_apply_affinity(tp->workers[0].cpumask);
+        }
+        ggml_threadpool_resume_locked(tp); // sets pause = false, broadcasts
+    } else {
+        ggml_cond_broadcast(&tp->cond);
+    }
+}
+
+// Persistent worker idle cycle: returns when state->pending or tp->stop.
+static void ggml_pthread_worker_wait(struct ggml_threadpool * tp,
+                                     struct ggml_compute_state * state) {
+    while (tp->pause) {
+        GGML_PRINT_DEBUG("thread #%d inside pause loop\n", state->ith);
+        ggml_mutex_lock_shared(&tp->mutex);
+        if (tp->pause) {
+            ggml_cond_wait(&tp->cond, &tp->mutex);
+        }
+        GGML_PRINT_DEBUG("thread #%d resuming after wait\n", state->ith);
+        ggml_mutex_unlock_shared(&tp->mutex);
+    }
+    if (tp->stop) return;
+    ggml_graph_compute_check_for_work(state); // poll then sleep for new n_graph
+}
+
+// Signal workers to exit, join them, destroy mutex + cond.
+static void ggml_pthread_destroy(struct ggml_threadpool * tp) {
+    ggml_mutex_lock(&tp->mutex);
+    tp->stop  = true;
+    tp->pause = false;
+    ggml_cond_broadcast(&tp->cond);
+    ggml_mutex_unlock(&tp->mutex);
+
+    for (int j = 1; j < tp->n_threads; j++) {
+        int32_t rc = ggml_thread_join(tp->workers[j].thrd, NULL);
+        GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
+        UNUSED(rc);
+    }
+
+    ggml_mutex_destroy(&tp->mutex);
+    ggml_cond_destroy(&tp->cond);
+}
+
+// Launch worker threads and apply CPU placement for the main thread.
+static void ggml_pthread_init(struct ggml_threadpool * tp,
+                               struct ggml_threadpool_params * tpp) {
+    struct ggml_compute_state * workers = tp->workers;
+
+    // Spin the threads for all workers, and update CPU placements.
+    // Place the main thread last (towards the higher numbered CPU cores).
+    int32_t cpumask_iter = 0;
+
+    for (int j = 1; j < tpp->n_threads; j++) {
+        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
+        GGML_ASSERT(rc == 0);
+    }
+
+    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+
+    if (!tp->pause) {
+        // Update main thread prio and affinity at the start, otherwise we'll do it in resume.
+        ggml_thread_apply_priority(tp->prio);
+        if (ggml_thread_cpumask_is_valid(tp->workers[0].cpumask)) {
+            ggml_thread_apply_affinity(tp->workers[0].cpumask);
+        }
+    }
+}
+
+static const struct ggml_cpu_executor_ops ggml_pthread_executor_ops = {
+    /* .init        = */ ggml_pthread_init,
+    /* .kickoff     = */ ggml_pthread_kickoff,
+    /* .worker_wait = */ ggml_pthread_worker_wait,
+    /* .destroy     = */ ggml_pthread_destroy,
+};
+
+// Global ops used by ggml_threadpool_new_impl.  Defaults to the pthread
+// substrate; HPX calls ggml_cpu_set_executor_ops() during its init to
+// redirect new threadpools to the HPX substrate.
+static const struct ggml_cpu_executor_ops * g_executor_ops = &ggml_pthread_executor_ops;
+
+void ggml_cpu_set_executor_ops(const struct ggml_cpu_executor_ops * ops) {
+    g_executor_ops = ops ? ops : &ggml_pthread_executor_ops;
+}
+
+// ---------------------------------------------------------------------------
+
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool * threadpool = state->threadpool;
@@ -3075,24 +3200,8 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     }
 
     while (true) {
-        // Check if we need to sleep
-        while (threadpool->pause) {
-            GGML_PRINT_DEBUG("thread #%d inside pause loop\n", state->ith);
-            ggml_mutex_lock_shared(&threadpool->mutex);
-            if (threadpool->pause) {
-                ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
-            }
-            GGML_PRINT_DEBUG("thread #%d resuming after wait\n", state->ith);
-            ggml_mutex_unlock_shared(&threadpool->mutex);
-        }
-
-        // This needs to be checked for after the cond_wait
+        threadpool->ops->worker_wait(threadpool, state);
         if (threadpool->stop) break;
-
-        // Check if there is new work
-        // The main thread is the only one that can dispatch new work
-
-        ggml_graph_compute_check_for_work(state);
         if (state->pending) {
             state->pending = false;
             ggml_graph_compute_thread(state);
@@ -3122,18 +3231,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
     atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
 
-    if (threadpool->pause) {
-       // Update main thread prio and affinity to match the threadpool settings
-       ggml_thread_apply_priority(threadpool->prio);
-       if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-           ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-       }
-
-       // resume does cond broadcast
-       ggml_threadpool_resume_locked(threadpool);
-    } else {
-       ggml_cond_broadcast(&threadpool->cond);
-    }
+    threadpool->ops->kickoff(threadpool, n_threads);
 
     ggml_mutex_unlock(&threadpool->mutex);
 }
@@ -3164,6 +3262,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_threads            = tpp->n_threads;
         threadpool->poll                 = tpp->poll;
         threadpool->prio                 = tpp->prio;
+        threadpool->ops                  = NULL; // set below in substrate block
     }
 
     // Allocate and init workers state
@@ -3186,30 +3285,10 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
 #else // GGML_USE_OPENMP
+    threadpool->ops = g_executor_ops;
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
-
-    // Spin the threads for all workers, and update CPU placements.
-    // Place the main thread last (towards the higher numbered CPU cores).
-
-    int32_t cpumask_iter = 0;
-
-    for (int j = 1; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
-
-        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
-        GGML_ASSERT(rc == 0);
-    }
-
-    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
-
-    if (!threadpool->pause) {
-        // Update main thread prio and affinity at the start, otherwise we'll do it in resume
-        ggml_thread_apply_priority(threadpool->prio);
-        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-        }
-    }
+    threadpool->ops->init(threadpool, tpp);
 #endif // GGML_USE_OPENMP
 
     return threadpool;

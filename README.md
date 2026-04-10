@@ -1,3 +1,47 @@
+# llama.cpp fork: HPX prefill orchestrator
+
+This branch is an experimental **fork of `llama.cpp`** that explores a more HPX-native execution/orchestration path for CPU inference.
+
+It keeps the `llama.cpp` / ggml inference stack and investigates how HPX can be used to orchestrate work more effectively for inference-style workloads.
+
+## Current goal
+
+The goal is **not** to replace ggml kernels or BLAS.  
+The goal is to redesign the **execution/orchestration layer** for CPU-side work so that HPX can be used in a way that better matches inference workloads.
+
+In particular, this branch separates:
+
+- **decode**: low-latency, repeated token-generation steps
+- **prefill**: heavier prompt-processing work
+
+## HPX-to-llama.cpp component mapping
+```
+HPX SIDE                            PLAIN LLAMA/GGML SIDE
+
+adapter                             scheduler/split-prep world
+ggml_hpx_adapt_*                    ggml_backend_sched_alloc_graph(...)
+                                    split_graph(...)
+
+plan                                implicit scheduler/backend setup
+explicit HPX plan objects           graph + split/allocation state
+
+cache                               prepared scheduler/allocation state
+explicit plan cache                 what alloc_graph() has already set up
+
+executor / manager                  llama_context::graph_compute(...)
+ggml_hpx_exec_*                     src/llama-context.cpp
+
+runtime / workers                   backend compute path
+ggml-hpx-runtime                    ggml_backend_graph_compute(...)
+```
+
+## Current status
+
+- end-to-end HPX integration has been wired into `llama.cpp`
+- smoke testing has passed on the CPU-only path
+
+
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)

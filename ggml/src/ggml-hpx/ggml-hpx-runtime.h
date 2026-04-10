@@ -54,6 +54,17 @@ struct ggml_hpx_runtime_params
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+// Start the HPX runtime and redirect new ggml_threadpool allocations to the
+// HPX substrate (sets g_executor_ops).  Does NOT create a runtime object or
+// exec adapter — use this when only the HPX threadpool is needed and the
+// exec orchestration layer should be bypassed entirely.
+//
+// Idempotent: safe to call multiple times; only the first call has effect.
+// The HPX runtime shuts down automatically at process exit via atexit.
+//
+// Defined in ggml-hpx-runtime.cpp.
+void ggml_hpx_tpool_start();
+
 // Create and start the HPX runtime and worker teams. Returns a non-null
 // pointer on success. The HPX runtime is started as a side effect; it must
 // not already be running.

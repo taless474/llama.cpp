@@ -14,7 +14,8 @@
 
 #pragma once
 
-#include "ggml.h" // ggml_cgraph, ggml_cplan, ggml_status
+#include "ggml.h"             // ggml_cgraph, ggml_cplan, ggml_status
+#include "ggml-cpu-executor.h" // struct ggml_cpu_executor_ops + helper decls
 
 // ---------------------------------------------------------------------------
 // Platform prerequisites (skipped when included from ggml-cpu.c which sets
@@ -83,13 +84,6 @@ typedef pthread_mutex_t ggml_mutex_t;
 #endif // GGML_CPU_THREADPOOL_PREREQS_DONE
 
 // ---------------------------------------------------------------------------
-// Forward declaration — full definition is in ggml-cpu.c.
-// Only used as a pointer inside struct ggml_threadpool.
-// ---------------------------------------------------------------------------
-
-struct ggml_compute_state;
-
-// ---------------------------------------------------------------------------
 // Per-dispatch job state.
 // Initialized completely by the caller before being published to workers
 // via executor->current_job and then executor->n_graph.
@@ -141,4 +135,13 @@ struct ggml_threadpool {
     int      n_threads;                  // Number of threads in the pool
     int32_t  prio;                       // Scheduling priority
     uint32_t poll;                       // Polling level (0 - no polling)
+
+    // Substrate ops: wakeup, worker idle-wait, shutdown.
+    // NULL only for OpenMP builds (where these ops are not called).
+    const struct ggml_cpu_executor_ops * ops;
+
+    // Opaque per-executor private state.  Set once during ops->init and
+    // read in kickoff/destroy.  The executor owns the allocation; ggml
+    // does not inspect it.  NULL when no executor is active.
+    void * executor_priv;
 };

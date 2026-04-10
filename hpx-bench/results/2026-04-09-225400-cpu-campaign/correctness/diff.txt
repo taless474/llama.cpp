@@ -1,0 +1,12 @@
+--- hpx-bench/results/2026-04-09-225400-cpu-campaign/correctness/base.norm.txt	2026-04-09 22:54:05
++++ hpx-bench/results/2026-04-09-225400-cpu-campaign/correctness/hpx.norm.txt	2026-04-09 22:54:05
+@@ -527,6 +527,7 @@
+ sched_reserve:        CPU compute buffer size =     3.86 MiB
+ sched_reserve: graph nodes  = 689
+ sched_reserve: graph splits = 1
+-sched_reserve: reserve took 0.93 ms, sched copies = 1
+-<s> -t 4 -ngl 0 -n 32 Tell me a short story about a young girl named Lily. Lilys story begins when she was just a baby. Her mother was a kind and loving woman, but she had a secret. Her mother had been abmain: decoded 32 tokens in 0.39 s, speed: 81.45 t/s
++sched_reserve: reserve took 0.88 ms, sched copies = 1
++llama_context: HPX exec enabled (LLAMA_USE_HPX=1)
++<s> -t 4 -ngl 0 -n 32 Tell me a short story about a young girl named Lily. Lilys story begins when she was just a baby. Her mother was a kind and loving woman, but she had a secret. Her mother had been abmain: decoded 32 tokens in 1.07 s, speed: 29.90 t/s
+ ~llama_context:        CPU compute buffer size is   3.8556 MiB, matches expectation of   3.8556 MiB
