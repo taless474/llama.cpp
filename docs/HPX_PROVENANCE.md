@@ -1332,3 +1332,77 @@ What remains open:
 - identify the source of the remaining small decode gap
 - decide whether that remaining gap is worth another optimization phase
 - continue only if the next phase has a clear, measurable target
+
+## Addendum: ggml-cpu executor pivot and persistent-worker baseline
+
+### Architectural pivot
+This phase moved the project from outer HPX orchestration around ggml into ggml-cpu executor ownership itself.
+
+Two key changes established that pivot:
+
+- **Executor/job split** (`89c747e37`)  
+  Long-lived worker substrate state was separated from per-dispatch mutable job state. This made shared-vs-managed executor attachment semantics explicit and testable, and created the seam needed for multiple executor substrates behind the same ggml-cpu interface.
+
+- **Persistent HPX workers** (`switch CPU executor from per-dispatch task posting to persistent workers`)  
+  The HPX CPU executor no longer posts fresh HPX work on every dispatch. Instead, it creates long-lived secondary workers once during executor init, keeps them alive across dispatches, wakes them with semaphores at kickoff, and joins them only during destroy. This replaced the earlier per-dispatch task-posting design.
+
+### Current HPX substrate model
+The current HPX executor substrate is a **persistent-worker** design:
+
+- secondary workers are launched once at init
+- each worker waits on a semaphore between dispatches
+- kickoff signals only the workers needed for the current graph
+- workers run `ggml_graph_compute_thread_run(...)` and then return to waiting
+- destroy sets stop, signals sleepers, waits for all persistent tasks, and tears down the substrate
+
+This means the remaining cost is **not** due to recreating HPX tasks on every `ggml_graph_compute(...)` call.
+
+### Correctness status
+End-to-end llama.cpp integration remains correct on the HPX path. TinyLlama output matched baseline in the previously validated smoke scenarios, and the known correctness issues from earlier phases were already fixed before this baseline sweep.
+
+### Compact sweep used for baseline
+A compact matrix sweep was run with:
+
+- **threads:** 1, 2, 4
+- **workloads:** `pp32`, `pp512`, `tg128`
+- **variants:** base pthread executor vs HPX persistent-worker executor
+- **repetitions:** 5 warm + 10 measured
+
+### Results summary
+The sweep shows that the remaining HPX gap is **real** and concentrated in **short multithreaded calls**, not in single-thread execution.
+
+#### Short prefill (`pp32`)
+- `t=1`: modest loss (~7%)
+- `t=2`: clear loss (~23%)
+- `t=4`: clear loss (~29%)
+
+#### Large prefill (`pp512`)
+- `t=1`: parity / noise
+- `t=2`: moderate loss (~8%)
+- `t=4`: moderate loss (~5%)
+
+#### Decode-like workload (`tg128`)
+- `t=1`: parity / noise
+- `t=2`: major loss (~41%)
+- `t=4`: major loss (~31%)
+
+### Interpretation
+This baseline localizes the remaining problem to **per-dispatch multithreaded executor coordination overhead** in the HPX substrate.
+
+Important takeaways:
+
+- the HPX path is **not** intrinsically slower in single-thread execution
+- the large earlier decode penalty was reduced by moving from per-dispatch task posting to persistent workers
+- however, the current persistent-worker substrate still does **not** match pthread behavior on short multithreaded calls
+- large prefill amortizes most of the remaining overhead, but short decode-like or short prefill calls do not
+
+### Conclusion of this phase
+At the end of this phase, the project has established a clean HPX persistent-worker baseline inside ggml-cpu:
+
+- correctness is established
+- executor/job split and shared attachment semantics are in place
+- HPX persistent workers are implemented and reusable
+- the remaining blocker is now narrowly identified as **short-call multithreaded coordination overhead**, not correctness and not per-dispatch task creation
+
+### Next direction
+The next branch will explore a more OpenMP-aligned **fork-join style executor structure** as an alternative HPX substrate, with the current persistent-worker implementation serving as the comparison baseline.
