@@ -12,7 +12,6 @@
 // they do not bracket HPX startup/shutdown.
 
 #include "ggml-hpx-runtime.h"
-#include "ggml-hpx-tpool.h"    // ggml_hpx_tpool_get_ops, ggml_cpu_set_executor_ops
 
 #include <hpx/async_combinators/wait_all.hpp>
 #include <hpx/future.hpp>
@@ -42,12 +41,16 @@ std::once_flag g_hpx_start_flag;
 void hpx_acquire()
 {
     std::call_once(g_hpx_start_flag, []() {
-        hpx::start(nullptr, 0, nullptr);
-        ggml_cpu_set_executor_ops(ggml_hpx_tpool_get_ops());
+        // Force the static (non-work-stealing) scheduler.  Measured ~25%
+        // faster than the default local-priority at t=2/4 for our bulk-region
+        // dispatch pattern.  Arrays must be mutable (HPX argc/argv contract).
+        static char arg0[] = "llama-hpx";
+        static char arg1[] = "--hpx:queuing=static";
+        static char* hpx_argv[] = {arg0, arg1};
+        hpx::start(nullptr, 2, hpx_argv);
         std::atexit([]() {
             hpx::post([]() { hpx::finalize(); });
             hpx::stop();
-            ggml_cpu_set_executor_ops(nullptr);    // restore pthread ops
         });
     });
 }

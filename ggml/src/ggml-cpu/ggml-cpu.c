@@ -2999,10 +2999,6 @@ void ggml_threadpool_destroy_substrate(struct ggml_threadpool * tp) {
     ggml_cond_destroy(&tp->cond);
 }
 
-void ggml_threadpool_set_active_threads(struct ggml_threadpool * tp, int n) {
-    tp->current_job->n_active_threads = n;
-}
-
 int ggml_threadpool_n_threads(const struct ggml_threadpool * tp) {
     return tp->n_threads;
 }
@@ -3015,17 +3011,20 @@ void * ggml_threadpool_get_priv(const struct ggml_threadpool * tp) {
     return tp->executor_priv;
 }
 
-int64_t ggml_threadpool_last_node_ne1(const struct ggml_threadpool * tp) {
+int ggml_threadpool_n_nodes(const struct ggml_threadpool * tp) {
     if (!tp || !tp->current_job || !tp->current_job->cgraph) {
         return -1;
     }
-    const struct ggml_cgraph * g = tp->current_job->cgraph;
-    if (g->n_nodes <= 0) {
-        return -1;
-    }
-    const struct ggml_tensor * last = g->nodes[g->n_nodes - 1];
-    return last ? last->ne[1] : -1;
+    return tp->current_job->cgraph->n_nodes;
 }
+
+size_t ggml_threadpool_work_size(const struct ggml_threadpool * tp) {
+    if (!tp || !tp->current_job || !tp->current_job->cplan) {
+        return SIZE_MAX;
+    }
+    return tp->current_job->cplan->work_size;
+}
+
 
 #ifndef GGML_USE_OPENMP
 
@@ -3173,10 +3172,9 @@ static void ggml_pthread_init(struct ggml_threadpool * tp,
 }
 
 static const struct ggml_cpu_executor_ops ggml_pthread_executor_ops = {
-    /* .init        = */ ggml_pthread_init,
-    /* .kickoff     = */ ggml_pthread_kickoff,
-    /* .worker_wait = */ ggml_pthread_worker_wait,
-    /* .destroy     = */ ggml_pthread_destroy,
+    /* .init    = */ ggml_pthread_init,
+    /* .run_job = */ NULL,
+    /* .destroy = */ ggml_pthread_destroy,
 };
 
 // Global ops used by ggml_threadpool_new_impl.  Defaults to the pthread
@@ -3200,7 +3198,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     }
 
     while (true) {
-        threadpool->ops->worker_wait(threadpool, state);
+        ggml_pthread_worker_wait(threadpool, state);
         if (threadpool->stop) break;
         if (state->pending) {
             state->pending = false;
@@ -3231,7 +3229,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
     atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
 
-    threadpool->ops->kickoff(threadpool, n_threads);
+    ggml_pthread_kickoff(threadpool, n_threads);
 
     ggml_mutex_unlock(&threadpool->mutex);
 }
@@ -3239,9 +3237,10 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 #endif // GGML_USE_OPENMP
 
 static struct ggml_threadpool * ggml_threadpool_new_impl(
-    struct ggml_threadpool_params * tpp,
-               struct ggml_cgraph * cgraph,
-                struct ggml_cplan * cplan) {
+    struct ggml_threadpool_params *       tpp,
+                  struct ggml_cgraph *    cgraph,
+                   struct ggml_cplan *    cplan,
+    const struct ggml_cpu_executor_ops *  ops_override) {
 
     struct ggml_threadpool * threadpool =
         ggml_aligned_malloc(sizeof(struct ggml_threadpool));
@@ -3285,7 +3284,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
 #else // GGML_USE_OPENMP
-    threadpool->ops = g_executor_ops;
+    threadpool->ops = ops_override ? ops_override : g_executor_ops;
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
     threadpool->ops->init(threadpool, tpp);
@@ -3295,7 +3294,14 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 }
 
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
-    return ggml_threadpool_new_impl(tpp, NULL, NULL);
+    return ggml_threadpool_new_impl(tpp, NULL, NULL, NULL);
+}
+
+struct ggml_threadpool * ggml_threadpool_new_with_ops(
+    struct ggml_threadpool_params *      tpp,
+    const struct ggml_cpu_executor_ops * ops) {
+    GGML_ASSERT(ops != NULL);
+    return ggml_threadpool_new_impl(tpp, NULL, NULL, ops);
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
@@ -3320,7 +3326,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
-        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan, NULL);
         // current_job = &threadpool->job, set inside ggml_threadpool_new_impl
     } else {
         // Initialize job fully before assigning to current_job.
@@ -3369,11 +3375,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
-    // Kick all threads to start the new graph
-    ggml_graph_compute_kickoff(threadpool, n_threads);
-
-    // This is a work thread too
-    ggml_graph_compute_thread(&threadpool->workers[0]);
+    if (threadpool->ops->run_job) {
+        // HPX path: executor owns all workers including worker 0.
+        // n_active_threads must be set before workers read it from the job.
+        // n_graph is not published: HPX workers are dispatched directly, not
+        // via the poll/wake mechanism.
+        threadpool->current_job->n_active_threads = n_threads;
+        threadpool->ops->run_job(threadpool, n_threads);
+    } else {
+        // pthread path: kickoff wakes workers [1..n_threads-1];
+        // this thread is worker 0.
+        ggml_graph_compute_kickoff(threadpool, n_threads);
+        ggml_graph_compute_thread(&threadpool->workers[0]);
+    }
 #endif
 
     // don't leave affinity set on the main thread

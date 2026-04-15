@@ -1,0 +1,14 @@
+date: Tue Apr 14 14:05:20 PDT 2026
+model: models/tinyllama/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+base_build: build-base-cpu
+hpx_build: build-hpx-cpu
+warm_reps: 5
+meas_reps: 10
+threads: 1 2 4
+cases: pp32 pp512 tg128
+git_commit: 66737bb6fa5c7591bbaa207f29873c3086a787c2
+git_branch: hpx-fork-join-experiment
+uname: Darwin Bitas-MacBook-Air.local 25.3.0 Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:55 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T8132 arm64
+cpu: Apple M4
+logical_cpu: 10
+physical_cpu: 10

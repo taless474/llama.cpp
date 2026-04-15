@@ -1,189 +1,123 @@
 // ggml-hpx-tpool.cpp
 //
-// HPX executor ops — persistent-worker variant (Option B).
+// HPX executor ops — bulk-region variant.
 //
-// init:        spawn n_threads-1 persistent HPX lightweight threads; each
-//              sleeps on a counting semaphore until signalled by kickoff.
-// kickoff:     signal all n_threads-1 semaphores; workers wake, call
-//              ggml_graph_compute_thread_run, then go back to sleep.
-// worker_wait: unreachable — ggml_graph_compute_secondary_thread is never
-//              entered because hpx_init creates no pthreads.
-// destroy:     set stop, signal semaphores to wake sleepers, wait for all
-//              futures, free HpxTpoolState, delegate mutex/cond teardown.
+// The HPX backend owns a reusable execution context (scheduler_executor
+// wrapping a thread_pool_scheduler) created once at init time with an
+// explicit thread-count placement hint.
 //
-// Synchronisation model
-// ─────────────────────
-// ggml_graph_compute_thread uses an atomic spin barrier (n_barrier /
-// n_barrier_passed) that requires all n_active_threads to arrive before
-// any proceed.  The caller (ggml_graph_compute) runs workers[0] on the
-// main thread synchronously.  When ggml_graph_compute returns, the final
-// barrier has already passed — all persistent tasks have finished accessing
-// shared state and are back to sleeping on their semaphore.
-//
-// The seq_cst store of n_graph in ggml_graph_compute_kickoff acts as a
-// full release fence before hpx_kickoff is called; the semaphore release/
-// acquire pair provides at least acquire semantics on the worker side,
-// establishing: job fields → n_graph store → sem.signal → sem.wait →
-// task reads current_job.
-//
-// Coroutine guard
+// Execution model
 // ───────────────
-// hpx::threads::get_self_ptr() returns non-null only inside an HPX
-// lightweight thread (coroutine).  On any OS thread — including the main
-// thread registered as HPX worker 0 — it returns nullptr.
+// run_job submits one hpx::experimental::for_loop over logical worker IDs
+// [0, n_threads) to the owned executor.  Each HPX task calls
+// ggml_graph_compute_thread_run for its worker ID, which iterates the full
+// graph and synchronises between nodes via ggml's atomic spin barrier.
 //
-// When kickoff is called from inside an HPX lightweight thread the spin
-// barrier would block that OS thread while persistent workers cannot run
-// on it → deadlock.  Fix: downgrade to single-thread execution.
+// hpx::experimental::for_loop with hpx::execution::par dispatches all
+// n_threads tasks before any complete (bulk semantics), so every barrier
+// cycle sees all n_active_threads participants arrive.  The call blocks the
+// caller until all iterations complete, so run_job returns only after the
+// final barrier has passed.
 //
-// Serial-decode fallback
-// ──────────────────────
-// When GGML_HPX_SERIAL_DECODE=1, if the last graph node's ne[1] <= 1
-// (single-token decode), override n_active_threads to 1 and skip the
-// semaphore signals.
-//
-// Instrumentation
-// ───────────────
-// GGML_HPX_STATS=1 prints on destroy:
-//   parallel-kickoffs  — dispatches where >1 thread was used
-//   serial-fallbacks   — single-token decode fast-paths taken
+// There are no persistent worker tasks, no semaphores, and no coroutine
+// guard.  Thread placement is delegated to the HPX runtime via the
+// with_processing_units_count property on the scheduler.
 
 #include "ggml-hpx-tpool.h"
+#include "ggml-hpx-runtime.h"    // ggml_hpx_tpool_start
 
-#include "ggml.h"    // GGML_ABORT
+#include <hpx/algorithm.hpp>
+#include <hpx/execution.hpp>
+#include <hpx/executors/scheduler_executor.hpp>
+#include <hpx/executors/thread_pool_scheduler.hpp>
 
-#include <hpx/future.hpp>
-#include <hpx/include/post.hpp>
-#include <hpx/synchronization/counting_semaphore.hpp>
-#include <hpx/synchronization/mutex.hpp>    // hpx::threads::get_self_ptr
-
-#include <atomic>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <memory>
-#include <mutex>
-#include <vector>
 
 // ---------------------------------------------------------------------------
-// Runtime config — read once from environment.
+// Owned execution context
 // ---------------------------------------------------------------------------
 
 namespace
 {
 
-struct HpxTpoolConfig
-{
-    bool serial_decode = false;    // GGML_HPX_SERIAL_DECODE=1
-    bool print_stats   = false;    // GGML_HPX_STATS=1
+using Scheduler =
+    hpx::execution::experimental::thread_pool_scheduler;
+
+using Exec =
+    hpx::execution::experimental::scheduler_executor<Scheduler>;
+
+// ---------------------------------------------------------------------------
+// Dispatch histogram
+//
+// Records cgraph->n_nodes × n_threads for every run_job call.
+// Printed to stderr in hpx_destroy.  Purely observational; zero effect on
+// dispatch behaviour.
+// ---------------------------------------------------------------------------
+
+static constexpr int kNThreadTiers = 4;   // t=1, t=2, t=4, other
+
+// n_nodes histogram (graph topology; batch-size invariant for llama graphs)
+static constexpr int kNNodeBuckets                     = 7;
+static constexpr int kNodeEdges[kNNodeBuckets - 1]     = {8, 16, 32, 64, 128, 256};
+static constexpr char const* kNodeLabels[kNNodeBuckets] = {
+    "    <8", "  8-15", " 16-31", " 32-63", " 64-127", "128-255", "   >=256",
 };
 
-HpxTpoolConfig g_cfg;
-std::once_flag g_cfg_flag;
+// work_size histogram (scratch bytes; varies with batch/sequence length)
+static constexpr int    kNWorkBuckets                      = 6;
+static constexpr size_t kWorkEdges[kNWorkBuckets - 1]      = {
+    1, 4096, 65536, 1048576, 16777216
+};   // 0 / 1–4K / 4K–64K / 64K–1M / 1M–16M / >=16M
+static constexpr char const* kWorkLabels[kNWorkBuckets] = {
+    "       0", "  1-4K", " 4K-64K", " 64K-1M", " 1M-16M", "  >=16M",
+};
 
-void load_config()
+static int thread_tier(int n_threads) noexcept
 {
-    std::call_once(g_cfg_flag, []() {
-        g_cfg.serial_decode =
-            (std::getenv("GGML_HPX_SERIAL_DECODE") != nullptr);
-        g_cfg.print_stats =
-            (std::getenv("GGML_HPX_STATS") != nullptr);
-    });
+    if (n_threads == 1) return 0;
+    if (n_threads == 2) return 1;
+    if (n_threads == 4) return 2;
+    return 3;
 }
 
-// ---------------------------------------------------------------------------
-// Global dispatch counters.
-// ---------------------------------------------------------------------------
-
-std::atomic<long long> g_kickoff_calls{0};
-std::atomic<long long> g_serial_fallbacks{0};
-
-// ---------------------------------------------------------------------------
-// Persistent worker state.
-//
-// One HpxWorkerSlot per secondary worker (j = 1 .. n_threads-1).
-// The slot is owned by HpxTpoolState; the worker task holds a raw pointer
-// and must not outlive the state.  HpxTpoolState is stored as
-// tp->executor_priv and freed in hpx_destroy after all futures complete.
-// ---------------------------------------------------------------------------
-
-struct HpxWorkerSlot
+static int node_bucket(int n_nodes) noexcept
 {
-    // HPX-aware counting semaphore: worker sleeps here between dispatches.
-    // Starts at 0 (blocked).  kickoff signals 1 per dispatch; destroy
-    // signals 1 extra so the stop check runs and the loop exits.
-    hpx::counting_semaphore_var<> sem{0};
+    for (int k = 0; k < kNNodeBuckets - 1; ++k)
+        if (n_nodes < kNodeEdges[k])
+            return k;
+    return kNNodeBuckets - 1;
+}
 
-    // Set by destroy before the final signal.  Checked after wakeup.
-    std::atomic<bool> stop{false};
-
-    // The future for this worker's persistent HPX task.  Awaited in destroy.
-    hpx::future<void> task{};
-
-    // Pointer into tp->workers[j].  Valid for the lifetime of the threadpool.
-    struct ggml_compute_state* state = nullptr;
-
-    // -----------------------------------------------------------------------
-    // Wake-latency instrumentation (only used when GGML_HPX_STATS=1).
-    //
-    // t_signal_ns: written by the main thread with relaxed ordering just
-    //   before sem.signal(); the semaphore release/acquire pair provides the
-    //   full happens-before ordering so the worker can read it safely after
-    //   sem.wait() returns.
-    //
-    // sum_wake_ns / sum_entry_ns / n_dispatches: written exclusively by the
-    //   worker task; read by the main thread only after task.wait() completes
-    //   (the future provides the necessary fence — no atomics needed).
-    // -----------------------------------------------------------------------
-    std::atomic<std::int64_t> t_signal_ns{0};
-
-    long long sum_wake_ns  = 0;   // sum of (t_woke  - t_signal) per dispatch
-    long long sum_entry_ns = 0;   // sum of (t_start - t_woke)   per dispatch
-    long long n_dispatches = 0;
-};
+static int work_bucket(std::size_t work_size) noexcept
+{
+    for (int k = 0; k < kNWorkBuckets - 1; ++k)
+        if (work_size < kWorkEdges[k])
+            return k;
+    return kNWorkBuckets - 1;
+}
 
 struct HpxTpoolState
 {
-    // Index 0 → secondary worker 1, index k → secondary worker k+1.
-    std::vector<std::unique_ptr<HpxWorkerSlot>> slots;
-};
+    // Reusable execution context: n_threads workers, HPX-topology placement.
+    // Constructed once in hpx_init; every run_job dispatch uses this object.
+    Exec exec;
 
-// ---------------------------------------------------------------------------
-// Persistent worker loop.
-//
-// Runs as an HPX lightweight thread.  The loop order is intentional:
-//   1. wake (sem.wait)
-//   2. check stop
-//   3. exit if stopping    ← teardown can never trigger an extra dispatch
-//   4. run one dispatch
-// ---------------------------------------------------------------------------
+    // n_nodes histogram: [thread_tier][node_bucket] dispatch counts.
+    std::int64_t node_hist[kNThreadTiers][kNNodeBuckets] = {};
+    // work_size histogram: [thread_tier][work_bucket] dispatch counts.
+    std::int64_t work_hist[kNThreadTiers][kNWorkBuckets] = {};
+    std::int64_t tier_total[kNThreadTiers]               = {};
 
-void worker_loop(HpxWorkerSlot* slot)
-{
-    for (;;)
+    explicit HpxTpoolState(int n_threads)
+      : exec(hpx::parallel::execution::with_processing_units_count(
+            Scheduler{},
+            static_cast<std::size_t>(n_threads)))
     {
-        slot->sem.wait(1);
-        auto t_woke = std::chrono::steady_clock::now();
-
-        if (slot->stop.load(std::memory_order_acquire))
-        {
-            break;
-        }
-
-        auto t_start = std::chrono::steady_clock::now();
-        ggml_graph_compute_thread_run(slot->state);
-
-        if (g_cfg.print_stats)
-        {
-            auto sig_ns   = slot->t_signal_ns.load(std::memory_order_relaxed);
-            auto woke_ns  = t_woke.time_since_epoch().count();
-            auto start_ns = t_start.time_since_epoch().count();
-            slot->sum_wake_ns  += woke_ns  - sig_ns;
-            slot->sum_entry_ns += start_ns - woke_ns;
-            ++slot->n_dispatches;
-        }
     }
-}
+};
 
 }    // namespace
 
@@ -192,150 +126,102 @@ void worker_loop(HpxWorkerSlot* slot)
 // ---------------------------------------------------------------------------
 
 static void hpx_init(
-    struct ggml_threadpool*        tp,
-    struct ggml_threadpool_params* /*tpp*/)
+    struct ggml_threadpool *        tp,
+    struct ggml_threadpool_params * /*tpp*/)
 {
-    load_config();
+    int n = ggml_threadpool_n_threads(tp);
+    ggml_threadpool_set_priv(tp, n > 0 ? new HpxTpoolState{n} : nullptr);
+}
 
-    int n_threads = ggml_threadpool_n_threads(tp);
-    if (n_threads <= 1)
+static void hpx_run_job(struct ggml_threadpool * tp, int n_threads)
+{
+    auto * s = static_cast<HpxTpoolState *>(ggml_threadpool_get_priv(tp));
+
+    // Hoist ws and n_nodes so both the probe and the fallback gate share them.
+    std::size_t const ws      = ggml_threadpool_work_size(tp);
+    int const         n_nodes = ggml_threadpool_n_nodes(tp);
+
+    // Probe: record every dispatch in the histograms before any early return.
+    if (s)
     {
-        ggml_threadpool_set_priv(tp, nullptr);
+        int const ti = thread_tier(n_threads);
+        if (n_nodes >= 0)
+            ++s->node_hist[ti][node_bucket(n_nodes)];
+        if (ws != SIZE_MAX)
+            ++s->work_hist[ti][work_bucket(ws)];
+        ++s->tier_total[ti];
+    }
+
+    // Fast path: no HPX overhead for single-threaded dispatch.
+    if (n_threads == 1)
+    {
+        ggml_graph_compute_thread_run(ggml_threadpool_worker(tp, 0));
         return;
     }
 
-    auto* s = new HpxTpoolState{};
-    s->slots.reserve(static_cast<std::size_t>(n_threads - 1));
-
-    for (int j = 1; j < n_threads; ++j)
-    {
-        auto slot    = std::make_unique<HpxWorkerSlot>();
-        slot->state  = ggml_threadpool_worker(tp, j);
-        // Launch persistent HPX lightweight thread.  The raw pointer is safe
-        // because HpxTpoolState (and its slots) outlive the future.
-        slot->task   = hpx::async(worker_loop, slot.get());
-        s->slots.push_back(std::move(slot));
-    }
-
-    ggml_threadpool_set_priv(tp, s);
+    // Bulk dispatch: all n_threads tasks are submitted simultaneously so the
+    // spin barrier inside ggml_graph_compute_thread_run sees every participant.
+    hpx::experimental::for_loop(
+        hpx::execution::par.on(s->exec),
+        0,
+        n_threads,
+        [=](int j) {
+            ggml_graph_compute_thread_run(ggml_threadpool_worker(tp, j));
+        });
 }
 
-static void hpx_kickoff(struct ggml_threadpool* tp, int n_threads)
+static void hpx_destroy(struct ggml_threadpool * tp)
 {
-    // Coroutine guard: spinning inside an HPX lightweight thread would
-    // deadlock because persistent workers cannot run on that OS thread.
-    if (hpx::threads::get_self_ptr() != nullptr)
+    auto * s = static_cast<HpxTpoolState *>(ggml_threadpool_get_priv(tp));
+    if (s)
     {
-        ggml_threadpool_set_active_threads(tp, 1);
-        return;
-    }
+        // Compute overall total.
+        std::int64_t grand_total = 0;
+        for (int ti = 0; ti < kNThreadTiers; ++ti)
+            grand_total += s->tier_total[ti];
 
-    // Serial-decode fallback.
-    if (g_cfg.serial_decode)
-    {
-        int64_t ne1 = ggml_threadpool_last_node_ne1(tp);
-        if (ne1 >= 0 && ne1 <= 1)
+        static constexpr char const* kTierLabels[kNThreadTiers] = {
+            "t=1", "t=2", "t=4", "t=other"
+        };
+
+        std::fprintf(stderr,
+            "[hpx-tpool] dispatch histogram  grand_total=%" PRId64 "\n",
+            grand_total);
+
+        for (int ti = 0; ti < kNThreadTiers; ++ti)
         {
-            ggml_threadpool_set_active_threads(tp, 1);
-            g_serial_fallbacks.fetch_add(1, std::memory_order_relaxed);
-            return;
+            if (s->tier_total[ti] == 0)
+                continue;
+
+            double const tot = static_cast<double>(s->tier_total[ti]);
+            std::fprintf(stderr, "  %s  dispatches=%" PRId64 "\n",
+                kTierLabels[ti], s->tier_total[ti]);
+
+            std::fprintf(stderr, "    -- n_nodes --\n");
+            for (int bi = 0; bi < kNNodeBuckets; ++bi)
+            {
+                std::int64_t const cnt = s->node_hist[ti][bi];
+                std::fprintf(stderr,
+                    "      %-8s  %6" PRId64 "  (%5.1f%%)\n",
+                    kNodeLabels[bi], cnt,
+                    static_cast<double>(cnt) / tot * 100.0);
+            }
+
+            std::fprintf(stderr, "    -- work_size --\n");
+            for (int bi = 0; bi < kNWorkBuckets; ++bi)
+            {
+                std::int64_t const cnt = s->work_hist[ti][bi];
+                std::fprintf(stderr,
+                    "      %-8s  %6" PRId64 "  (%5.1f%%)\n",
+                    kWorkLabels[bi], cnt,
+                    static_cast<double>(cnt) / tot * 100.0);
+            }
         }
+        std::fflush(stderr);
     }
 
-    auto* s = static_cast<HpxTpoolState*>(ggml_threadpool_get_priv(tp));
-    if (s == nullptr || s->slots.empty())
-    {
-        return;
-    }
-
-    g_kickoff_calls.fetch_add(1, std::memory_order_relaxed);
-
-    // Signal n_threads-1 workers.  n_threads may be less than the pool size
-    // on the last dispatch (capped by the job's n_active_threads); wake only
-    // what will actually participate.
-    int n_wake = n_threads - 1;
-    if (n_wake > static_cast<int>(s->slots.size()))
-    {
-        n_wake = static_cast<int>(s->slots.size());
-    }
-    for (int j = 0; j < n_wake; ++j)
-    {
-        auto& slot = s->slots[static_cast<std::size_t>(j)];
-        if (g_cfg.print_stats)
-        {
-            slot->t_signal_ns.store(
-                std::chrono::steady_clock::now().time_since_epoch().count(),
-                std::memory_order_relaxed);
-        }
-        slot->sem.signal(1);
-    }
-}
-
-static void hpx_worker_wait(
-    struct ggml_threadpool*    /*tp*/,
-    struct ggml_compute_state* /*state*/)
-{
-    // Unreachable: hpx_init creates no pthreads; secondary workers run as
-    // persistent HPX tasks and never enter ggml_graph_compute_secondary_thread.
-    GGML_ABORT("hpx_worker_wait: unreachable in HPX persistent-worker substrate");
-}
-
-static void hpx_destroy(struct ggml_threadpool* tp)
-{
-    auto* s = static_cast<HpxTpoolState*>(ggml_threadpool_get_priv(tp));
-
-    // Aggregate wake-latency stats before tearing down (s is freed below).
-    long long total_dispatches = 0;
-    long long total_wake_ns    = 0;
-    long long total_entry_ns   = 0;
-
-    if (s != nullptr)
-    {
-        // Signal stop before waking so the worker never starts a new dispatch
-        // after seeing the signal.
-        for (auto& slot : s->slots)
-        {
-            slot->stop.store(true, std::memory_order_release);
-            slot->sem.signal(1);
-        }
-        // Block until all persistent tasks have exited their loops.
-        // task.wait() provides the fence: slot accumulators are safe to read.
-        for (auto& slot : s->slots)
-        {
-            slot->task.wait();
-            total_dispatches += slot->n_dispatches;
-            total_wake_ns    += slot->sum_wake_ns;
-            total_entry_ns   += slot->sum_entry_ns;
-        }
-        delete s;
-        ggml_threadpool_set_priv(tp, nullptr);
-    }
-
-    if (g_cfg.print_stats)
-    {
-        long long calls  = g_kickoff_calls.load(std::memory_order_relaxed);
-        long long serial = g_serial_fallbacks.load(std::memory_order_relaxed);
-
-        double avg_wake_us  = total_dispatches > 0
-            ? double(total_wake_ns)  / double(total_dispatches) / 1000.0
-            : 0.0;
-        double avg_entry_us = total_dispatches > 0
-            ? double(total_entry_ns) / double(total_dispatches) / 1000.0
-            : 0.0;
-        double avg_total_us = avg_wake_us + avg_entry_us;
-
-        fprintf(stderr,
-            "[hpx-tpool] parallel-kickoffs=%lld"
-            " worker-dispatches=%lld"
-            " avg-wake-latency-us=%.2f"
-            " avg-entry-latency-us=%.2f"
-            " avg-total-wake-to-run-us=%.2f"
-            " serial-fallbacks=%lld\n",
-            calls, total_dispatches,
-            avg_wake_us, avg_entry_us, avg_total_us,
-            serial);
-    }
-
+    delete s;
+    ggml_threadpool_set_priv(tp, nullptr);
     ggml_threadpool_destroy_substrate(tp);
 }
 
@@ -344,13 +230,21 @@ static void hpx_destroy(struct ggml_threadpool* tp)
 // ---------------------------------------------------------------------------
 
 static const struct ggml_cpu_executor_ops ggml_hpx_executor_ops = {
-    /* .init        = */ hpx_init,
-    /* .kickoff     = */ hpx_kickoff,
-    /* .worker_wait = */ hpx_worker_wait,
-    /* .destroy     = */ hpx_destroy,
+    /* .init    = */ hpx_init,
+    /* .run_job = */ hpx_run_job,
+    /* .destroy = */ hpx_destroy,
 };
 
-extern "C" const struct ggml_cpu_executor_ops* ggml_hpx_tpool_get_ops()
+extern "C" const struct ggml_cpu_executor_ops * ggml_hpx_tpool_get_ops()
 {
     return &ggml_hpx_executor_ops;
+}
+
+struct ggml_threadpool * ggml_hpx_tpool_create(
+    struct ggml_threadpool_params * tpp)
+{
+    // Start HPX runtime if not already running (idempotent).
+    // Does not touch g_executor_ops.
+    ggml_hpx_tpool_start();
+    return ggml_threadpool_new_with_ops(tpp, &ggml_hpx_executor_ops);
 }

@@ -373,12 +373,13 @@ llama_context::llama_context(
         if (env && atoi(env) != 0) {
             const char * tpool_only = getenv("GGML_HPX_TPOOL_ONLY");
             if (tpool_only && atoi(tpool_only) != 0) {
-                // Tpool-only mode: start HPX and redirect new threadpools to
-                // the HPX substrate, but do NOT create the exec adapter.
-                // graph_compute falls through to the standard backend path.
-                // Use this to measure pure threadpool overhead in isolation
-                // from the exec orchestration layer.
-                ggml_hpx_tpool_start();
+                // Tpool-only mode: create a dedicated HPX threadpool for large
+                // graphs; small graphs (work_size < threshold) stay on the
+                // pthread threadpool already attached to the backend.
+                // Does NOT modify g_executor_ops — only this context is affected.
+                const int n_thr = cparams.n_threads;
+                struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_thr);
+                threadpool_hpx = ggml_hpx_tpool_create(&tpp);
                 LLAMA_LOG_INFO("%s: HPX tpool-only mode (GGML_HPX_TPOOL_ONLY=1)\n", __func__);
             } else {
                 ggml_hpx_exec_params hpx_params{};
@@ -395,6 +396,10 @@ llama_context::~llama_context() {
     if (hpx_exec != nullptr) {
         ggml_hpx_exec_destroy(hpx_exec);
         hpx_exec = nullptr;
+    }
+    if (threadpool_hpx != nullptr) {
+        ggml_threadpool_free(threadpool_hpx);
+        threadpool_hpx = nullptr;
     }
 #endif
     if (!model.hparams.no_alloc) {
@@ -2208,6 +2213,23 @@ ggml_status llama_context::graph_compute(
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
+#ifdef GGML_HPX
+            // Dual-substrate tpool: choose HPX or pthread based on work_size.
+            // ggml_graph_plan with a null threadpool pointer is cheap (no
+            // allocation — work_data stays null) and gives us work_size for
+            // the dispatch decision without running the graph twice.
+            if (threadpool_hpx != nullptr) {
+                // Default 32 KiB; override with GGML_HPX_WORK_THRESHOLD (bytes).
+                static const size_t kHpxWorkThreshold = []() -> size_t {
+                    const char * env = getenv("GGML_HPX_WORK_THRESHOLD");
+                    return (env && atol(env) > 0)
+                        ? static_cast<size_t>(atol(env))
+                        : 32 * 1024;
+                }();
+                const struct ggml_cplan plan = ggml_graph_plan(gf, n_threads, nullptr);
+                tp = (plan.work_size >= kHpxWorkThreshold) ? threadpool_hpx : tp;
+            }
+#endif
             set_threadpool_fn(backend_cpu, tp);
         }
     }

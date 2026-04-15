@@ -1126,7 +1126,7 @@ Model:
 #### Correctness
 Pass. Generated text was bit-for-bit identical. The only diff was the `llama_context: HPX exec enabled` log line and timing noise.
 
-#### Throughput summary (initial campaign)
+#### Throughput summary (these are superseeded)
 
 **No-BLAS** (build-base-cpu vs build-hpx-cpu):
 
@@ -1312,7 +1312,7 @@ What it now supports instead is:
 
 ---
 
-### Current status
+### Status
 
 - end-to-end llama.cpp integration through the HPX path is correct on the tested TinyLlama scenarios
 - the outer “HPX above ggml backends” approach hit a structural limit for intra-region CPU parallelism
@@ -1333,20 +1333,19 @@ What remains open:
 - decide whether that remaining gap is worth another optimization phase
 - continue only if the next phase has a clear, measurable target
 
-## Addendum: ggml-cpu executor pivot and persistent-worker baseline
-
-### Architectural pivot
+## 6. Persistent Workers
+### ggml-cpu executor pivot
 This phase moved the project from outer HPX orchestration around ggml into ggml-cpu executor ownership itself.
 
 Two key changes established that pivot:
 
-- **Executor/job split** (`89c747e37`)  
+- **Executor/job split**  
   Long-lived worker substrate state was separated from per-dispatch mutable job state. This made shared-vs-managed executor attachment semantics explicit and testable, and created the seam needed for multiple executor substrates behind the same ggml-cpu interface.
 
-- **Persistent HPX workers** (`switch CPU executor from per-dispatch task posting to persistent workers`)  
+- **Persistent HPX workers**
   The HPX CPU executor no longer posts fresh HPX work on every dispatch. Instead, it creates long-lived secondary workers once during executor init, keeps them alive across dispatches, wakes them with semaphores at kickoff, and joins them only during destroy. This replaced the earlier per-dispatch task-posting design.
 
-### Current HPX substrate model
+### HPX substrate model
 The current HPX executor substrate is a **persistent-worker** design:
 
 - secondary workers are launched once at init
@@ -1404,5 +1403,820 @@ At the end of this phase, the project has established a clean HPX persistent-wor
 - HPX persistent workers are implemented and reusable
 - the remaining blocker is now narrowly identified as **short-call multithreaded coordination overhead**, not correctness and not per-dispatch task creation
 
+
+---
+
+## 7. HPX-native bulk-region redesign
+
+### Motivation
+
+The persistent-worker design was correct but pthread-shaped:
+the vtable expressed a thread-lifecycle interface (init/kickoff/worker_wait/destroy), which forced persistent sleeping tasks, semaphore-based wakeup,
+a nested-HPX coroutine guard, and a serial-decode heuristic — all scaffolding around an atomic spin barrier that required exactly N persistent threads.
+
+The redesign grounds the implementation in two things simultaneously: the actual ggml seam and HPX's own primitives, to produce a design where HPX owns the parallel execution primitive rather than managing thread lifecycle.
+
+### Design
+
+**Vtable** reduced to three ops: `init`, `run_job`, `destroy`.
+
+`run_job(tp, n_threads)` replaces `kickoff` + `worker_wait`. It is called
+after `current_job` and `n_active_threads` are set, and returns only when
+all workers have completed. The common layer in `ggml_graph_compute` checks
+`ops->run_job` first; if non-NULL it calls it and skips the pthread kickoff
+path entirely.
+
+**Owned execution context**: `HpxTpoolState` holds a single
+`hpx::execution::experimental::scheduler_executor<thread_pool_scheduler>`
+constructed once at `hpx_init` with
+`hpx::parallel::execution::with_processing_units_count(N)`. The scheduler
+is a P2300 sender-based type; wrapping it in `scheduler_executor` exposes
+the traditional executor interface used by `for_loop`.
+
+**Dispatch**: `hpx_run_job` calls
+
+```cpp
+hpx::experimental::for_loop(
+    hpx::execution::par.on(s->exec),
+    0, n_threads,
+    [=](int j) {
+        ggml_graph_compute_thread_run(ggml_threadpool_worker(tp, j));
+    });
+```
+
+`for_loop` with `par` dispatches all N tasks simultaneously (bulk
+semantics) and blocks the caller until all complete. This is why the
+ggml spin barrier remains correct: all N workers are live at the same
+time, so every barrier cycle sees all `n_active_threads` participants.
+
+### What was removed
+
+- `HpxWorkerSlot`, persistent worker tasks, `hpx::counting_semaphore_var`
+- `worker_loop` function
+- `hpx_kickoff`, `hpx_worker_wait`
+- Nested-HPX coroutine guard (`hpx::threads::get_self_ptr()` check)
+- Serial-decode heuristic (`GGML_HPX_SERIAL_DECODE`)
+- `GGML_HPX_STATS` instrumentation
+- `ggml_threadpool_set_active_threads`, `ggml_threadpool_last_node_ne1`
+  helper functions (were only used by `hpx_kickoff`)
+
+`ggml-hpx-tpool.cpp` went from 357 lines to ~100.
+
+### Correctness result
+
+All 10 `test_hpx_exec` cases pass with the new substrate on the first
+build attempt. The three files changed are:
+
+- `ggml/src/ggml-cpu/ggml-cpu-executor.h` — vtable
+- `ggml/src/ggml-cpu/ggml-cpu.c` — dispatch path + helper removals
+- `ggml/src/ggml-hpx/ggml-hpx-tpool.cpp` — complete rewrite
+
+### Future path
+
+Performance benchmarks against the pthread baseline are the next step
+(CPU-only, `-t 4`, short decode and 128-token prefill).
+
+For richer HPX composition (dataflow dependencies, async prefill chains),
+the `scheduler_executor` already supports the sender/receiver path:
+`bulk(schedule(exec.sched()), N, fn)` + `sync_wait` can replace
+`for_loop.on(exec)` without touching the seam.
+
+### Initial bulk-region result
+
+After the HPX-native bulk-region redesign landed, the new substrate was structurally correct and passed all `test_hpx_exec` cases. The common executor seam had been reduced to:
+
+- `init`
+- `run_job`
+- `destroy`
+
+and the HPX backend owned a reusable `scheduler_executor<thread_pool_scheduler>` created once at `hpx_init`. Dispatch was implemented as one blocking bulk call over logical worker ids using:
+
+```cpp
+hpx::experimental::for_loop(
+    hpx::execution::par.on(s->exec),
+    0, n_threads,
+    [=](int j) {
+        ggml_graph_compute_thread_run(ggml_threadpool_worker(tp, j));
+    });
+```
+
+This preserved the intended HPX-native shape:
+- no persistent worker slots
+- no semaphore wakeup path
+- no coroutine guard
+- no serial-decode heuristic
+- no thread-lifecycle-shaped executor contract
+
+### Benchmark result: the redesign fixed the shape, but exposed a new single-thread issue
+
+The first compact matrix sweep against the stock pthread baseline showed a mixed result:
+
+- large prefill (`pp512`) remained near parity
+- multithreaded short work improved relative to the earlier persistent-worker substrate in some cases
+- but `tg128` at `t=1` regressed badly
+
+This regression turned out not to be a correctness issue and not a multithreaded coordination problem. The cause was simpler:
+
+- persistent-worker had effectively treated `n_threads <= 1` as a no-op on the HPX side, so worker 0 ran inline with no HPX dispatch overhead
+- the new bulk-region `run_job` path always routed even `n_threads == 1` through HPX parallel-algorithm dispatch
+- for decode-like workloads (`tg128`), that meant paying HPX dispatch overhead once per token
+
+So the first bulk-region result showed that the redesign was directionally right for multithreaded work, but that the new seam had accidentally lost the old zero-overhead single-thread path.
+
+### Fix: direct fast path for `n_threads <= 1`
+
+The fix was intentionally small and local:
+
+- keep the bulk-region architecture unchanged for `n_threads > 1`
+- add an early return in `hpx_run_job(...)` for `n_threads <= 1`
+- run worker 0 directly in that case
+
+Conceptually:
+
+```cpp
+if (n_threads <= 1) {
+    ggml_graph_compute_thread_run(ggml_threadpool_worker(tp, 0));
+    return;
+}
+```
+This restored the expected single-thread behavior without reintroducing:
+- persistent workers
+- semaphores
+- coroutine guards
+- serial heuristics
+- extra executor hooks
+
+### Three-way comparison: pthread vs persistent-worker vs bulk-region
+
+After the `n_threads <= 1` fast path was added, the meaningful comparison became:
+
+1. stock pthread baseline
+2. HPX persistent-worker substrate
+3. HPX bulk-region substrate
+
+The resulting pattern was clear.
+
+#### Single-thread (`t=1`)
+Bulk-region returned to near parity with pthread:
+
+- `pp32`: ~97% of pthread
+- `pp512`: ~101% of pthread
+- `tg128`: ~98% of pthread
+
+This fixed the accidental single-thread decode regression completely enough for practical purposes.
+
+#### Large prefill (`pp512`)
+Bulk-region stayed healthy across all thread counts:
+
+- `t=1`: ~101% of pthread
+- `t=2`: ~99% of pthread
+- `t=4`: ~97% of pthread
+
+This is the strongest positive signal in the whole matrix. When compute dominates, the HPX bulk-region substrate is close to free.
+
+#### Short multithreaded work (`pp32`, `tg128`)
+The remaining gap is concentrated here:
+
+- `pp32 t=2`: ~84% of pthread
+- `pp32 t=4`: ~78% of pthread
+- `tg128 t=2`: ~62% of pthread
+- `tg128 t=4`: ~79% of pthread
+
+So the redesign narrowed the problem substantially:
+- single-thread is fixed
+- large workloads are healthy
+- the remaining weakness is short multithreaded dispatch
+
+#### Comparison to persistent-worker
+Bulk-region was consistently as good as or better than persistent-worker in the measured matrix. The biggest visible improvement was restoring single-thread decode to parity; large prefill also remained healthy, while short multithreaded decode still remained the main open problem.
+
+### Experiment attempted and reverted: sender/receiver bulk path
+
+A follow-up experiment temporarily replaced `for_loop(par.on(exec), ...)` with the P2300 sender path:
+
+    bulk(schedule(exec.sched()), N, fn) + sync_wait(...)
+
+The intent was to test whether the sender/receiver bulk form had lower overhead for short dispatches.
+
+Benchmark result:
+- it was slightly worse on the critical short multithreaded case
+- for example, `tg128 t=2` dropped slightly relative to the `for_loop.on(exec)` version
+
+That experiment was therefore reverted. The current branch remains on:
+- `for_loop(par.on(exec), ...)` for `n_threads > 1`
+- direct worker-0 execution for `n_threads <= 1`
+
+### Interpretation
+
+At this point the project has a cleaner and more stable result than either earlier phase:
+
+- the HPX substrate is now HPX-native rather than pthread-shaped
+- the single-thread decode regression introduced by the first bulk-region version was fixed
+- large prefill workloads are near pthread parity
+- bulk-region is consistently better than or equal to the persistent-worker substrate
+- the remaining performance problem is specifically short multithreaded dispatch overhead, especially decode-like work
+
+This means the architectural redesign itself is no longer the question. The open question is narrower:
+
+> can the remaining short multithreaded dispatch cost be reduced enough to make decode-like work competitive with pthread?
+
+### Near-no-op dispatch microbenchmark
+
+The next step is a standalone near-no-op dispatch microbenchmark in `hpx-bench/` to measure raw `run_job(tp, n_threads)` overhead at `n_threads = 2, 4`, comparing:
+
+- stock pthread dispatch
+- current HPX bulk-region dispatch
+
+The purpose of that benchmark is to isolate substrate overhead from ggml compute and determine whether the remaining `tg128` / `pp32` gap is primarily:
+
+- raw dispatch overhead, or
+- deeper interaction with ggml barrier/worker behavior
+
+### Tail localization
+
+To understand the remaining gap after the bulk-region redesign and the `n_threads <= 1` fast path, a standalone microbenchmark was added under `hpx-bench/` to measure raw `run_job(tp, n_threads)` overhead without ggml compute dominating the result.
+
+The benchmark compared:
+
+- stock pthread-style dispatch
+- current HPX bulk-region dispatch using `for_loop(par.on(exec), ...)`
+
+The first version used batched measurements and showed a heavy right tail on the HPX side:
+- median overhead was only moderately worse than pthread
+- but tail latency was much worse
+
+This suggested that the remaining decode loss was not primarily caused by the median dispatch cost, but by rare expensive dispatches.
+
+### Tail breakdown: where the delay actually occurs
+
+The microbenchmark was then extended with a breakdown mode. For each dispatch, it recorded:
+
+- `t_submit`: immediately before dispatch
+- `t_enter[j]`: immediately when worker `j` entered the body
+- `t_done`: immediately after dispatch returned
+
+From those timestamps, it derived:
+
+- `submit→first-start`
+- `submit→last-start`
+- `spread = last-start - first-start`
+- total dispatch time
+
+This revealed the key fact:
+
+- the tail was almost entirely in `submit→first-start`
+- the `spread` between first and last worker start was tiny
+
+So the remaining problem was **not** gang formation, straggler arrival, or barrier spread.  
+The problem was that the first HPX worker sometimes started late, while the rest of the workers followed almost immediately once pickup began.
+
+### Restricted-thread executor probe
+
+A comparison was made against `restricted_thread_pool_executor` to test whether explicit fixed OS-thread placement would eliminate the tail.
+
+It did not reliably do so.
+
+The executor changed the shape of the delay distribution somewhat, but did not remove the long startup stalls. In some cases it traded the original “first worker pickup delay” pattern for a wider first-to-last spread.
+
+This ruled out a simple conclusion that runtime-managed placement alone was the root cause.
+
+### Breakdown repetition count increased to 10,000
+
+The first breakdown runs used too few repetitions to characterize the rare tail events reliably.
+
+At 2,000 dispatches:
+- p99 was under-sampled
+- counts of extreme tail events varied too much between runs
+
+The benchmark was therefore rerun with **10,000 breakdown repetitions**.
+
+With 10K reps, the shape became much clearer and more stable:
+- roughly 90–95% of dispatches landed in the fast bucket
+- a small fraction landed in an intermediate 20 µs–1 ms region
+- about ~1% landed in a >=1 ms tail bucket
+
+This pattern appeared for both the scheduler-based HPX executor path and the restricted-thread executor probe. The conclusion from this phase was:
+
+- the tail was real
+- it was rare
+- it was large enough to matter for decode-like workloads
+- it looked more like startup/pickup delay than steady-state gang overhead
+
+### Scheduler-policy sweep on the default HPX pool
+
+Because the delay was concentrated in worker pickup rather than barrier spread, the next experiment was a scheduler-policy sweep with no structural code change.
+
+The benchmark binary was updated so HPX runtime flags were forwarded correctly through `hpx::start(...)`, and a scheduler label was printed in both the header and breakdown rows. A sweep script was added to run multiple launches per scheduler and collect all output into a single timestamped result file.
+
+The schedulers tested on the default HPX pool were:
+
+- `local`
+- `static`
+- `local-priority`
+- `static-priority`
+- `shared-priority`
+
+All five schedulers ran successfully at `--hpx:threads=4`. Earlier probe runs showed some scheduler instability at `--hpx:threads=2`, but the sweep itself completed.
+
+### Scheduler sweep result
+
+Scheduler choice had a clear effect on dispatch throughput.
+
+At `t=2` for the near-no-op HPX dispatch benchmark:
+- `static` was the clear winner
+- `local-priority` was the slowest
+- `shared-priority` and `local` landed in the middle
+- `static-priority` was close to `static`, but not better
+
+The most important outcome was that **`static` materially reduced total dispatch overhead compared with the previous default-like scheduler choice**.
+
+This changed the interpretation in an important way:
+
+- the earlier HPX loss was not an unavoidable fixed tax
+- scheduler policy mattered significantly
+- some of the remaining loss could be reduced without changing the seam or switching executor types
+
+### End-to-end throughput with static scheduler
+
+After the sweep identified `static` as the best candidate, the real throughput matrix was rerun against the stock pthread baseline for the important cases at `t=2` and `t=4`.
+
+Results showed:
+
+#### Prefill improved substantially
+- `pp32` moved much closer to pthread
+- `pp512` became very close to parity
+
+Representative behavior:
+- `pp512` was within about 1–4% of pthread
+- `pp32` was within a few percent and even slightly positive in one noisy `t=4` run
+
+This was a strong sign that the scheduler change addressed a meaningful part of the earlier HPX overhead.
+
+#### Decode remained the persistent loser
+The remaining weak point was `tg128`, the decode-heavy case:
+- still clearly behind pthread at both `t=2` and `t=4`
+
+The interpretation here is straightforward:
+- decode-like execution consists of many short dispatches
+- even with the better `static` scheduler, HPX still pays a higher per-dispatch cost than pthread
+- that cost accumulates significantly across repeated short decode steps
+
+### Interpretation after scheduler sweep
+
+At this point the picture is much cleaner than earlier in the project:
+
+- the HPX substrate is structurally HPX-native rather than pthread-shaped
+- the accidental single-thread regression was fixed by the `n_threads <= 1` fast path
+- scheduler policy was shown to matter, and `static` is clearly a better fit than `local-priority` for this workload
+- large prefill is now near parity with pthread
+- short prefill is much improved
+- the main remaining problem is decode-heavy short dispatches
+
+This means the project is no longer blocked on correctness, basic architecture, or general prefill performance.
+
+The open question has narrowed to:
+
+> can decode-like short dispatches be made competitive, or should they use a different execution policy than the current HPX bulk-region path?
+
 ### Next direction
-The next branch will explore a more OpenMP-aligned **fork-join style executor structure** as an alternative HPX substrate, with the current persistent-worker implementation serving as the comparison baseline.
+
+The current evidence suggests that the remaining decode loss is tied to **dispatch granularity** more than to the basic executor seam.
+
+Two plausible next directions are:
+
+1. reduce the number of HPX dispatches on decode-like work, or
+2. add a decode-specific cutoff/fallback so very small decode-sized calls avoid HPX dispatch entirely
+
+The bulk-region design, plus the `static` scheduler, appears sufficient for large prefill and good enough for most non-decode-heavy work. Decode remains the one workload where the current HPX dispatch granularity is still not competitive with pthread.
+
+### Work-size probe: finding a real decode/prefill discriminator
+
+After scheduler-policy tuning, the remaining open question was whether decode-like calls could be separated from prefill-like calls using a simple runtime signal available inside the HPX substrate.
+
+The first probe used graph node count (`cgraph->n_nodes`) as a candidate discriminator. That failed completely.
+
+Observed result:
+- `pp32`: 100% in `>=256` nodes
+- `pp512`: 100% in `>=256` nodes
+- `tg128` decode: 100% in `>=256` nodes
+- single-token prefill (`p=1`): 100% in `>=256` nodes
+
+This showed that TinyLlama’s graph topology is effectively invariant across decode and prefill. The number of nodes does not change meaningfully with batch size; only tensor shapes and work per node change.
+
+That negative result was important because it ruled out graph topology as the gating signal.
+
+### Work-size histogram: clean separation
+
+The next probe used `cplan->work_size` instead.
+
+Unlike node count, `work_size` separated the regimes cleanly:
+
+- `tg128` decode: `4K–64K`
+- single-token prefill (`p=1`): `4K–64K`
+- `pp32`: `64K–1M`
+- `pp512`: `>=16M`
+
+This was the first clean decode/prefill discriminator found inside the current ggml/HPX seam.
+
+Interpretation:
+- the important distinction is not graph structure
+- it is dispatch size / work per dispatch
+- decode and large prefill use essentially the same graph topology, but radically different tensor sizes and scratch requirements
+
+This matched the performance results much better than node count did:
+- decode-like work remains the main HPX loser
+- short prefill is much closer to pthread
+- large prefill is near parity
+
+### Consequence of the work-size result
+
+The work-size probe changed the understanding of the remaining problem.
+
+Before this probe, the main open question was whether decode-sized work could be identified at all from within the HPX substrate.
+
+After this probe, the picture became much clearer:
+- decode-sized dispatches can be identified
+- the classifier is `work_size`, not `n_nodes`
+- the likely policy boundary lies somewhere below the `pp32` regime and above the decode regime
+
+A threshold around `64K` became the first plausible candidate:
+- `<64K` catches decode-like dispatches and single-token prefill
+- `>=64K` keeps short and large prefill on the HPX path
+
+### Serial-fallback experiment and barrier hang
+
+A first attempt was made to test a simple fallback policy for `work_size < 64K` by bypassing HPX and running only worker 0 directly.
+
+That hung immediately.
+
+Root cause:
+- the caller had already set `current_job->n_active_threads = n_threads`
+- the fallback executed only worker 0
+- ggml’s spin barrier still expected all `n_active_threads` participants
+- worker 0 blocked forever waiting for workers that were never launched
+
+This clarified an important constraint of the current design:
+
+A local “small-work bypass” is not safe unless the active participant count is also changed to match the fallback execution mode.
+
+In other words:
+- the fallback is not just “run worker 0 directly”
+- it is “run worker 0 directly **and** override the barrier participant count to 1”
+
+That is a useful design constraint for any future policy split.
+
+### What the work-size result means strategically
+
+The project is now past the phase of guessing at decode/prefill signals.
+
+The current evidence supports the following conclusions:
+
+- graph topology is not the right classifier
+- work size is the right classifier
+- the remaining HPX decode problem is tied to dispatch granularity
+- any policy split must respect ggml’s barrier contract
+
+This also sharpened the strategic options:
+
+1. use `work_size` as a classifier for policy selection
+2. keep HPX for prefill-like work
+3. treat decode-like work as a separate policy problem
+
+What remains unresolved is **which** alternate policy should be used for the decode-like regime:
+- serial fallback for the smallest cases
+- pthread fallback for small multithreaded calls
+- or a deeper HPX-specific pool/placement redesign
+
+### Status after all probes
+
+At this point the project has established all of the following:
+
+- the HPX substrate has been redesigned into an HPX-native bulk-region execution path
+- the accidental single-thread regression was fixed by the `n_threads <= 1` fast path
+- scheduler policy matters, and `static` is a much better fit than the earlier default-like scheduler for this workload
+- large prefill is near parity with pthread
+- short prefill is much closer to pthread than earlier HPX versions
+- decode-heavy short dispatches remain the main loser
+- node count does not distinguish decode from prefill
+- `work_size` does distinguish decode from prefill cleanly
+- barrier-safe fallback requires changing the active participant count as well as the execution path
+
+### Updated interpretation
+
+The project is no longer blocked on correctness or on finding the right substrate seam.
+
+The open problem has narrowed to this:
+
+> Given that `work_size` cleanly separates decode-like from prefill-like dispatches, what execution policy should the small-work regime use?
+
+That is the current frontier of the project.
+
+The evidence now points toward a policy split based on dispatch size, not graph topology. Whether that split should be implemented as a local serial fallback, a pthread fallback, or a deeper HPX pool/placement redesign remains the next design decision.
+
+### Work-size probe: finding a real decode/prefill discriminator
+
+After scheduler-policy tuning, the remaining open question was whether decode-like calls could be separated from prefill-like calls using a simple runtime signal available inside the current ggml/HPX seam.
+
+The first probe used graph node count (`cgraph->n_nodes`) as a candidate discriminator. That failed completely.
+
+Observed result:
+- `pp32`: 100% in `>=256` nodes
+- `pp512`: 100% in `>=256` nodes
+- `tg128` decode: 100% in `>=256` nodes
+- single-token prefill (`p=1`): 100% in `>=256` nodes
+
+This showed that TinyLlama’s graph topology is effectively invariant across decode and prefill. The graph structure stays the same; only tensor shapes and work per node change.
+
+That negative result ruled out graph topology as the gating signal.
+
+### Work-size histogram: clean separation
+
+The next probe used `cplan->work_size` instead.
+
+Unlike node count, `work_size` separated the regimes cleanly:
+
+- `tg128` decode: `4K–64K`
+- single-token prefill (`p=1`): `4K–64K`
+- `pp32`: `64K–1M`
+- `pp512`: `>=16M`
+
+This was the first clean decode/prefill discriminator found inside the current substrate seam.
+
+Interpretation:
+- the important distinction is not graph structure
+- it is dispatch size / work per dispatch
+- decode and prefill use essentially the same graph topology, but radically different tensor sizes and scratch requirements
+
+This matched the performance story much better than node count did:
+- decode-like work remains the main HPX loser
+- short prefill is much closer to pthread
+- large prefill is near parity
+
+### Serial fallback probe inside the HPX path
+
+A first attempt was made to use `work_size` as a policy signal inside `hpx_run_job(...)`.
+
+The idea was:
+- small work (`work_size < 64K`) would bypass HPX bulk dispatch
+- the fallback would run worker 0 directly
+- larger work would continue to use the HPX `for_loop(par.on(exec), ...)` path
+
+The first version hung immediately.
+
+Root cause:
+- the caller had already set `current_job->n_active_threads = n_threads`
+- the fallback executed only worker 0
+- ggml’s spin barrier still expected all `n_active_threads` participants
+- worker 0 blocked forever waiting for workers that were never launched
+
+This clarified an important constraint of the current design:
+
+A local serial fallback is not safe unless the active barrier participant count is also overridden to 1.
+
+After fixing that, the serial fallback path did run correctly.
+
+### Critical result: dispatch bypass did not restore decode performance
+
+Even after the serial branch was confirmed to fire for decode-sized work, decode throughput remained far below the stock pthread baseline.
+
+This was the key result of the probe.
+
+Interpretation:
+- the remaining decode loss is **not** explained only by the HPX `for_loop` dispatch overhead
+- bypassing `for_loop` inside the HPX path is not enough
+- the HPX runtime’s resident worker threads still exist in the background and compete for CPU time with the serial decode work
+
+In other words:
+
+> decode-sized calls do badly not just because of HPX dispatch, but because they are still running inside an HPX-owned runtime regime with active worker threads on the machine
+
+This sharply changed the understanding of the remaining decode problem.
+
+### Consequence: the real split is HPX vs pthread, not HPX vs serial branch
+
+Before this probe, it was plausible that a simple branch inside `hpx_run_job(...)` could solve decode:
+- small work → direct worker-0 path
+- large work → HPX bulk dispatch
+
+After this probe, that no longer looked sufficient.
+
+The result implied that the meaningful boundary is not:
+
+- HPX `for_loop` vs local serial fallback inside one HPX threadpool
+
+but rather:
+
+- true **pthread-owned execution** for decode-sized work
+- true **HPX-owned execution** for prefill-sized work
+
+### Proposed hybrid-threadpool design and why it was questioned
+
+A follow-on design was then considered to remove the global executor switch and make threadpool creation explicit.
+
+The good part of that plan was:
+- stop relying on a global `g_executor_ops`
+- add `ggml_threadpool_new_with_ops(...)`
+- make HPX threadpool creation explicit via `ggml_hpx_tpool_create(...)`
+- allow different contexts to coexist with different executor substrates
+
+That infrastructure direction is sound.
+
+However, the first routing idea proposed a **single hybrid threadpool object**:
+- spawn pthread workers in `hpx_init`
+- also create an HPX executor in the same object
+- route by `work_size`
+  - `<64K` → pthread kickoff-and-wait
+  - `>=64K` → HPX `for_loop`
+
+This was questioned for an important reason:
+
+The serial-fallback experiment had already shown that decode loses not just because of HPX dispatch overhead, but because the HPX runtime’s resident worker threads continue to interfere with small-work execution.
+
+So a single hybrid threadpool object containing:
+- live pthread workers
+- and live HPX workers
+
+would likely preserve the same basic interference problem during the decode-sized path.
+
+That means a one-object hybrid does not obviously solve the actual issue the probe uncovered.
+
+### Updated interpretation
+
+At this point the project has established all of the following:
+
+- the HPX substrate has been redesigned into an HPX-native bulk-region execution path
+- the accidental single-thread regression was fixed by the `n_threads <= 1` fast path
+- scheduler policy matters, and `static` is a much better fit than the earlier default-like scheduler
+- large prefill is near parity with pthread
+- short prefill is much improved
+- decode-heavy short dispatches remain the main loser
+- graph node count does not distinguish decode from prefill
+- `work_size` does distinguish decode from prefill cleanly
+- a local serial fallback inside the HPX runtime does not restore decode performance
+- the remaining decode loss is therefore not just `for_loop` dispatch overhead
+- the likely fix is a **real substrate split**, not a local branch inside one HPX-owned path
+
+### Current strategic direction
+
+The project is now past the phase of guessing at workload signals.
+
+The current evidence points toward this architecture:
+
+- remove HPX’s dependence on the global executor switch
+- make threadpool creation explicit
+- keep a real pthread substrate available
+- keep a real HPX substrate available
+- choose between them per dispatch using `work_size`
+
+The open design question is no longer whether decode and prefill can be separated.
+
+That part is now answered.
+
+The open question is:
+
+> should the project implement a true work_size-based pthread/HPX split using two independent substrates, or go deeper into HPX pool/placement redesign first?
+
+At this stage, the evidence favors the true substrate split.
+
+### Explicit per-threadpool executor creation
+
+At this stage, the global executor switch (`g_executor_ops`) had become the wrong abstraction.
+
+Originally, HPX activation worked by replacing the global ggml CPU executor ops table, which meant:
+- new threadpools created after HPX activation would use HPX ops
+- the default path and the HPX path were still coupled through global process state
+
+To remove that coupling, the threadpool creation path was refactored so executor ops could be passed explicitly.
+
+Key change:
+- `ggml_threadpool_new_with_ops(...)` was added as an explicit creation entry point
+- the old global `ggml_cpu_set_executor_ops(...)` path was left in place only for the default/legacy route
+- HPX threadpool creation no longer depends on mutating global executor state
+
+This made executor selection per-threadpool instead of effectively process-wide.
+
+### Explicit HPX threadpool creation
+
+With the explicit-ops refactor in place, the HPX path gained an explicit creation function:
+- `ggml_hpx_tpool_create(...)`
+
+This function:
+- starts HPX if needed
+- creates a threadpool with HPX executor ops directly
+- avoids touching the global default executor path
+
+At the llama.cpp integration point, the HPX path now creates its own threadpool explicitly and stores it on the context. This means:
+- the context can hold an HPX-backed threadpool independently of the default pthread one
+- destruction is explicit and context-local
+- HPX activation no longer globally redirects unrelated threadpool creation
+
+This was an architectural cleanup, not just a performance change.
+
+### First real substrate split
+
+Once `work_size` had been validated as the correct decode/prefill discriminator, the next question was how to route work based on it.
+
+A first attempt tried to do this *inside* the HPX threadpool by using a local serial fallback for `work_size < threshold`. That experiment showed that bypassing `for_loop(...)` alone was not enough; decode still lost because the HPX runtime’s resident worker threads were still alive and competing for CPU time.
+
+That result changed the meaning of the split:
+
+- the real boundary is not “HPX dispatch vs serial branch inside one HPX-owned threadpool”
+- the real boundary is “true pthread-owned execution vs true HPX-owned execution”
+
+The project then moved to a genuine substrate split.
+
+### Routing by `work_size`
+
+The llama.cpp dispatch path was updated so it computes a fresh `ggml_cplan` and uses `cplan->work_size` to decide which threadpool should own the dispatch.
+
+The policy became:
+
+- small work (`work_size < threshold`) → pthread threadpool
+- larger work (`work_size >= threshold`) → HPX threadpool
+
+This is the first point where the project stopped trying to make one substrate fit all workloads and instead used an explicit measured signal to route work to the more appropriate execution regime.
+
+### Routing validation
+
+The routing was then checked directly.
+
+Observed behavior:
+- decode-like work (`tg16` / `tg128`) never touched the HPX threadpool
+- large prefill (`pp512`) consistently routed to the HPX threadpool
+
+This confirmed that the split was not just configured in code; it was actually selecting the intended substrate at runtime.
+
+### End-to-end result of the split
+
+After the substrate split landed, the key benchmark matrix was rerun.
+
+Measured result:
+
+| case  | t | base | hpx | delta |
+|------|---:|-----:|----:|------:|
+| tg128 | 2 | 87.2 | 83.1 | -5% |
+| tg128 | 4 | 97.0 | 96.2 | -1% |
+| pp32  | 2 | 170.7 | 162.4 | -5% |
+| pp32  | 4 | 236.7 | 233.3 | -1% |
+| pp512 | 2 | 155.5 | 156.7 | +1% |
+| pp512 | 4 | 210.9 | 214.3 | +2% |
+
+Interpretation:
+- `tg128` returned to near pthread baseline
+- `pp32` stayed near parity
+- `pp512` stayed at parity or a slight win
+
+This was the first result where the architecture and the measurements fully lined up:
+
+- decode-sized work no longer paid the HPX penalty
+- large prefill still benefited from the HPX path being available
+- no meaningful regression remained in the measured matrix
+
+In practical terms, the split achieved the intended goal:
+- protect decode performance
+- preserve HPX competitiveness for prefill-sized work
+
+### Threshold sweep and final default
+
+A threshold sweep was run for:
+- `32K`
+- `64K`
+- `128K`
+
+Two important observations came out of the sweep:
+
+1. Absolute throughput across sections was affected by thermal throttling, so the trustworthy comparison was the **within-section HPX/base ratio**, not raw tokens/s across the entire run.
+2. Routing was identical across all three thresholds:
+   - decode-sized work always stayed off HPX
+   - `pp32` and `pp512` always stayed on HPX
+
+Within-section ratios:
+
+| threshold | case×t | HPX/base |
+|----------|--------|----------|
+| 32K  | tg128×t2 | 80.8 / 85.6 = 94% |
+| 32K  | tg128×t4 | 78.4 / 83.9 = 93% |
+| 32K  | pp32×t2  | 161.5 / 159.7 = 101% |
+| 32K  | pp32×t4  | 208.4 / 202.7 = 103% |
+| 32K  | pp512×t2 | 150.3 / 151.2 = 99% |
+| 32K  | pp512×t4 | 184.8 / 187.2 = 99% |
+| 64K  | tg128×t2 | 63.1 / 63.9 = 99% |
+| 64K  | tg128×t4 | 71.6 / 73.0 = 98% |
+| 64K  | pp32×t2  | 135.0 / 138.5 = 97% |
+| 64K  | pp32×t4  | 204.8 / 199.1 = 103% |
+| 64K  | pp512×t2 | 131.9 / 128.7 = 102% |
+| 128K | tg128×t2 | 59.9 / 60.9 = 98% |
+| 128K | tg128×t4 | 70.6 / 73.3 = 96% |
+| 128K | pp32×t2  | 139.6 / 138.2 = 101% |
+| 128K | pp32×t4  | 199.9 / 186.9 = 107% |
+| 128K | pp512×t2 | 129.1 / 130.4 = 99% |
+
+Because routing did not change across the tested thresholds, the smallest working threshold became the right default.
+
+Final recommendation:
+- set `GGML_HPX_WORK_THRESHOLD` default to **32K** (`32768` bytes)
+
+Why `32K`:
+- it is the smallest threshold that still routes correctly
+- it keeps as much work as possible on the HPX path without leaking decode-sized work into HPX
+- it leaves headroom for models whose decode-sized work is larger than TinyLlama’s while still staying conservative

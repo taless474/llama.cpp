@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include <stdint.h>    // int64_t
+#include <stddef.h>    /* size_t */
 
 #ifdef __cplusplus
 extern "C"
@@ -27,39 +27,41 @@ struct ggml_threadpool_params;
 // ---------------------------------------------------------------------------
 // Executor ops vtable.
 //
-// Isolates the four substrate-specific operations so that alternative
-// compute substrates (e.g. HPX) can be wired in without touching the
-// barrier, chunk-dispatch, or kernel-execution logic.
+// Isolates substrate-specific operations so that alternative compute
+// substrates (e.g. HPX) can be wired in without touching the barrier,
+// chunk-dispatch, or kernel-execution logic.
 //
-// The default implementation (ggml_pthread_executor_ops) wraps the existing
-// pthreads + condition-variable substrate.  No behavior changes; the ops are
-// one indirection point between ggml_threadpool_new_impl / kickoff /
-// secondary-thread loop / ggml_threadpool_free and the actual
-// create/wake/sleep/join primitives.
+// Two execution models coexist:
+//
+//   pthread (default): init spawns persistent workers; kickoff wakes them;
+//     the common layer runs worker-0 inline; workers synchronise via the
+//     spin barrier in ggml_graph_compute_thread.  run_job is NULL.
+//
+//   HPX: init creates a reusable scheduler_executor; run_job submits a
+//     bulk region over logical worker IDs [0, n_threads) to that executor
+//     and waits for completion.  kickoff/worker_wait are not used.
 // ---------------------------------------------------------------------------
 
 struct ggml_cpu_executor_ops
 {
-    // Launch persistent workers (pthreads) and apply CPU placement.
     // Called from ggml_threadpool_new_impl after mutex/cond are initialized.
-    // HPX: no-op (tasks are submitted on each kickoff instead).
+    // pthread: spawns n_threads-1 worker threads and applies CPU placement.
+    // HPX:     creates the owned scheduler_executor (N threads, HPX topology).
     void (*init)(struct ggml_threadpool*       tp,
                  struct ggml_threadpool_params* tpp);
 
-    // Wake workers for a new dispatch.
-    // Called with tp->mutex held (exclusive), after n_graph has been
-    // published with a seq_cst store and current_job is set.
-    void (*kickoff)(struct ggml_threadpool* tp, int n_threads);
-
-    // Persistent worker's full idle cycle: block until new work is ready
-    // (state->pending == true) or the pool is stopping (tp->stop == true).
-    // Called from the secondary-thread loop.
-    // HPX: unreachable — no persistent workers exist.
-    void (*worker_wait)(struct ggml_threadpool*    tp,
-                        struct ggml_compute_state* state);
+    // Execute one full graph dispatch across n_threads logical workers.
+    // current_job (cgraph, cplan, n_active_threads) is already set when
+    // this is called.  Returns only after all workers have completed.
+    //
+    // pthread: NULL — the common layer uses its own kickoff + inline worker-0.
+    // HPX:     submits hpx::experimental::for_loop over [0, n_threads) on
+    //          the owned executor; each iteration calls
+    //          ggml_graph_compute_thread_run(&tp->workers[j]).
+    void (*run_job)(struct ggml_threadpool* tp, int n_threads);
 
     // Signal all workers to exit, join them, and tear down the substrate
-    // (mutex, cond, etc.).  Called from ggml_threadpool_free.
+    // (mutex, cond, executor state).  Called from ggml_threadpool_free.
     void (*destroy)(struct ggml_threadpool* tp);
 };
 
@@ -69,8 +71,15 @@ struct ggml_cpu_executor_ops
 
 // Override the executor ops for all future ggml_threadpool_new() calls.
 // Pass NULL to restore the default pthread ops.
-// Called by the HPX backend during initialisation.
+// Prefer ggml_threadpool_new_with_ops() for new code; this function modifies
+// global state and is retained only for the legacy default-path override.
 void ggml_cpu_set_executor_ops(const struct ggml_cpu_executor_ops* ops);
+
+// Create a threadpool with an explicitly supplied executor ops table.
+// ops must not be NULL.  Does not read or modify g_executor_ops.
+struct ggml_threadpool* ggml_threadpool_new_with_ops(
+    struct ggml_threadpool_params*      tpp,
+    const struct ggml_cpu_executor_ops* ops);
 
 // Non-static wrapper: lets HPX code in a separate TU submit one worker
 // as an HPX task without crossing the static-linkage boundary.
@@ -86,27 +95,32 @@ struct ggml_compute_state* ggml_threadpool_worker(
 // ggml-cpu-threadpool.h (stdatomic.h / HPX macro conflict).
 int ggml_threadpool_n_threads(const struct ggml_threadpool* tp);
 
+// Return the number of nodes in the graph currently loaded into tp.
+// Returns -1 if tp, tp->current_job, or tp->current_job->cgraph is NULL.
+// In normal execution all three are valid when run_job is called, but the
+// defensive check makes the contract explicit for callers that probe this
+// value (e.g. histogram logging, future size-gating policies).
+int ggml_threadpool_n_nodes(const struct ggml_threadpool* tp);
+
+// Return the scratch work_size (bytes) from the cplan of the currently
+// active job.  work_size is computed by ggml_graph_plan() and reflects the
+// total scratch needed for this graph at the current batch size; it varies
+// with batch/sequence length even when n_nodes is invariant.
+// Returns SIZE_MAX if tp, tp->current_job, or tp->current_job->cplan is NULL.
+// (0 is a valid work_size for graphs with no scratch requirement, so SIZE_MAX
+// is the sentinel rather than 0.)
+size_t ggml_threadpool_work_size(const struct ggml_threadpool* tp);
+
 // Set tp->stop = true, then destroy tp->mutex and tp->cond.
 // Used by the HPX destroy op which has no direct access to the
 // platform mutex/cond macros.
 void ggml_threadpool_destroy_substrate(struct ggml_threadpool* tp);
-
-// Override the active-thread count for the current dispatch to n.
-// Used by hpx_kickoff to downgrade to single-thread execution when
-// called from an HPX coroutine (to avoid barrier deadlock).
-void ggml_threadpool_set_active_threads(struct ggml_threadpool* tp, int n);
 
 // Attach or retrieve opaque executor-private state on a threadpool.
 // The pointer is set once in executor->init and read in kickoff/destroy.
 // The executor owns the allocation; ggml does not inspect it.
 void  ggml_threadpool_set_priv(struct ggml_threadpool* tp, void* priv);
 void* ggml_threadpool_get_priv(const struct ggml_threadpool* tp);
-
-// Return nodes[n_nodes-1]->ne[1] for the graph attached to the current job.
-// Returns -1 if tp, current_job, or the graph is NULL, or n_nodes == 0.
-// Safe to call from C++ TUs that cannot include ggml-cpu-threadpool.h
-// (which pulls in <stdatomic.h> and conflicts with HPX memory-order macros).
-int64_t ggml_threadpool_last_node_ne1(const struct ggml_threadpool* tp);
 
 #ifdef __cplusplus
 }

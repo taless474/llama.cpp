@@ -1,0 +1,81 @@
+bench_run_job_overhead  warm=500  batches=200  batch_size=500  total_per_cell=100000
+breakdown_warm=200  breakdown_reps=10000
+
+=== throughput (ns/dispatch) ===
+var    t     body                  iters        mean         p50         p95         p99         max
+------------------------------------------------------------------------------------------
+pth    t=1   noop        iters= 100000  mean=    26.7  p50=    26.4  p95=    26.5  p99=    26.7  max=     91.5  ns
+pth    t=1   tiny-touch  iters= 100000  mean=    27.5  p50=    26.8  p95=    26.8  p99=   349.7  max=    395.0  ns
+pth    t=2   noop        iters= 100000  mean=  3434.6  p50=  2671.5  p95=  7616.0  p99=  8903.2  max=  21133.3  ns
+pth    t=2   tiny-touch  iters= 100000  mean=  2658.7  p50=  2538.8  p95=  3363.2  p99=  7454.2  max=   7861.2  ns
+pth    t=4   noop        iters= 100000  mean=  7556.8  p50=  6846.2  p95= 13371.2  p99= 17266.4  max=  17680.5  ns
+pth    t=4   tiny-touch  iters= 100000  mean=  7071.9  p50=  6742.7  p95=  8594.1  p99=  9741.2  max=  12065.4  ns
+
+hpx    t=1   noop        iters= 100000  mean=     1.5  p50=     1.4  p95=     2.0  p99=     2.0  max=      2.1  ns
+hpx    t=1   tiny-touch  iters= 100000  mean=     1.5  p50=     1.5  p95=     1.6  p99=     1.6  max=      1.6  ns
+hpx    t=2   noop        iters= 100000  mean= 51929.9  p50= 12335.6  p95=210426.9  p99=450931.7  max= 470395.2  ns
+hpx    t=2   tiny-touch  iters= 100000  mean= 28753.5  p50= 11285.7  p95=193008.2  p99=317380.0  max= 430243.1  ns
+hpx    t=4   noop        iters= 100000  mean= 50104.8  p50= 13015.5  p95=293441.2  p99=487392.2  max= 508998.8  ns
+hpx    t=4   tiny-touch  iters= 100000  mean= 40655.4  p50= 12124.3  p95=304408.6  p99=445985.8  max= 447942.3  ns
+
+rpe    t=1   noop        iters= 100000  mean=     4.0  p50=     4.0  p95=     4.0  p99=     4.0  max=      4.0  ns
+rpe    t=1   tiny-touch  iters= 100000  mean=     4.3  p50=     4.3  p95=     4.3  p99=     4.4  max=      7.0  ns
+rpe    t=2   noop        iters= 100000  mean= 36887.0  p50= 10085.4  p95=254361.2  p99=431821.9  max= 455645.6  ns
+rpe    t=2   tiny-touch  iters= 100000  mean= 37024.3  p50= 10225.2  p95=248630.8  p99=449621.9  max= 488215.0  ns
+rpe    t=4   noop        iters= 100000  mean= 42608.7  p50= 11766.0  p95=292358.9  p99=472333.8  max= 521906.6  ns
+rpe    t=4   tiny-touch  iters= 100000  mean= 47210.8  p50= 11910.6  p95=297277.1  p99=443210.6  max= 497112.5  ns
+
+=== breakdown (ns per component, n_threads >= 2 only) ===
+
+[breakdown] hpx   t=2 noop       reps=10000
+  submit→first-start      p50=  2792.0  p95=  4917.0  p99= 81958.0  max=2682791.0  ns
+  submit→last-start       p50=  2875.0  p95=  5000.0  p99= 82042.0  max=2682958.0  ns
+  spread (first→last)     p50=    42.0  p95=    84.0  p99=   125.0  max=  11083.0  ns
+  total (submit→done)     p50=  8958.0  p95=148708.0  p99=1017209.0  max=5787584.0  ns
+  histogram (total):  <5µs=0  <20µs=8989  <50µs=245  <100µs=149  <300µs=274  <1ms=238  ≥1ms=105
+[breakdown] hpx   t=2 tiny-touch reps=10000
+  submit→first-start      p50=  2750.0  p95=  4583.0  p99= 16250.0  max=1997666.0  ns
+  submit→last-start       p50=  2834.0  p95=  4667.0  p99= 16375.0  max=1997833.0  ns
+  spread (first→last)     p50=    83.0  p95=   125.0  p99=   166.0  max=   7542.0  ns
+  total (submit→done)     p50=  8625.0  p95= 14875.0  p99=704375.0  max=8934625.0  ns
+  histogram (total):  <5µs=0  <20µs=9571  <50µs=119  <100µs=52  <300µs=87  <1ms=95  ≥1ms=76
+
+[breakdown] rpe   t=2 noop       reps=10000
+  submit→first-start      p50=  2459.0  p95=  3000.0  p99=  4125.0  max=2025750.0  ns
+  submit→last-start       p50=  3792.0  p95=  4458.0  p99=  5542.0  max=2026167.0  ns
+  spread (first→last)     p50=  1334.0  p95=  1583.0  p99=  1750.0  max=  11667.0  ns
+  total (submit→done)     p50=  9542.0  p95= 19875.0  p99=344833.0  max=2038083.0  ns
+  histogram (total):  <5µs=0  <20µs=9503  <50µs=209  <100µs=82  <300µs=93  <1ms=94  ≥1ms=19
+[breakdown] rpe   t=2 tiny-touch reps=10000
+  submit→first-start      p50=  2500.0  p95=  3833.0  p99=  5667.0  max=3284875.0  ns
+  submit→last-start       p50=  3834.0  p95=  5334.0  p99=  7750.0  max=3286667.0  ns
+  spread (first→last)     p50=  1416.0  p95=  1666.0  p99=  1875.0  max= 139042.0  ns
+  total (submit→done)     p50= 10000.0  p95=118667.0  p99=985000.0  max=7721583.0  ns
+  histogram (total):  <5µs=0  <20µs=9145  <50µs=205  <100µs=121  <300µs=210  <1ms=221  ≥1ms=98
+
+[breakdown] hpx   t=4 noop       reps=10000
+  submit→first-start      p50=  3542.0  p95=  5416.0  p99=  9167.0  max=1969416.0  ns
+  submit→last-start       p50=  3667.0  p95=  5500.0  p99=  9833.0  max=1969500.0  ns
+  spread (first→last)     p50=   125.0  p95=   208.0  p99=   209.0  max=   6709.0  ns
+  total (submit→done)     p50=  9375.0  p95= 47667.0  p99=1216292.0  max=11406750.0  ns
+  histogram (total):  <5µs=0  <20µs=9391  <50µs=119  <100µs=65  <300µs=134  <1ms=164  ≥1ms=127
+[breakdown] hpx   t=4 tiny-touch reps=10000
+  submit→first-start      p50=  3583.0  p95=  5541.0  p99= 14917.0  max=2980667.0  ns
+  submit→last-start       p50=  3750.0  p95=  5667.0  p99= 15708.0  max=2980917.0  ns
+  spread (first→last)     p50=   208.0  p95=   292.0  p99=   292.0  max=   4458.0  ns
+  total (submit→done)     p50=  9791.0  p95=234167.0  p99=1007250.0  max=3984459.0  ns
+  histogram (total):  <5µs=0  <20µs=8909  <50µs=227  <100µs=168  <300µs=262  <1ms=333  ≥1ms=101
+
+[breakdown] rpe   t=4 noop       reps=10000
+  submit→first-start      p50=  3084.0  p95=  4750.0  p99=  9000.0  max=2492083.0  ns
+  submit→last-start       p50=  4458.0  p95=  6834.0  p99= 36583.0  max=2494417.0  ns
+  spread (first→last)     p50=  1333.0  p95=  2333.0  p99= 19625.0  max=1532625.0  ns
+  total (submit→done)     p50= 11208.0  p95=133041.0  p99=948458.0  max=9909542.0  ns
+  histogram (total):  <5µs=0  <20µs=9045  <50µs=269  <100µs=139  <300µs=239  <1ms=216  ≥1ms=92
+[breakdown] rpe   t=4 tiny-touch reps=10000
+  submit→first-start      p50=  3042.0  p95=  4666.0  p99=  9417.0  max=3353875.0  ns
+  submit→last-start       p50=  4375.0  p95=  7084.0  p99= 43500.0  max=3493084.0  ns
+  spread (first→last)     p50=  1333.0  p95=  2584.0  p99= 22708.0  max=3489000.0  ns
+  total (submit→done)     p50= 11167.0  p95=234292.0  p99=941625.0  max=3653708.0  ns
+  histogram (total):  <5µs=0  <20µs=8698  <50µs=340  <100µs=208  <300µs=330  <1ms=331  ≥1ms=93
+

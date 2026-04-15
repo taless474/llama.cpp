@@ -100,7 +100,7 @@ run_cell() {
   # extract t/s field (last data line, column 7 of md table: "  123.45 ± 6.78 ")
   local ts
   ts=$(grep -E '^\| llama' "${logfile}" | grep "${case_name}" | \
-       awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $7); print $7}' | tail -1)
+       awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $8); print $8}' | tail -1)
   [[ -z "${ts}" ]] && ts="(parse error)"
 
   printf "%s\t%s\t%s\t%s\t%s\n" \

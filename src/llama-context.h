@@ -352,6 +352,11 @@ private:
     // env: LLAMA_USE_HPX — set to 1 to route graph_compute through HPX exec.
     // Null when the env var is absent or GGML_HPX is not compiled in.
     ggml_hpx_exec * hpx_exec = nullptr;
+
+    // GGML_HPX_TPOOL_ONLY=1: HPX threadpool for large graphs (work_size >= threshold).
+    // The standard threadpool / threadpool_batch members serve as the pthread substrate
+    // for small graphs.  Null unless GGML_HPX_TPOOL_ONLY is active.
+    ggml_threadpool_t threadpool_hpx = nullptr;
 #endif
 
     // perf

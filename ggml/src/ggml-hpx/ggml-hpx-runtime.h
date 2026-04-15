@@ -32,6 +32,10 @@
 #include <cstddef>
 #include <cstdint>
 
+// Forward declarations — full definitions are in ggml-cpu-threadpool.h / ggml.h.
+struct ggml_threadpool;
+struct ggml_threadpool_params;
+
 // ---------------------------------------------------------------------------
 // Opaque runtime handle
 // ---------------------------------------------------------------------------
@@ -54,16 +58,21 @@ struct ggml_hpx_runtime_params
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-// Start the HPX runtime and redirect new ggml_threadpool allocations to the
-// HPX substrate (sets g_executor_ops).  Does NOT create a runtime object or
-// exec adapter — use this when only the HPX threadpool is needed and the
-// exec orchestration layer should be bypassed entirely.
-//
-// Idempotent: safe to call multiple times; only the first call has effect.
+// Start the HPX runtime (idempotent).  Does NOT create a runtime object or
+// exec adapter.  Does not modify g_executor_ops.
 // The HPX runtime shuts down automatically at process exit via atexit.
 //
 // Defined in ggml-hpx-runtime.cpp.
 void ggml_hpx_tpool_start();
+
+// Start the HPX runtime (idempotent) and create a new ggml_threadpool backed
+// by the HPX executor ops.  Does NOT modify g_executor_ops — only the returned
+// threadpool uses the HPX substrate.  The caller owns the returned pointer and
+// must free it with ggml_threadpool_free().
+//
+// Defined in ggml-hpx-tpool.cpp.
+struct ggml_threadpool* ggml_hpx_tpool_create(
+    struct ggml_threadpool_params* tpp);
 
 // Create and start the HPX runtime and worker teams. Returns a non-null
 // pointer on success. The HPX runtime is started as a side effect; it must
