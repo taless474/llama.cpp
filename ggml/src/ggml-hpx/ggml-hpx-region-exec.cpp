@@ -1,0 +1,335 @@
+// ggml-hpx-region-exec.cpp
+//
+// Validator, F32 mul_mat kernel, single-region executor, and group runner
+// for the ggml_hpx_cpu_region contract.
+//
+// None of the functions here call:
+//   ggml_graph_compute_thread_run
+//   ggml_graph_compute
+//   ggml_backend_graph_compute
+//
+// Execution model (Phase 2: per-region dataflow)
+// ──────────────────────────────────────────────
+// launch_region_async (internal) is the single HPX boundary: all knowledge
+// of hpx::async, hpx::dataflow, hpx::future, and hpx::wait_all lives in
+// this translation unit.  Intra-region fan-out inside launch_region_async
+// is unchanged from Phase 1.
+//
+// ggml_hpx_run_single_region:
+//   Wraps launch_region_async(...).get().
+//
+// ggml_hpx_run_region_group:
+//   One shared_future per region.  For each region i in topological order:
+//     - gather shared_futures of i's predecessors;
+//     - if none, region_fut[i] = launch_region_async(i).share();
+//     - else,   region_fut[i] = dataflow(preds...).share(), whose body
+//       calls launch_region_async(i) when every predecessor has completed.
+//   The group barrier is a single hpx::wait_all on region_fut.
+//
+//   There is no explicit level loop: the true invariant ("a region is
+//   runnable when its predecessors are done") is expressed directly by
+//   the dataflow edges.
+
+#ifndef GGML_HPX_REGION_DAG
+#  error "ggml-hpx-region-exec.cpp requires -DGGML_HPX_REGION_DAG"
+#endif
+
+#include "ggml-hpx-region-exec.h"
+
+// HPX
+#include <hpx/algorithm.hpp>
+#include <hpx/async_base/async.hpp>
+#include <hpx/async_base/dataflow.hpp>
+#include <hpx/async_combinators/wait_all.hpp>
+#include <hpx/execution.hpp>
+#include <hpx/future.hpp>
+
+// std
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <queue>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Forward-declare the F32 dot-product kernel used by mul_mat.
+// Implemented in ggml-cpu; not reached through any ggml graph path.
+// ---------------------------------------------------------------------------
+
+extern "C" void ggml_vec_dot_f32(
+    int           n,
+    float *       s,  size_t bs,
+    const float * x,  size_t bx,
+    const float * y,  size_t by,
+    int           nrc);
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+// The single HPX boundary for the fine-region DAG path.
+//
+// All knowledge of hpx::async, hpx::future, and hpx::wait_all lives in
+// this function's body.  Phase 2 will wrap calls to this seam in
+// hpx::dataflow over predecessor shared_futures; the signature does not
+// need to change to support that.
+//
+// Intra-region fan-out is implemented with one hpx::async per lane and a
+// hpx::wait_all inside the outer task.  Using plain asyncs (rather than a
+// pinned fork_join_executor) lets the default HPX scheduler schedule every
+// lane of every concurrent region across all available workers without PU
+// contention between regions.  Executor pooling / reuse is explicitly
+// Phase 3.
+hpx::future<void> launch_region_async(
+    ggml_hpx_cpu_region const & r,
+    int                         n_lanes,
+    ggml_hpx_region_resources * res)
+{
+    return hpx::async([&r, n_lanes, res]()
+    {
+        if (r.kind == GGML_HPX_CPU_REGION_KIND_REDUCTION || n_lanes <= 1)
+        {
+            r.run_range(r.ctx, 0, 1, r.begin, r.end, res);
+            return;
+        }
+
+        int64_t const span = r.end - r.begin;
+
+        std::vector<hpx::future<void>> lane_futs;
+        lane_futs.reserve(static_cast<std::size_t>(n_lanes));
+
+        for (int ith = 0; ith < n_lanes; ++ith)
+        {
+            int64_t const b = (span *  ith)      / n_lanes;
+            int64_t const e = (span * (ith + 1)) / n_lanes;
+            if (b >= e) continue;
+
+            lane_futs.push_back(hpx::async(
+                [&r, n_lanes, res, ith, b, e]()
+                {
+                    r.run_range(r.ctx, ith, n_lanes,
+                                r.begin + b, r.begin + e, res);
+                }));
+        }
+
+        hpx::wait_all(lane_futs);
+    });
+}
+
+}    // namespace
+
+// ---------------------------------------------------------------------------
+// Validator
+// ---------------------------------------------------------------------------
+
+const char * ggml_hpx_validate_region_group(
+    ggml_hpx_cpu_region_group const * group,
+    bool                              check_acyclic)
+{
+    if (!group)               return "group is null";
+    if (group->n_regions < 0) return "n_regions is negative";
+    if (group->n_deps    < 0) return "n_deps is negative";
+
+    if (group->n_regions > 0 && !group->regions)
+        return "regions is null but n_regions > 0";
+    if (group->n_deps > 0 && !group->deps)
+        return "deps is null but n_deps > 0";
+
+    for (int i = 0; i < group->n_regions; ++i)
+    {
+        ggml_hpx_cpu_region const & r = group->regions[i];
+        if (!r.run_range)     return "region has null run_range";
+        if (r.begin >= r.end) return "region has begin >= end";
+    }
+
+    for (int e = 0; e < group->n_deps; ++e)
+    {
+        ggml_hpx_dep_edge const & d = group->deps[e];
+        if (d.src < 0 || d.src >= group->n_regions)
+            return "dep edge src out of range";
+        if (d.dst < 0 || d.dst >= group->n_regions)
+            return "dep edge dst out of range";
+        if (d.src == d.dst)
+            return "dep edge is a self-loop";
+    }
+
+    if (check_acyclic)
+    {
+        // Kahn's algorithm: topological sort via in-degree countdown.
+        // If we cannot drain all nodes the graph has at least one cycle.
+        int const               n = group->n_regions;
+        std::vector<int> in_deg(static_cast<std::size_t>(n), 0);
+
+        for (int e = 0; e < group->n_deps; ++e)
+            ++in_deg[static_cast<std::size_t>(group->deps[e].dst)];
+
+        std::queue<int> ready;
+        for (int i = 0; i < n; ++i)
+            if (in_deg[static_cast<std::size_t>(i)] == 0)
+                ready.push(i);
+
+        int visited = 0;
+        while (!ready.empty())
+        {
+            int const u = ready.front();
+            ready.pop();
+            ++visited;
+
+            for (int e = 0; e < group->n_deps; ++e)
+            {
+                if (group->deps[e].src != u) continue;
+                int const dst = group->deps[e].dst;
+                if (--in_deg[static_cast<std::size_t>(dst)] == 0)
+                    ready.push(dst);
+            }
+        }
+
+        if (visited != n)
+            return "dep graph contains a cycle";
+    }
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// F32 mul_mat kernel
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_mul_mat_f32_run_range(
+    void *                      ctx_void,
+    int                         /*ith*/,
+    int                         /*nth*/,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * /*resources*/)
+{
+    auto * ctx = static_cast<ggml_hpx_mul_mat_f32_ctx *>(ctx_void);
+    int const n = static_cast<int>(ctx->cols);
+
+    for (int64_t row = 0; row < ctx->rows; ++row)
+    {
+        const float * x_row = ctx->x + row * ctx->cols;
+        float *       y_row = ctx->y + row * ctx->out_cols;
+
+        for (int64_t col = begin; col < end; ++col)
+        {
+            ggml_vec_dot_f32(n,
+                y_row + col,               /* s */ 0,
+                ctx->w + col * ctx->cols,  /* x */ 0,
+                x_row,                     /* y */ 0,
+                1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-region executor
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_run_single_region(
+    ggml_hpx_cpu_region const * region,
+    ggml_hpx_region_resources * resources)
+{
+    assert(region && resources);
+    launch_region_async(*region, resources->n_lanes, resources).get();
+}
+
+// ---------------------------------------------------------------------------
+// Group runner
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_run_region_group(
+    ggml_hpx_cpu_region_group const * group,
+    ggml_hpx_region_resources *       resources)
+{
+    assert(group && resources);
+    int const n       = group->n_regions;
+    int const n_lanes = resources->n_lanes;
+    if (n == 0) return;
+
+    // Build per-region predecessor index lists from the dep edges.
+    // pred_idx[i] holds the region indices whose futures i must wait on.
+    std::vector<std::vector<int>> pred_idx(static_cast<std::size_t>(n));
+    std::vector<int>              in_deg(static_cast<std::size_t>(n), 0);
+    for (int e = 0; e < group->n_deps; ++e)
+    {
+        int const src = group->deps[e].src;
+        int const dst = group->deps[e].dst;
+        pred_idx[static_cast<std::size_t>(dst)].push_back(src);
+        ++in_deg[static_cast<std::size_t>(dst)];
+    }
+
+    // Topological order via Kahn's algorithm.  The group is assumed acyclic
+    // (callers are expected to have passed ggml_hpx_validate_region_group
+    // with check_acyclic = true).  Visiting in topo order guarantees that
+    // every predecessor's shared_future has already been stored in
+    // region_fut by the time we compose the current region's dataflow.
+    std::vector<int> topo;
+    topo.reserve(static_cast<std::size_t>(n));
+    {
+        std::queue<int> ready;
+        for (int i = 0; i < n; ++i)
+            if (in_deg[static_cast<std::size_t>(i)] == 0)
+                ready.push(i);
+        while (!ready.empty())
+        {
+            int const u = ready.front();
+            ready.pop();
+            topo.push_back(u);
+            for (int e = 0; e < group->n_deps; ++e)
+            {
+                if (group->deps[e].src != u) continue;
+                int const dst = group->deps[e].dst;
+                if (--in_deg[static_cast<std::size_t>(dst)] == 0)
+                    ready.push(dst);
+            }
+        }
+    }
+
+    // One shared_future per region.  A region with no predecessors launches
+    // immediately via launch_region_async; otherwise hpx::dataflow composes
+    // the wait-for-preds-then-launch node.  The dataflow callable runs when
+    // every predecessor future is ready; it invokes launch_region_async and
+    // blocks (cooperatively on its HPX thread) on the resulting future so
+    // the returned shared_future<void> becomes ready only once the region
+    // itself has completed.
+    std::vector<hpx::shared_future<void>> region_fut(
+        static_cast<std::size_t>(n));
+
+    for (int i : topo)
+    {
+        auto const & preds = pred_idx[static_cast<std::size_t>(i)];
+
+        if (preds.empty())
+        {
+            region_fut[static_cast<std::size_t>(i)] =
+                launch_region_async(
+                    group->regions[i], n_lanes, resources).share();
+            continue;
+        }
+
+        std::vector<hpx::shared_future<void>> pred_futs;
+        pred_futs.reserve(preds.size());
+        for (int p : preds)
+            pred_futs.push_back(region_fut[static_cast<std::size_t>(p)]);
+
+        region_fut[static_cast<std::size_t>(i)] = hpx::dataflow(
+            hpx::launch::async,
+            [group, i, n_lanes, resources]
+            (std::vector<hpx::shared_future<void>> && /*preds*/)
+            {
+                launch_region_async(
+                    group->regions[i], n_lanes, resources).get();
+            },
+            std::move(pred_futs)
+        ).share();
+    }
+
+    // Group barrier.  wait_all rethrows any stored exception; partially
+    // completed concurrent regions are not forcibly canceled (cooperative
+    // abort per HPX_EXECUTOR_CONTRACT.md §6).
+    hpx::wait_all(region_fut);
+}

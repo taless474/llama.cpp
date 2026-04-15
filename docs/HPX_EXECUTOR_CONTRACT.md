@@ -1,173 +1,212 @@
 # HPX Executor Contract for ggml/llama.cpp
-**Draft v0.2**
+**Tightened rulebook version**
 
 ## Scope
 
-This document defines the execution boundary for an HPX-based executor in a `llama.cpp` fork.
+This document defines the current execution contract for the HPX-related CPU
+execution paths in this `llama.cpp` fork.
 
-Goals:
-- keep ggml graphs and tensors
-- keep existing CPU kernels
-- keep BLAS as a delegated backend
-- support two execution modes: **decode** and **prefill**
-- isolate scheduler coupling to one adapter translation unit
-- make planning, caching, and execution testable independently
+This file is a **rulebook**, not a provenance document.
 
-Non-goals:
-- rewriting ggml kernels
-- replacing ggml IR
-- planning inside BLAS
-- creating one HPX task per ggml op
+Use it for:
+- execution invariants
+- dependency boundaries
+- allowed and forbidden design moves
+- current substrate-selection rules
 
----
-
-## 1. Decode plan
-
-A **decode plan** is a cached, reusable execution template for the low-latency single-token path.
-
-It contains only structural execution metadata:
-- mode = `decode`
-- plan key
-- coarse region list
-- region order and dependencies
-- chunking policy for CPU regions
-- workspace requirement
-- executor scratch layout
-- optional instrumentation labels
-
-A decode plan is optimized for:
-- minimum dispatch overhead
-- stable region structure
-- minimal dynamic repartitioning
-
-A decode plan must **not** depend on:
-- ephemeral graph addresses
-- live scheduler-owned objects
-- prior allocation-owned tensor pointers
+Do **not** use it for:
+- chronological history
+- superseded HPX designs
+- benchmark storytelling
 
 ---
 
-## 2. Prefill plan
+## 1. Execution model (current)
 
-A **prefill plan** is a cached, reusable execution template for prompt or batch throughput work.
+The system supports **two execution substrates**:
 
-It may depend on scheduler-derived split topology, but only through an immutable HPX-owned snapshot.
+- **pthread substrate**
+  - used for small work
+  - optimized for low overhead and stable latency
 
-It contains:
-- mode = `prefill`
-- plan key
-- region topology snapshot
-- dependency edges
-- per-region execution policy
-- workspace requirement
-- optional overlap policy
+- **HPX substrate**
+  - used for large work
+  - optimized for throughput and structured CPU parallelism
 
-A prefill plan may be reused only while:
-- backend placement assumptions remain compatible
-- split topology remains compatible
-- workspace/layout assumptions remain compatible
-- planner policy version remains compatible
+### Selection rule
+
+Execution is selected **per dispatch** using:
+
+```cpp
+cplan->work_size
+```
+
+Policy:
+
+```text
+small work   → pthread
+large work   → HPX
+```
+
+This rule is fundamental and must not be bypassed casually.
 
 ---
 
-## 3. Execution unit
+## 2. Decode vs prefill (operational meaning)
 
-The execution unit is **not** a ggml op.
+| mode    | meaning                         | preferred substrate |
+|---------|----------------------------------|---------------------|
+| decode  | small, latency-sensitive work    | pthread             |
+| prefill | large, throughput-oriented work  | HPX                 |
 
-The execution unit is a **coarse region**, such as:
+Important:
+- graph topology does **not** reliably distinguish decode from prefill
+- `work_size` does
+
+---
+
+## 3. Execution units
+
+### 3.1 Coarse regions (current production-oriented path)
+
+The primary execution unit is a **coarse region**, such as:
 - a scheduler split
-- a contiguous CPU-only region
+- a contiguous CPU-only graph region
 - a delegated BLAS-supported region
-- another planner-defined region with a single synchronization boundary
+- another planner-defined unit with one synchronization boundary
 
-The planner creates regions.  
-The executor consumes regions.  
-The scheduler does not see HPX internal worker-level chunking.
+The planner creates coarse regions.  
+The executor consumes coarse regions.
+
+### 3.2 Fine CPU regions (HPX-native path)
+
+An optional finer execution unit may be used inside CPU regions.
+
+Fine regions represent:
+- explicit CPU work ranges
+- explicit dependency edges
+- explicit resource ownership
+
+They are expressed by:
+- `ggml_hpx_cpu_region`
+- `ggml_hpx_cpu_region_group`
+- `ggml_hpx_run_range_fn`
+
+Fine-region execution is the preferred direction for HPX-native CPU work.
 
 ---
 
-## 4. BLAS handoff
+## 4. Fine-region DAG rule
 
-A region is handed off to BLAS instead of being planned internally when:
-- the region is executable by the existing BLAS backend
-- no HPX-only fusion or kernel rewrite is required
-- delegated execution is expected to be at least as good as decomposing it
+The fine-region model is the HPX-native direction.
 
-BLAS regions are treated as opaque coarse units:
-- HPX may schedule around them
-- HPX may attach dependencies before and after them
-- HPX does not plan inside them
+A fine region is executed through:
+
+```cpp
+run_range(ctx, ith, nth, begin, end, resources)
+```
+
+Properties:
+- explicit work range
+- no graph re-entry
+- no dependence on ggml worker identity
+- no direct use of ggml’s barrier model
+
+A region group defines:
+- region array
+- dependency edges
+- per-dispatch resources
+
+The preferred executor for this layer is:
+
+- `hpx::execution::experimental::block_fork_join_executor`
+
+Reason:
+- lower overhead on short fork/join CPU work
+- better fit than the earlier scheduler-queue-based path
 
 ---
 
-## 5. Abort / cancel
+## 5. BLAS rule
+
+BLAS remains:
+- opaque
+- coarse
+- delegated
+
+HPX may:
+- schedule before BLAS regions
+- schedule after BLAS regions
+- attach dependencies around BLAS regions
+
+HPX must not:
+- decompose BLAS internally
+- plan inside BLAS
+- assume control of BLAS worker behavior
+
+---
+
+## 6. Abort rule
 
 Abort is **cooperative**, not preemptive.
 
-At executor level, abort means:
-- no new regions start after abort is observed
-- a running CPU region stops at the next safe checkpoint
-- in-flight delegated work such as BLAS is not forcibly preempted
-- the executor returns aborted status after required cleanup
+Abort means:
+- no new region starts after abort is observed
+- running CPU work stops only at safe checkpoints
+- in-flight BLAS or delegated backend work is not forcibly interrupted
 
 Abort checks must exist:
 - before starting each region
-- at safe checkpoints inside long CPU regions
-- before launching dependent follow-on regions
+- at safe checkpoints inside long CPU work
+- before launching dependent follow-on work
 
 ---
 
-## 6. Reusable state across runs
+## 7. Plan and cache invariants
 
-Safe to reuse:
-- immutable plan metadata
-- mode choice
-- region topology
+Plans are:
+- structural only
+- reusable across compatible runs
+
+Plans may include:
+- mode
+- structural topology
 - dependency graph
-- chunking policy
-- workspace size requirement
-- executor-owned scratch buffers sized for max requirement
-- long-lived HPX runtime objects and teams
-- instrumentation counters and labels
-
-Not safe to reuse:
-- raw `ggml_cgraph *` pointers
-- raw tensor pointers
-- backend buffer addresses from a previous allocation pass
-- pointers into scheduler-owned temporary storage
-- per-run input/output bindings
-- transient split objects tied to a specific scheduler pass
-
----
-
-## 7. Plan cache key
-
-A plan cache key must include at least:
-- mode: `decode` or `prefill`
-- graph-shape signature
-- backend assignment signature
-- workspace/layout signature
+- workspace requirement
 - planner policy version
+- execution policy metadata
 
-A plan cache key must **not** include ephemeral addresses.
+Plans must not include:
+- ephemeral addresses
+- raw tensor pointers
+- live backend instances
+- scheduler-owned objects
+- allocation-pass-owned transient state
 
 ---
 
-## 8. Scheduler dependency rule
+## 8. Scheduler isolation rule (critical)
 
 Scheduler coupling is isolated mechanically.
 
-### Allowed scheduler dependency
-`ggml-backend.h` may be included only by:
-- `ggml-hpx-adapter.cpp`
+### Allowed
+Only this translation unit may include scheduler-facing backend details:
 
-### Forbidden scheduler dependency
-`ggml-backend.h` must not be included by:
+```text
+ggml-hpx-adapter.cpp
+```
+
+### Forbidden
+Scheduler/backend internals must not appear in:
 - `ggml-hpx-plan.cpp`
 - `ggml-hpx-exec.cpp`
-- cache, abort, topology, or region headers
+- cache headers
+- abort headers
+- topology headers
+- fine-region headers
+- fine-region executor code
 
-This rule makes violations visible and testable.
+This rule must not be violated.
 
 ---
 
@@ -175,368 +214,214 @@ This rule makes violations visible and testable.
 
 The adapter may use two strategies.
 
-### Decode topology
-Default strategy: **independent graph walk**
-
-Use this when the decode path is CPU-only and simple enough that HPX-owned topology is authoritative.
+### Decode
+Default strategy:
+- independent graph walk
 
 Reason:
-- lowest overhead
-- no scheduler-state dependency on the fast path
+- lower overhead
+- avoids scheduler-state dependency on the fast path
 
-### Prefill topology
-Default strategy: **scheduler-driven split translation**
-
-Use this when split structure or mixed backend placement matters.
+### Prefill
+Default strategy:
+- scheduler-driven split translation
 
 Flow:
-1. adapter asks scheduler to derive split structure
-2. adapter translates scheduler result into `ggml_hpx_region_topology`
-3. plan builder consumes only that immutable snapshot
+1. adapter asks scheduler for split structure
+2. adapter translates it to immutable HPX-owned topology
+3. planner consumes only that immutable snapshot
 
-Fallback rule:
-- if decode ever stops being simple or becomes mixed-backend, it may also use scheduler-driven topology through the adapter
+Fallback:
+- if decode stops being simple or becomes mixed-backend, decode may also use scheduler-driven topology through the adapter
 
 ---
 
-## 10. Repo layout
+## 10. Execution substrate rules
+
+### 10.1 Substrate ownership
+
+Each threadpool owns exactly one substrate:
+
+- pthread threadpool → pthread executor
+- HPX threadpool → HPX executor
+
+There is no mixed substrate inside one threadpool.
+
+### 10.2 No hybrid execution inside one pool
+
+This is forbidden:
 
 ```text
-llama.cpp/
-├── docs/
-│   ├── HPX_EXECUTOR_CONTRACT.md
-│   ├── HPX_REPO_LAYOUT.md
-│   ├── HPX_MODE_POLICY.md
-│   ├── HPX_TEST_PLAN.md
-│   ├── HPX_BENCHMARK_PLAN.md
-│   └── HPX_IMPL_NOTES.md
-│
-├── ggml/
-│   ├── include/
-│   │   └── ggml-hpx.h
-│   │
-│   └── src/
-│       ├── CMakeLists.txt
-│       │
-│       ├── ggml-hpx/
-│       │   ├── CMakeLists.txt
-│       │   ├── ggml-hpx-region.h
-│       │   ├── ggml-hpx-abort.h
-│       │   ├── ggml-hpx-topo.h
-│       │   ├── ggml-hpx-adapter.h
-│       │   ├── ggml-hpx-adapter.cpp
-│       │   ├── ggml-hpx-plan.h
-│       │   ├── ggml-hpx-plan.cpp
-│       │   ├── ggml-hpx-cache.h
-│       │   ├── ggml-hpx-cache.cpp
-│       │   ├── ggml-hpx-runtime.h
-│       │   ├── ggml-hpx-runtime.cpp
-│       │   ├── ggml-hpx-exec.h
-│       │   ├── ggml-hpx-exec.cpp
-│       │   ├── ggml-hpx-instrument.h
-│       │   └── ggml-hpx-instrument.cpp
-│       │
-│       ├── ggml-cpu/
-│       └── ggml-blas/
-│
-├── tests/
-│   ├── hpx/
-│   │   ├── test_hpx_contract.cpp
-│   │   ├── test_hpx_decode_plan.cpp
-│   │   ├── test_hpx_prefill_plan.cpp
-│   │   ├── test_hpx_cache.cpp
-│   │   ├── test_hpx_abort.cpp
-│   │   ├── test_hpx_adapter.cpp
-│   │   ├── test_hpx_exec.cpp
-│   │   └── test_hpx_stress.cpp
-│   │
-│   └── ggml/
-│
-├── hpx-bench/
-│   ├── CMakeLists.txt
-│   ├── bench_dispatch_overhead.cpp
-│   ├── bench_decode_latency.cpp
-│   ├── bench_prefill_throughput.cpp
-│   ├── bench_split_scaling.cpp
-│   ├── bench_blas_interop.cpp
-│   └── results/
-│
-└── src/
-    └── llama-context.cpp
+one threadpool object that actively contains and runs both:
+- pthread workers
+- HPX workers
 ```
 
-## 11. File responsibilities
+Reason:
+- causes contention
+- breaks decode behavior
+- obscures ownership
 
-### docs/
+### 10.3 Routing must happen before execution
 
-#### `HPX_EXECUTOR_CONTRACT.md`
-Source of truth for:
-- decode vs prefill semantics
-- abort semantics
-- plan reuse rules
-- scheduler dependency rules
+Correct:
 
-#### `HPX_REPO_LAYOUT.md`
-Explains:
-- why files are placed where they are
-- allowed dependency directions
-- what must remain isolated
+```text
+decide substrate → run_job(...)
+```
 
-#### `HPX_MODE_POLICY.md`
-Defines:
-- how mode is selected
-- when decode uses graph-walk topology
-- when prefill uses scheduler-derived topology
-- fallback rules
+Incorrect:
 
-#### `HPX_TEST_PLAN.md`
-Lists:
-- contract tests
-- stress tests
-- regression tests
-- performance guardrails
+```text
+run_job(...)
+  → branch internally between unrelated substrates
+```
 
-#### `HPX_BENCHMARK_PLAN.md`
-Defines:
-- benchmark matrix
-- input shapes
-- decode vs prefill measurements
-- BLAS and non-BLAS runs
-- result reporting format
+Substrate selection must happen before the execution call.
 
-#### `HPX_IMPL_NOTES.md`
-Holds:
-- caveats
-- unresolved questions
-- follow-up refactors
-- performance observations
+### 10.4 Small-work fallback constraint
+
+If execution uses fewer than the published thread count, then the active
+participant count must be updated consistently.
+
+In particular, if only one worker will run, then barrier participation must
+also reflect one worker.
+
+Otherwise:
+- ggml barrier logic will deadlock
+
+### 10.5 HPX must not own decode-sized work accidentally
+
+HPX must not be used for decode-sized work by mistake.
+
+Decode-like work and very small prefill must stay off the HPX substrate unless
+a new design proves that choice beneficial.
 
 ---
 
-### `ggml/include/ggml-hpx.h`
-Thin public C-facing HPX backend header.
+## 11. Repo structure rules
 
-Responsibilities:
-- init / destroy entry points
-- capability query
-- backend creation hooks
-- no internal planner or runtime types
+### Root entry points
 
----
+- `README_HPX.md`
+  - current architecture and current results
 
-### `ggml/src/ggml-hpx/`
+- `docs/HPX_EXECUTOR_CONTRACT.md`
+  - strict design and dependency rules
 
-#### `ggml-hpx-region.h`
-Defines the coarse execution unit.
+- `docs/HPX_PROVENANCE.md`
+  - full chronological history
+  - not a rulebook
 
-Contains:
-- region type enum
-- region identity
-- node span or equivalent structural bounds
-- sync boundary marker
-- region-level metadata only
+### Main code areas
 
-#### `ggml-hpx-abort.h`
-Defines the cooperative abort token.
+- `ggml/src/ggml-hpx/`
+  - HPX-specific execution code
 
-Contains:
-- atomic abort state
-- inline check helpers
-- no runtime ownership
+- `ggml/src/ggml-cpu/`
+  - CPU executor seam and substrate ownership
 
-#### `ggml-hpx-topo.h`
-Defines immutable HPX-owned topology snapshot structs.
-
-Contains:
-- `ggml_hpx_region_topology`
-- region list
-- dependency edges
-- topology metadata
-
-Must never store:
-- live scheduler-owned pointers
-- allocation-pass-owned transient state
-
-#### `ggml-hpx-adapter.h`
-Adapter interface.
-
-Responsibilities:
-- accept graph and optional scheduler-facing inputs
-- produce immutable topology snapshots
-- expose separate decode/prefill topology entry points if needed
-
-#### `ggml-hpx-adapter.cpp`
-Only translation unit allowed to include `ggml-backend.h`.
-
-Responsibilities:
-- scheduler-driven split acquisition for prefill
-- translation from scheduler result to HPX topology snapshot
-- optional independent graph walk for decode
-- no plan caching
-- no execution
-
-#### `ggml-hpx-plan.h`
-Planner-facing types.
-
-Contains:
-- `plan_key`
-- `decode_plan`
-- `prefill_plan`
-- plan validity contract
-
-#### `ggml-hpx-plan.cpp`
-Planner implementation.
-
-Responsibilities:
-- `build_decode_plan()`
-- `build_prefill_plan()`
-- `plan_valid()`
-
-Rules:
-- consumes topology snapshots
-- does not read scheduler state directly
-- must not include `ggml-backend.h`
-
-#### `ggml-hpx-cache.h`
-Plan cache interface.
-
-Contains:
-- lookup
-- insert
-- invalidate
-- cache stats
-
-#### `ggml-hpx-cache.cpp`
-Cache implementation.
-
-Responsibilities:
-- keyed plan storage
-- lifetime and invalidation rules
-- no execution logic
-
-#### `ggml-hpx-runtime.h`
-HPX runtime ownership interface.
-
-Contains:
-- runtime creation / destroy
-- team or pool ownership types
-- scratch ownership interface
-
-#### `ggml-hpx-runtime.cpp`
-Runtime implementation.
-
-Responsibilities:
-- HPX runtime lifecycle
-- worker team or pool ownership
-- scratch buffer ownership
-- pool sizing/config hooks
-
-#### `ggml-hpx-exec.h`
-Executor interface.
-
-Contains:
-- create
-- run
-- destroy
-- status return contract
-
-#### `ggml-hpx-exec.cpp`
-Executor implementation.
-
-Responsibilities:
-- adapter → plan → cache orchestration
-- mode-specific dispatch
-- region execution
-- abort checks
-- delegated BLAS launch coordination
-
-Must not:
-- read scheduler state directly
-- include `ggml-backend.h`
-
-#### `ggml-hpx-instrument.h`
-Instrumentation interface.
-
-Contains:
-- counters
-- timing labels
-- trace hooks
-- benchmark-facing metrics
-
-#### `ggml-hpx-instrument.cpp`
-Instrumentation implementation.
-
-Responsibilities:
-- event counters
-- timing collection
-- trace helpers
-- no planning policy
+- `hpx-bench/`
+  - standalone benchmark executables
 
 ---
 
-## 12. Dependency edges that matter
+## 12. File responsibilities
+
+### `ggml-hpx-region.h`
+Defines coarse execution regions.
+
+### `ggml-hpx-region-dag.h`
+Defines fine CPU regions, dependency edges, resources, and `run_range`.
+
+### `ggml-hpx-region-exec.h/.cpp`
+Implements fine-region validation and direct fine-region execution helpers.
+
+### `ggml-hpx-adapter.cpp`
+Only allowed scheduler/backend translation unit.
+
+### `ggml-hpx-plan.h/.cpp`
+Structural plan creation and plan validity logic.
+
+### `ggml-hpx-cache.h/.cpp`
+Structural plan cache only.
+
+### `ggml-hpx-runtime.h/.cpp`
+HPX runtime ownership and substrate-level runtime support.
+
+### `ggml-hpx-exec.h/.cpp`
+Coarse-region orchestration path only.
+Must not read scheduler internals directly.
+
+---
+
+## 13. Dependency rules
 
 ### Allowed
-- `ggml-hpx-adapter.cpp`
-  - includes `ggml-backend.h`
-  - includes `ggml-hpx-topo.h`
-  - includes `ggml-hpx-region.h`
-
-- `ggml-hpx-plan.cpp`
-  - includes `ggml-hpx-topo.h`
-  - includes `ggml-hpx-region.h`
-  - may include cache-free planner helpers
-  - must not include scheduler headers
-
-- `ggml-hpx-exec.cpp`
-  - includes `ggml-hpx-adapter.h`
-  - includes `ggml-hpx-plan.h`
-  - includes `ggml-hpx-cache.h`
-  - includes `ggml-hpx-abort.h`
-  - includes `ggml-hpx-runtime.h`
-  - includes `ggml-hpx-instrument.h`
+- adapter → scheduler/backend translation
+- planner → immutable topology
+- executor → adapter + plan + cache + runtime
+- fine-region executor → fine-region structs + HPX executor headers
 
 ### Forbidden
-- `ggml-backend.h` outside `ggml-hpx-adapter.cpp`
-- scheduler-owned objects escaping into plan/cache/executor structures
-- cache keys containing ephemeral addresses
+- scheduler details outside adapter
+- backend instances inside plans
+- runtime ownership inside planner
+- cache keys using ephemeral addresses
+- fine-region code calling back into full graph execution
 
 ---
 
-## 13. Testing implications
+## 14. Fine-region execution rules
 
-The tests should align to the contract.
+When using `run_range(...)`, code must:
 
-### Contract tests
-- decode plan does not depend on ephemeral pointers
-- prefill plan reuses only when topology is compatible
-- abort stops new regions from starting
-- BLAS regions remain opaque coarse units
+- operate on explicit ranges
+- be reentrant for distinct range tuples
+- use only explicit resources passed in
+- avoid graph re-entry
 
-### Adapter tests
-- scheduler-driven topology translation is stable
-- decode graph walk produces valid topology
-- adapter outputs immutable HPX-owned snapshots
-
-### Cache tests
-- key excludes ephemeral addresses
-- invalidation occurs on policy/version/layout changes
-- reuse works across repeated compatible runs
-
-### Executor tests
-- decode path stays low-overhead
-- prefill path respects dependencies
-- abort is cooperative
-- BLAS handoff preserves ordering
+It must not:
+- call `ggml_graph_compute_thread_run(...)`
+- call `ggml_graph_compute(...)`
+- call `ggml_backend_graph_compute(...)`
+- depend on implicit worker identity semantics
+- assume persistent worker participation or a ggml barrier contract
 
 ---
 
-## 14. Short summary
+## 15. What Claude or future code should not change
 
-- decode uses a cached low-overhead plan
-- prefill uses a cached topology-aware plan
-- regions are coarse execution units
-- BLAS is delegated, not internally planned
-- abort is cooperative
-- reusable state is structural only
-- scheduler coupling is isolated to one adapter `.cpp`
+Do not:
+- merge pthread and HPX into one active substrate in one pool
+- remove work-size routing without replacement evidence
+- leak scheduler dependency outside the adapter
+- reintroduce decode-sized HPX ownership casually
+- treat provenance as a design contract
+- replace fine-region execution with graph re-entry
+
+---
+
+## 16. What may evolve
+
+These are allowed to evolve:
+- threshold tuning for work-size routing
+- region partitioning policy
+- new direct `run_range` kernels
+- fine-region DAG scheduling policy
+- HPX executor configuration
+- resource ownership details for reductions and scratch
+
+These must evolve without violating earlier rules.
+
+---
+
+## 17. Short summary
+
+- use pthread for small work
+- use HPX for large work
+- keep scheduler coupling isolated to the adapter
+- keep plans structural
+- keep BLAS opaque
+- move HPX toward explicit fine-grained CPU work execution instead of
+  thread-centric execution

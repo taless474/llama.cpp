@@ -1,44 +1,35 @@
-# llama.cpp fork: HPX prefill orchestrator
+# llama.cpp fork: HPX CPU execution redesign
 
-This branch is an experimental **fork of `llama.cpp`** that explores a more HPX-native execution/orchestration path for CPU inference.
+This branch is an experimental fork of llama.cpp exploring HPX for CPU inference execution.
 
-It keeps the `llama.cpp` / ggml inference stack and investigates how HPX can be used to orchestrate work more effectively for inference-style workloads.
+## Goal
 
-## Current goal
+- Do NOT replace ggml kernels or BLAS
+- Redesign CPU execution layer
 
-The goal is **not** to replace ggml kernels or BLAS.  
-The goal is to redesign the **execution/orchestration layer** for CPU-side work so that HPX can be used in a way that better matches inference workloads.
+## Execution model
 
-In particular, this branch separates:
+Two substrates:
 
-- **decode**: low-latency, repeated token-generation steps
-- **prefill**: heavier prompt-processing work
+- pthread → small / latency-sensitive work
+- HPX → large / throughput work
 
-## HPX-to-llama.cpp component mapping
-```
-HPX SIDE                            PLAIN LLAMA/GGML SIDE
+Selection:
 
-adapter                             scheduler/split-prep world
-ggml_hpx_adapt_*                    ggml_backend_sched_alloc_graph(...)
-                                    split_graph(...)
+cplan->work_size
 
-plan                                implicit scheduler/backend setup
-explicit HPX plan objects           graph + split/allocation state
+## Direction
 
-cache                               prepared scheduler/allocation state
-explicit plan cache                 what alloc_graph() has already set up
+- Keep pthread where it wins
+- Use HPX where it helps
+- Move toward explicit region-based execution (run_range)
 
-executor / manager                  llama_context::graph_compute(...)
-ggml_hpx_exec_*                     src/llama-context.cpp
+## Status
 
-runtime / workers                   backend compute path
-ggml-hpx-runtime                    ggml_backend_graph_compute(...)
-```
+- End-to-end integration works (CPU path)
+- Work-size routing implemented
+- Fine-grained HPX execution under development
 
-## Current status
-
-- end-to-end HPX integration has been wired into `llama.cpp`
-- smoke testing has passed on the CPU-only path
 
 
 

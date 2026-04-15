@@ -26,6 +26,11 @@
 #include "ggml-hpx-tpool.h"
 #include "ggml-hpx-runtime.h"    // ggml_hpx_tpool_start
 
+#ifdef GGML_HPX_REGION_DAG_TESTING
+#include <atomic>
+std::atomic<int> g_ggml_graph_compute_thread_run_calls{0};
+#endif
+
 #include <hpx/algorithm.hpp>
 #include <hpx/execution.hpp>
 #include <hpx/executors/scheduler_executor.hpp>
@@ -155,6 +160,10 @@ static void hpx_run_job(struct ggml_threadpool * tp, int n_threads)
     // Fast path: no HPX overhead for single-threaded dispatch.
     if (n_threads == 1)
     {
+#ifdef GGML_HPX_REGION_DAG_TESTING
+        g_ggml_graph_compute_thread_run_calls.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
         ggml_graph_compute_thread_run(ggml_threadpool_worker(tp, 0));
         return;
     }
@@ -166,6 +175,10 @@ static void hpx_run_job(struct ggml_threadpool * tp, int n_threads)
         0,
         n_threads,
         [=](int j) {
+#ifdef GGML_HPX_REGION_DAG_TESTING
+            g_ggml_graph_compute_thread_run_calls.fetch_add(
+                1, std::memory_order_relaxed);
+#endif
             ggml_graph_compute_thread_run(ggml_threadpool_worker(tp, j));
         });
 }

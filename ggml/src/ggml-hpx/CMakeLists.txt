@@ -25,8 +25,11 @@ ggml_add_backend_library(ggml-hpx
 )
 
 target_include_directories(ggml-hpx
-    PRIVATE
+    # PUBLIC: ggml/src/ggml-hpx/ is exposed to consumers (e.g. hpx-bench)
+    # so they can include ggml-hpx-region-dag.h without an ad hoc path.
+    PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cpu
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
@@ -43,3 +46,20 @@ target_link_libraries(ggml-hpx
 )
 
 target_compile_features(ggml-hpx PRIVATE cxx_std_17)
+
+# Experimental: fine-grained HPX region DAG (ggml-hpx-region-dag.h).
+# OFF by default. Enable to develop and benchmark the DAG executor path
+# without affecting the stable dispatch pipeline.
+# Benchmarks that exercise this path live in hpx-bench/ and are gated on
+# the same option there.
+option(GGML_HPX_REGION_DAG
+    "Enable experimental HPX fine-grained region DAG structures" OFF)
+if(GGML_HPX_REGION_DAG)
+    target_compile_definitions(ggml-hpx PRIVATE GGML_HPX_REGION_DAG)
+    # Add the region executor implementation to the library.
+    # The source is gated here rather than in the main source list so it is
+    # only compiled (and GGML_HPX_REGION_DAG can be assumed present) when
+    # the flag is explicitly enabled.
+    target_sources(ggml-hpx PRIVATE ggml-hpx-region-exec.cpp)
+    message(STATUS "ggml-hpx: GGML_HPX_REGION_DAG enabled")
+endif()

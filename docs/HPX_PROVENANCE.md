@@ -2220,3 +2220,238 @@ Why `32K`:
 - it is the smallest threshold that still routes correctly
 - it keeps as much work as possible on the HPX path without leaking decode-sized work into HPX
 - it leaves headroom for models whose decode-sized work is larger than TinyLlama’s while still staying conservative
+
+
+# 8. HPX-native fine-region DAG redesign
+
+## Motivation
+
+The bulk-region executor redesign improved the HPX substrate, but still relied on ggml’s worker-loop model:
+
+- launch worker j
+- enter ggml_graph_compute_thread_run(...)
+- synchronize via barriers
+
+This meant HPX controlled *threads*, but not the **actual work units**.
+
+The next question was:
+
+> Can HPX execute CPU kernel work directly, without re-entering ggml’s worker loop?
+
+---
+
+## Coarse vs fine regions
+
+Existing:
+- `ggml_hpx_region` → coarse graph slice
+
+New:
+- `ggml_hpx_cpu_region` → fine work range inside one op
+- `ggml_hpx_cpu_region_group` → DAG of fine regions
+
+Hierarchy:
+
+graph → coarse region → fine CPU region → run_range
+
+---
+
+## New contract (region DAG)
+
+Defined in `ggml-hpx-region-dag.h`:
+
+- `ggml_hpx_cpu_region_kind`
+- `ggml_hpx_dep_edge { src, dst }`
+- `ggml_hpx_region_resources`
+- `ggml_hpx_run_range_fn`
+- `ggml_hpx_cpu_region`
+- `ggml_hpx_cpu_region_group`
+
+Key idea:
+
+> run_range is a **direct kernel entry**, no graph execution allowed.
+
+---
+
+## First executor layer
+
+Implemented in:
+
+- `ggml-hpx-region-exec.h`
+- `ggml-hpx-region-exec.cpp`
+
+Provides:
+
+### Validation
+`ggml_hpx_validate_region_group(...)`  
+Checks structure and optional acyclicity.
+
+### Direct kernel
+`ggml_hpx_mul_mat_f32_run_range(...)`  
+Calls `ggml_vec_dot_f32` directly (no ggml graph).
+
+### Execution
+- `run_single_region(...)`
+- `run_region_group(...)`
+
+Limitation:
+- same-level regions executed serially (executor safety)
+
+---
+
+## Microbench: direct run_range
+
+First standalone benchmark:
+
+- no ggml graph execution
+- direct kernel timing
+
+Result:
+- contract works
+- large work ≈ parity
+- small work still sensitive
+
+---
+
+## Region-chain benchmark
+
+Adds:
+- dependencies
+- shared resources
+
+Result:
+- correctness matches
+- overhead accumulates with scheduler executor
+
+Conclusion:
+- contract is correct
+- executor choice is critical
+
+---
+
+## Executor comparison
+
+### Bench 1 — matmul dispatch
+
+| shape   | nth | scheduler_exec (prev) | fork_join_exec (now) |
+|---------|-----|------------------------|----------------------|
+| decode  | 1   | ~990 µs                | 993 µs (≈ same)      |
+| decode  | 2   | ~880 µs                | 894 µs (≈ same)      |
+| decode  | 4   | ~660 µs                | 642 µs (slightly faster) |
+| prefill | 1   | ~31 ms                 | 31.2 ms (≈ same)     |
+| prefill | 2   | ~28 ms                 | 27.8 ms (≈ same)     |
+| prefill | 4   | ~21 ms                 | 20.5 ms (slightly faster) |
+
+### Bench 2 — 3-region chain
+
+| shape   | nth | pool      | fork_join_exec | speedup |
+|---------|-----|-----------|----------------|---------|
+| decode  | 4   | 1145 µs   | 643 µs         | 1.78×   |
+| prefill | 4   | 23.4 ms   | 21.9 ms        | 1.07×   |
+
+---
+
+## Interpretation
+
+- scheduler_executor + for_loop was wrong for this workload
+- fork_join_executor matches the structure
+- first real speedup appears on decode-scale chains
+
+---
+
+## Design consequence
+
+HPX should:
+
+- not just orchestrate regions
+- not just replace threadpool
+- but execute **explicit fine CPU work units**
+
+---
+
+## Limitations
+
+- same-level regions still serialized
+- run_single_region not optimized
+- only matmul kernel implemented
+- no full llama.cpp integration yet
+
+---
+
+## Conclusion
+
+This phase moves HPX from:
+
+- outer orchestration
+- → executor substrate
+- → direct CPU execution model
+
+This is the first phase where HPX executes real work units, not just threads.
+
+
+### Phase 1 — bridge to same-level fine-region concurrency
+
+After the fine-region DAG contract, validator, and direct `run_range(...)` kernel entry were in place, the system still executed same-level regions **serially**.
+
+A new test (`test_hpx_region_group_parallel`) exposed this:
+- independent regions at the same level did not overlap
+- the DAG existed structurally, but not behaviorally
+
+### Key issue
+Early attempts using `fork_join_executor` failed because:
+- shared executor → unsafe concurrent use
+- per-region pinned executors → PU contention → serialization
+
+### Phase 1 design
+
+Introduce a single HPX boundary:
+
+```cpp
+hpx::future<void> launch_region_async(...)
+```
+
+Changes:
+- same-level regions launched via `hpx::async`
+- intra-region fan-out via per-lane async
+- level loop retained as temporary scaffolding
+
+### Result
+- real overlap achieved
+- all existing tests still pass
+- no graph re-entry introduced
+
+---
+
+### Phase 2 — HPX-native inter-region scheduling
+
+Phase 1 still relied on a **manual level loop**.
+
+Phase 2 removes that.
+
+### Core idea
+A region becomes runnable when its **predecessor futures are ready**.
+
+### Implementation
+
+- build predecessor lists
+- topological sort (Kahn)
+- one `shared_future` per region
+- use `hpx::dataflow` for dependent regions
+
+```cpp
+region_fut[i] =
+    dataflow(pred_futs..., launch_region_async(...))
+```
+
+### Result
+- no explicit level loop
+- true dependency-driven execution
+- same correctness guarantees preserved
+
+### Outcome
+
+Fine-region execution is now:
+
+- inter-region: HPX futures / dataflow
+- intra-region: direct run_range execution
+
+This is the first fully HPX-native execution model for the region DAG.

@@ -1,0 +1,53 @@
+# Large local model assets
+models/**
+!models/README.md
+!models/.gitkeep
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# Local benchmark / experiment outputs
+local/results/**
+!local/results/README.md
+!local/results/*.md
+results/**
+!results/README.md
+!results/*.md
+benchmark-results/**
+perf/**
+*.prof
+*.trace
+*.csv
+*.tsv
+*.jsonl
+
+# Logs and temp files
+*.log
+tmp/**
+temp/**
+.cache/**
+.DS_Store
+
+# Python caches / local envs
+__pycache__/**
+*.pyc
+.venv/**
+venv/**
+
+# Secrets / machine-local config
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets/**
+credentials/**
+
+# IDE noise
+.vscode/**
+.idea/**
+
+docs/HPX_BUILD.md
