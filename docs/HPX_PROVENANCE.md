@@ -2455,3 +2455,313 @@ Fine-region execution is now:
 - intra-region: direct run_range execution
 
 This is the first fully HPX-native execution model for the region DAG.
+
+
+
+### Context entering Phase 3
+
+By the end of Phase 2, the project had already moved to the new fine-region DAG model:
+
+- explicit `ggml_hpx_cpu_region` / `ggml_hpx_cpu_region_group`
+- explicit dependencies via `ggml_hpx_dep_edge`
+- direct `run_range` execution, not graph re-entry
+- dependency-driven scheduling in `ggml_hpx_run_region_group(...)`
+  using:
+  - Kahn topo sort
+  - one `shared_future` per region
+  - `hpx::dataflow(...)` for dependent launch
+
+So scheduling was already HPX-native and direct.
+
+What was still *not* proven was the **resource model**:
+- `lane_scratch`
+- `reduction_buffer`
+- `shared_scratch`
+
+The key question became:
+
+> Can the executor carry the right execution resources for real fine-region work, or is the region DAG still only a scheduling shell?
+
+---
+
+### Phase 3 — resource-model proof
+
+#### Goal
+
+Prove that `ggml_hpx_region_resources` is real and usable at the API boundary, without changing the scheduler and without integrating into the full llama / ggml path.
+
+This phase was intentionally scoped as:
+
+- no executor redesign
+- no scheduler changes
+- no integration yet
+- no performance work
+- prove resource plumbing by tests first
+
+#### Why this phase happened
+
+At this point, the DAG runner already existed and the fine-region contract was already defined, but the resource channels had only been designed, not justified by passing tests.
+
+The immediate need was not “more scheduling,” but **evidence** that the new execution contract could safely carry shared and per-lane state.
+
+### Work done
+
+Two new tests were added in the HPX region-DAG test suite:
+
+#### 1. `test_hpx_region_group_reduction`
+A two-region DAG:
+
+- `R0` (`REDUCTION`) computes a scalar reduction and writes it into
+  `resources->reduction_buffer`
+- `R1` depends on `R0` and reads that reduction result to produce output
+
+This proved:
+- `reduction_buffer` is visible across dependent regions
+- dependency ordering is honored
+- reduction remains single-threaded under the current runner contract
+
+#### 2. `test_hpx_region_group_lane_scratch`
+A lane-parallel region with `n_lanes = 4`.
+
+Each callback invocation uses:
+- `resources->lane_scratch[ith]`
+
+This proved:
+- per-lane scratch is threaded correctly to callbacks
+- lane identity is stable at the API boundary
+- each lane receives its own mutable slot for the dispatch
+
+### Important design choice in Phase 3
+
+These tests were written as **contract tests**, not as scheduler redesign tests.
+
+That meant:
+- no new runner logic
+- no graph-path re-entry
+- no broad new kernels
+- only proving that the existing runner already satisfied the resource contract
+
+### Outcome
+
+All region-DAG tests passed, including the two new Phase 3 tests.
+
+That established:
+
+- the current dependency-driven runner already supports the resource model needed by the fine-region contract
+- no code changes to the scheduler or executor were required
+- `reduction_buffer` and `lane_scratch` are valid execution resources, not just unused fields in a struct
+
+### Phase 3 conclusion
+
+Phase 3 completed the **proof-of-contract** milestone:
+
+> The fine-region DAG executor can carry real shared and per-lane execution resources correctly.
+
+What it did **not** prove yet was that the DAG could host a real ggml-style op.
+
+That led to the next question:
+
+> Is the fine-region DAG only a validated executor contract, or can it actually run meaningful compute?
+
+---
+
+## Transition from Phase 3 to Phase 4
+
+An intermediate “Phase 3-B” idea was considered:
+- add more direct callbacks / more resource-backed toy paths
+
+That idea was rejected as the main next milestone because it would mostly amount to writing more synthetic kernel-style code without proving that the DAG could express a *real* ggml-style operation.
+
+The project direction was reframed:
+
+> The next meaningful milestone is not “more resource tests.”
+> It is “first real ggml-style CPU op on the fine-region DAG.”
+
+That became Phase 4.
+
+---
+
+### Phase 4 — first real ggml-style CPU op on the fine-region DAG
+
+#### Goal
+
+Show that the fine-region DAG can execute a **real op-shaped computation**, not just synthetic callbacks.
+
+Scope stayed intentionally narrow:
+
+- F32 only
+- one row
+- CPU only
+- correctness only
+- no scheduler changes
+- no full graph / llama integration yet
+
+### Why RMS_NORM was chosen
+
+`RMS_NORM` was chosen as the first real op because it naturally matches the fine-region model:
+
+- lane-parallel partial work
+- a reduction/finalize stage
+- lane-parallel apply stage
+
+It is also a real transformer-style computation, so succeeding here would mean the DAG is not merely a test harness anymore.
+
+### Structural design of Phase 4
+
+One RMS_NORM row was lowered into a 3-region DAG:
+
+#### `R0` — partial sums of squares
+Kind: `ELEMENTWISE`
+
+Each lane computes:
+- sum of `x[i]^2` over its chunk
+
+and writes that partial into:
+- `resources->lane_scratch[ith]`
+
+#### `R1` — finalize
+Kind: `REDUCTION`
+
+Single-threaded.
+
+Reads:
+- `resources->lane_scratch[0 .. n_lanes)`
+
+Computes:
+- `sumsq`
+- `scale = 1 / sqrt(sumsq / n + eps)`
+
+Writes:
+- `sumsq`
+- `scale`
+
+into:
+- `resources->reduction_buffer`
+
+#### `R2` — apply
+Kind: `ELEMENTWISE`
+
+Each lane reads `scale` from:
+- `resources->reduction_buffer`
+
+and writes:
+- `dst[i] = x[i] * scale`
+
+Dependencies:
+- `R0 -> R1 -> R2`
+
+This design deliberately exercised both:
+- `lane_scratch`
+- `reduction_buffer`
+
+in one real computation.
+
+### Test-first design
+
+Before implementing the callbacks, a new test was written:
+
+#### `test_hpx_region_group_rms_norm_f32`
+
+Input:
+- `x = {1.f, -2.f, 3.f, -4.f, 5.f, -6.f, 7.f, -8.f}`
+- `eps = 1e-5f`
+- `n_lanes = 4`
+
+The test:
+- built the exact `R0 -> R1 -> R2` DAG
+- used a scalar reference RMS_NORM computation for the oracle
+- checked the exact per-lane partial sums for the chosen split shape
+- checked `reduce_buf.sumsq`
+- checked `reduce_buf.scale`
+- checked final `dst`
+
+This test became the specification for the implementation.
+
+### Production changes made in Phase 4
+
+Two production files were changed:
+
+#### 1. `ggml-hpx-region-exec.h`
+Added 4 C-compatible structs:
+
+- `ggml_hpx_rms_norm_f32_reduce_buffer`
+- `ggml_hpx_rms_norm_partial_f32_ctx`
+- `ggml_hpx_rms_norm_finalize_f32_ctx`
+- `ggml_hpx_rms_norm_apply_f32_ctx`
+
+And 3 new `run_range` declarations:
+
+- `ggml_hpx_rms_norm_partial_f32_run_range`
+- `ggml_hpx_rms_norm_finalize_f32_run_range`
+- `ggml_hpx_rms_norm_apply_f32_run_range`
+
+#### 2. `ggml-hpx-region-exec.cpp`
+Added the 3 callback implementations:
+
+- **partial**
+  - accumulates `x[begin:end)^2` into `lane_scratch[ith]`
+
+- **finalize**
+  - asserts the current reduction contract
+  - sums lane partials
+  - computes `scale`
+  - writes `sumsq` and `scale` into `reduction_buffer`
+
+- **apply**
+  - reads `scale` only from `reduction_buffer`
+  - writes `dst[i] = x[i] * scale`
+
+Notably:
+- no scheduler changes were made
+- no graph re-entry was introduced
+- data was intentionally carried through resources, not smuggled through ctx structs
+
+### Validation outcome
+
+The new RMS_NORM DAG test passed.
+
+All region-DAG tests passed as well.
+
+This established that the fine-region DAG can now execute:
+
+- real per-lane work
+- a real reduction/finalize stage
+- a real dependent apply stage
+
+with correct numerical results.
+
+### Phase 4 conclusion
+
+Phase 4 completed the first **real compute** milestone:
+
+> The fine-region DAG is not only a validated executor contract.
+> It can host a real ggml-style CPU op decomposition and execute it correctly.
+
+That was the bridge from:
+- infrastructure proof
+
+to:
+- real compute substrate
+
+---
+
+## Net result of Phases 3 and 4
+
+By the end of Phase 4, the project had established:
+
+1. **Phase 3**
+   - the fine-region executor carries real execution resources correctly
+
+2. **Phase 4**
+   - those resources are expressive enough to run a real op-shaped computation
+
+Together, these phases transformed the fine-region DAG from:
+- “an explicit HPX scheduling experiment”
+
+into:
+- “a viable execution substrate for real ggml-style CPU work”
+
+without:
+- re-entering the graph path
+- redesigning the scheduler
+- integrating into full llama execution yet

@@ -1,32 +1,30 @@
 // ggml-hpx-region-exec.h
 //
-// Validator, kernel context/callback, and HPX executor API for the
+// Validator, direct kernel callback, and HPX execution API for the
 // ggml_hpx_cpu_region contract defined in ggml-hpx-region-dag.h.
 //
 // All declarations here are guarded by GGML_HPX_REGION_DAG.
 //
 // Layered interface
 // ─────────────────
-//   1. ggml_hpx_validate_region_group   — pre-flight contract check
-//   2. ggml_hpx_mul_mat_f32_run_range   — direct F32 mul_mat kernel
-//      ggml_hpx_mul_mat_f32_ctx         — context struct for that kernel
-//   3. ggml_hpx_run_single_region       — one region, fork_join fan-out
-//   4. ggml_hpx_run_region_group        — dependency-ordered group runner
+//   1. ggml_hpx_validate_region_group   : pre-flight contract check
+//   2. ggml_hpx_mul_mat_f32_run_range   : direct F32 mul_mat kernel
+//      ggml_hpx_mul_mat_f32_ctx         : context for that kernel
+//   3. ggml_hpx_run_single_region       : execute one region
+//   4. ggml_hpx_run_region_group        : dependency-driven group runner
 //
-// None of the functions in this header call:
+// None of the functions declared here call:
 //   ggml_graph_compute_thread_run
 //   ggml_graph_compute
 //   ggml_backend_graph_compute
 //
 // C / C++ split
 // ─────────────
-//   Items 1–2 are declared inside extern "C" and may be called from C or C++.
-//   Items 3–4 are C++ only (fork_join_executor) and require an HPX thread
-//   context (they construct fork_join_executor, which calls
-//   this_thread::get_pool() internally).
+//   Items 1-2 are declared inside extern "C" and may be called from C or C++.
+//   Items 3-4 are C++ only and require an HPX thread context.
 //
-//   Wrap in hpx::async(...).get() when calling from the main thread after
-//   hpx::start but before hpx::stop.
+//   Wrap calls in hpx::async(...).get() when invoking from a non-HPX thread
+//   after hpx::start() and before hpx::stop().
 
 #pragma once
 
@@ -102,6 +100,68 @@ void ggml_hpx_mul_mat_f32_run_range(
     int64_t                     end,
     ggml_hpx_region_resources * resources);
 
+// ── F32 RMS_NORM kernels ─────────────────────────────────────────────────
+//
+// Three-region decomposition of one F32 RMS_NORM row:
+//
+//   R0 (ELEMENTWISE) : lane-parallel partial sumsq into lane_scratch[ith]
+//   R1 (REDUCTION)   : single-thread finalize → reduction_buffer
+//   R2 (ELEMENTWISE) : lane-parallel apply, dst[i] = x[i] * scale
+//
+// Data flow through resources, not ctx structs:
+//   R0 writes  lane_scratch[ith]           (float partial sumsq)
+//   R1 reads   lane_scratch[0 .. n_lanes)  → writes reduction_buffer
+//   R2 reads   reduction_buffer->scale     → writes dst
+
+typedef struct ggml_hpx_rms_norm_f32_reduce_buffer
+{
+    float sumsq;
+    float scale;
+} ggml_hpx_rms_norm_f32_reduce_buffer;
+
+typedef struct ggml_hpx_rms_norm_partial_f32_ctx
+{
+    const float * x;
+    int64_t       n;
+} ggml_hpx_rms_norm_partial_f32_ctx;
+
+typedef struct ggml_hpx_rms_norm_finalize_f32_ctx
+{
+    int64_t n;
+    float   eps;
+} ggml_hpx_rms_norm_finalize_f32_ctx;
+
+typedef struct ggml_hpx_rms_norm_apply_f32_ctx
+{
+    const float * x;
+    float *       dst;
+    int64_t       n;
+} ggml_hpx_rms_norm_apply_f32_ctx;
+
+void ggml_hpx_rms_norm_partial_f32_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
+void ggml_hpx_rms_norm_finalize_f32_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
+void ggml_hpx_rms_norm_apply_f32_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
 #ifdef __cplusplus
 }    // extern "C"
 #endif
@@ -112,37 +172,41 @@ void ggml_hpx_mul_mat_f32_run_range(
 
 #ifdef __cplusplus
 
-// Execute one fine CPU region across at most resources->n_lanes HPX workers.
+// Execute one fine CPU region using the current HPX region runner.
 //
-// Splits [region.begin, region.end) into n_lanes non-empty chunks and
-// dispatches each chunk to one HPX worker via fork_join_executor:
+// For non-REDUCTION regions, the runner splits [region.begin, region.end)
+// into up to resources->n_lanes non-empty chunks and launches one HPX task
+// per non-empty chunk:
 //
 //   region.run_range(ctx, ith, n_lanes, chunk_begin, chunk_end, resources)
 //
-// Exception: REDUCTION regions (kind == GGML_HPX_CPU_REGION_KIND_REDUCTION)
-// and n_lanes == 1 bypass fan-out and run single-threaded (ith = 0).
+// REDUCTION regions are currently executed single-threaded:
+//   ith = 0, nth = 1, begin = region.begin, end = region.end
 //
-// Constructs a new fork_join_executor per call.  For hot paths the caller
-// should use the lower-level internal run_on_exec helper directly.
-// resources must not be null.
+// Assumes region != nullptr and resources != nullptr.
 void ggml_hpx_run_single_region(
     const ggml_hpx_cpu_region * region,
     ggml_hpx_region_resources * resources);
 
-// Execute a ggml_hpx_cpu_region_group in dependency order.
+// Execute a ggml_hpx_cpu_region_group as a dependency-driven DAG.
 //
-// Computes topological levels from the dep edges (O(n_regions + n_deps)).
-// At each level all regions are sequentially dispatched through one shared
-// fork_join_executor so the executor is never driven by concurrent callers
-// (fork_join_executor documents concurrent callers as UB).
+// The group must already satisfy ggml_hpx_validate_region_group().
 //
-// Intra-region parallelism is preserved: each region fans out across
-// resources->n_lanes workers via for_loop.  Genuine inter-region concurrency
-// at the same level (independent regions running simultaneously) is a TODO —
-// it requires either separate executors per region or a different executor
-// type that supports concurrent submission.
+// Execution model:
+//   - predecessor lists are built from group->deps
+//   - regions are topologically ordered with Kahn's algorithm
+//   - one hpx::shared_future<void> is created per region
+//   - a region with no predecessors launches immediately
+//   - a region with predecessors is launched via hpx::dataflow(...) after
+//     all predecessor futures become ready
 //
-// Assumes the group has passed ggml_hpx_validate_region_group.
+// This preserves true inter-region concurrency for independent regions.
+// There is no explicit level loop.
+//
+// Each region still uses ggml_hpx_run_single_region semantics internally:
+// non-REDUCTION regions may fan out across resources->n_lanes, while
+// REDUCTION regions currently run single-threaded.
+//
 // resources must not be null.
 void ggml_hpx_run_region_group(
     const ggml_hpx_cpu_region_group * group,

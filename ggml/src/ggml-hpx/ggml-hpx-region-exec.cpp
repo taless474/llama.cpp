@@ -47,6 +47,7 @@
 // std
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <queue>
 #include <vector>
@@ -69,6 +70,11 @@ extern "C" void ggml_vec_dot_f32(
 
 namespace
 {
+
+// Maximum n_regions for the stack-allocated small path in
+// ggml_hpx_run_region_group.  Groups larger than this fall through to the
+// original heap-vector path unchanged.
+constexpr int kSmallN = 8;
 
 // The single HPX boundary for the fine-region DAG path.
 //
@@ -226,6 +232,83 @@ void ggml_hpx_mul_mat_f32_run_range(
 }
 
 // ---------------------------------------------------------------------------
+// F32 RMS_NORM kernels
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_rms_norm_partial_f32_run_range(
+    void *                      ctx_void,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources)
+{
+    (void)nth;
+    auto * ctx = static_cast<ggml_hpx_rms_norm_partial_f32_ctx *>(ctx_void);
+
+    assert(resources->lane_scratch != nullptr);
+    assert(ith >= 0 && ith < resources->n_lanes);
+    assert(end <= ctx->n);
+
+    float sumsq = 0.0f;
+    for (int64_t i = begin; i < end; ++i)
+    {
+        sumsq += ctx->x[i] * ctx->x[i];
+    }
+
+    *static_cast<float *>(resources->lane_scratch[ith]) = sumsq;
+}
+
+void ggml_hpx_rms_norm_finalize_f32_run_range(
+    void *                      ctx_void,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources)
+{
+    auto * ctx = static_cast<ggml_hpx_rms_norm_finalize_f32_ctx *>(ctx_void);
+
+    assert(ith == 0 && nth == 1);
+    assert(begin == 0 && end == ctx->n);
+    (void)ith; (void)nth; (void)begin; (void)end;
+
+    float sumsq = 0.0f;
+    for (int i = 0; i < resources->n_lanes; ++i)
+    {
+        sumsq += *static_cast<float *>(resources->lane_scratch[i]);
+    }
+
+    auto * buf = static_cast<ggml_hpx_rms_norm_f32_reduce_buffer *>(
+        resources->reduction_buffer);
+
+    buf->sumsq = sumsq;
+    buf->scale = 1.0f / std::sqrt(sumsq / static_cast<float>(ctx->n) + ctx->eps);
+}
+
+void ggml_hpx_rms_norm_apply_f32_run_range(
+    void *                      ctx_void,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources)
+{
+    (void)ith;
+    (void)nth;
+    auto * ctx = static_cast<ggml_hpx_rms_norm_apply_f32_ctx *>(ctx_void);
+
+    auto const * buf = static_cast<ggml_hpx_rms_norm_f32_reduce_buffer const *>(
+        resources->reduction_buffer);
+
+    float const scale = buf->scale;
+    for (int64_t i = begin; i < end; ++i)
+    {
+        ctx->dst[i] = ctx->x[i] * scale;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Single-region executor
 // ---------------------------------------------------------------------------
 
@@ -250,6 +333,109 @@ void ggml_hpx_run_region_group(
     int const n_lanes = resources->n_lanes;
     if (n == 0) return;
 
+    // ── Small-group fast path ─────────────────────────────────────────────
+    //
+    // For groups with n_regions <= kSmallN and n_deps <= kSmallN*kSmallN,
+    // all bookkeeping structures are stack-allocated.  The execution model,
+    // Kahn traversal order, dataflow composition, and wait_all semantics are
+    // identical to the heap path below.  Only storage changes.
+    //
+    // pred_store[i][0..pred_count[i]) holds the predecessor indices of
+    // region i, exactly as pred_idx[i] does in the heap path.
+    //
+    // The ready queue is a plain array used as a FIFO (head/tail indices).
+    // Each region is enqueued at most once, so q_tail <= n <= kSmallN.
+    //
+    // region_fut_arr[i] is assigned for every i in 0..n-1 before wait_all
+    // because the topo loop visits every region exactly once (asserted below).
+    // The iterator range [begin, begin+n) therefore contains only valid futures.
+    if (n <= kSmallN && group->n_deps <= kSmallN * kSmallN)
+    {
+        std::array<std::array<int, kSmallN>, kSmallN> pred_store{};
+        std::array<int, kSmallN>                       pred_count{};
+        std::array<int, kSmallN>                       in_deg_arr{};
+
+        for (int e = 0; e < group->n_deps; ++e)
+        {
+            int const src = group->deps[e].src;
+            int const dst = group->deps[e].dst;
+            assert(pred_count[static_cast<std::size_t>(dst)] < kSmallN);
+            pred_store[static_cast<std::size_t>(dst)]
+                      [static_cast<std::size_t>(pred_count[static_cast<std::size_t>(dst)]++)] = src;
+            ++in_deg_arr[static_cast<std::size_t>(dst)];
+        }
+
+        std::array<int, kSmallN> topo_arr{};
+        int                      topo_count = 0;
+        {
+            int ready_q[kSmallN];
+            int q_head = 0, q_tail = 0;
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (in_deg_arr[static_cast<std::size_t>(i)] == 0)
+                    ready_q[q_tail++] = i;
+            }
+            while (q_head != q_tail)
+            {
+                int const u          = ready_q[q_head++];
+                topo_arr[static_cast<std::size_t>(topo_count++)] = u;
+                for (int e = 0; e < group->n_deps; ++e)
+                {
+                    if (group->deps[e].src != u) continue;
+                    int const dst = group->deps[e].dst;
+                    if (--in_deg_arr[static_cast<std::size_t>(dst)] == 0)
+                        ready_q[q_tail++] = dst;
+                }
+            }
+            assert(topo_count == n);
+        }
+
+        std::array<hpx::shared_future<void>, kSmallN> region_fut_arr;
+
+        for (int ii = 0; ii < topo_count; ++ii)
+        {
+            int const i   = topo_arr[static_cast<std::size_t>(ii)];
+            int const cnt = pred_count[static_cast<std::size_t>(i)];
+
+            if (cnt == 0)
+            {
+                region_fut_arr[static_cast<std::size_t>(i)] =
+                    launch_region_async(
+                        group->regions[i], n_lanes, resources).share();
+                continue;
+            }
+
+            std::vector<hpx::shared_future<void>> pred_futs;
+            pred_futs.reserve(static_cast<std::size_t>(cnt));
+            for (int j = 0; j < cnt; ++j)
+            {
+                pred_futs.push_back(
+                    region_fut_arr[static_cast<std::size_t>(
+                        pred_store[static_cast<std::size_t>(i)]
+                                  [static_cast<std::size_t>(j)])]);
+            }
+
+            region_fut_arr[static_cast<std::size_t>(i)] = hpx::dataflow(
+                hpx::launch::async,
+                [group, i, n_lanes, resources]
+                (std::vector<hpx::shared_future<void>> && /*preds*/)
+                {
+                    launch_region_async(
+                        group->regions[i], n_lanes, resources).get();
+                },
+                std::move(pred_futs)
+            ).share();
+        }
+
+        // All n entries region_fut_arr[0..n-1] are now valid.
+        hpx::wait_all(region_fut_arr.begin(),
+                      region_fut_arr.begin() + static_cast<std::ptrdiff_t>(n));
+        return;
+    }
+
+    // ── Heap path (n > kSmallN or n_deps > kSmallN*kSmallN) ──────────────
+    //
     // Build per-region predecessor index lists from the dep edges.
     // pred_idx[i] holds the region indices whose futures i must wait on.
     std::vector<std::vector<int>> pred_idx(static_cast<std::size_t>(n));
