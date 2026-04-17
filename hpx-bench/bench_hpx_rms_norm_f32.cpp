@@ -12,6 +12,10 @@
 //                      orchestration floor of the 3-region DAG design
 //   dag_nowrap       — R0→R1→R2 group, production callbacks, outer async once;
 //                      full DAG path with HPX context amortised over reps
+//   frozen_packet    — compiled 3-step packet, production callbacks, pinned
+//                      decode Exec; only bind+run inside the timed loop.
+//                      Two HPX entries per rep when n_lanes > 1 (R0 + R2
+//                      lane fan-outs); zero when n_lanes == 1.
 //
 // Correctness checks (abort on mismatch):
 //   ref vs direct        (single-threaded; must agree exactly)
@@ -33,6 +37,7 @@
 #  error "bench_hpx_rms_norm_f32.cpp requires -DGGML_HPX_REGION_DAG"
 #endif
 
+#include "ggml-hpx-packet.h"
 #include "ggml-hpx-region-dag.h"
 #include "ggml-hpx-region-exec.h"
 #include "ggml-hpx-runtime.h"
@@ -47,6 +52,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <new>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -417,7 +423,9 @@ int main()
         "# direct           = fused body called on main thread, no HPX\n"
         "# fused_async      = one hpx::async(...).get() per rep around fused body\n"
         "# dag_empty_nowrap = 3-region group, near-nop callbacks, outer async once\n"
-        "# dag_nowrap       = 3-region group, production callbacks, outer async once\n",
+        "# dag_nowrap       = 3-region group, production callbacks, outer async once\n"
+        "# frozen_packet    = compiled 3-step packet, pinned decode Exec; "
+        "bind+run per rep\n",
         static_cast<double>(kEps), kWarmup, kReps);
 
     print_csv_header();
@@ -530,6 +538,109 @@ int main()
             }, kWarmup, kReps);
 
             print_csv_row("dag_nowrap", n, n_lanes, nowrap_stats);
+
+            // frozen_packet: compile once per (n, lanes); bind+run in the timed loop.
+            std::fill(dst_dag.begin(), dst_dag.end(), 0.0f);
+            for (int i = 0; i < n_lanes; ++i) { lane_scalars[i] = 0.0f; }
+
+            ggml_hpx_rms_norm_f32_reduce_buffer packet_reduce_buf{};
+            ggml_hpx_rms_norm_partial_f32_ctx   packet_partial_ctx{x.data(), n};
+            ggml_hpx_rms_norm_finalize_f32_ctx  packet_finalize_ctx{n, kEps};
+            ggml_hpx_rms_norm_apply_f32_ctx     packet_apply_ctx{
+                x.data(), dst_dag.data(), n};
+
+            ggml_hpx_cpu_region packet_regions[3] = {
+                {
+                    GGML_HPX_CPU_REGION_KIND_ELEMENTWISE,
+                    0, n, 0,
+                    &packet_partial_ctx,
+                    ggml_hpx_rms_norm_partial_f32_run_range,
+                },
+                {
+                    GGML_HPX_CPU_REGION_KIND_REDUCTION,
+                    0, n, 0,
+                    &packet_finalize_ctx,
+                    ggml_hpx_rms_norm_finalize_f32_run_range,
+                },
+                {
+                    GGML_HPX_CPU_REGION_KIND_ELEMENTWISE,
+                    0, n, 0,
+                    &packet_apply_ctx,
+                    ggml_hpx_rms_norm_apply_f32_run_range,
+                },
+            };
+            ggml_hpx_dep_edge packet_deps[2] = {{0, 1}, {1, 2}};
+            ggml_hpx_cpu_region_group packet_fine_group{
+                packet_regions, 3, packet_deps, 2};
+
+            ggml_hpx_packet_plan_key packet_key{};
+            packet_key.sublayer       = GGML_HPX_PACKET_SUBLAYER_RMS_NORM_F32;
+            packet_key.team           = GGML_HPX_PACKET_TEAM_DECODE;
+            packet_key.n_lanes        = static_cast<uint32_t>(n_lanes);
+            packet_key.dtype          = 0;
+            packet_key.seq_regime     = 0;
+            packet_key.policy_version = 0;
+            packet_key.shape[0]       = n;
+
+            const char * compile_err = nullptr;
+            auto * packet = ggml_hpx_compile_packet(
+                &packet_fine_group, &packet_key, &compile_err);
+            if (packet == nullptr)
+            {
+                std::fprintf(stderr,
+                    "ABORT: compile_packet failed n=%" PRId64 " lanes=%d: %s\n",
+                    n, n_lanes,
+                    compile_err != nullptr ? compile_err : "(null)");
+                return 1;
+            }
+
+            auto * packet_runtime = ggml_hpx_packet_runtime_create(
+                static_cast<uint32_t>(n_lanes));
+
+            const size_t frame_sz = ggml_hpx_packet_frame_size(packet);
+            const size_t frame_al = ggml_hpx_packet_frame_align(packet);
+            void * frame_raw = ::operator new(
+                frame_sz, std::align_val_t{frame_al});
+            auto * frame = static_cast<ggml_hpx_packet_frame *>(frame_raw);
+            ggml_hpx_packet_frame_init(frame, packet);
+
+            ggml_hpx_region_resources packet_resources{};
+            packet_resources.shared_scratch   = nullptr;
+            packet_resources.lane_scratch     = lane_ptrs;
+            packet_resources.reduction_buffer = &packet_reduce_buf;
+            packet_resources.n_lanes          = n_lanes;
+
+            ggml_hpx_rms_norm_binding packet_binding{
+                x.data(), dst_dag.data(), n, kEps};
+
+            hpx::async([&]()
+            {
+                ggml_hpx_bind_rms_norm_packet(frame, &packet_binding);
+                ggml_hpx_run_frozen_packet(
+                    packet_runtime, packet, frame, &packet_resources);
+            }).get();
+
+            if (!verify_match(dst_ref.data(), dst_dag.data(), n, 1e-6f))
+            {
+                std::fprintf(stderr,
+                    "ABORT: frozen_packet correctness failed n=%" PRId64
+                    " lanes=%d\n",
+                    n, n_lanes);
+                return 1;
+            }
+
+            BenchStats packet_stats = bench_ns_in_hpx([&]()
+            {
+                ggml_hpx_bind_rms_norm_packet(frame, &packet_binding);
+                ggml_hpx_run_frozen_packet(
+                    packet_runtime, packet, frame, &packet_resources);
+            }, kWarmup, kReps);
+
+            print_csv_row("frozen_packet", n, n_lanes, packet_stats);
+
+            ::operator delete(frame_raw, std::align_val_t{frame_al});
+            ggml_hpx_free_packet(packet);
+            ggml_hpx_packet_runtime_destroy(packet_runtime);
         }
 
         std::fflush(stdout);

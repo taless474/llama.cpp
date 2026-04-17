@@ -2222,7 +2222,7 @@ Why `32K`:
 - it leaves headroom for models whose decode-sized work is larger than TinyLlama’s while still staying conservative
 
 
-# 8. HPX-native fine-region DAG redesign
+## 8. HPX-native fine-region DAG redesign
 
 ## Motivation
 
@@ -2765,3 +2765,804 @@ without:
 - re-entering the graph path
 - redesigning the scheduler
 - integrating into full llama execution yet
+
+## HPX fine-region DAG provenance — Phase 5
+
+### Context entering Phase 5
+
+By the end of Phase 4, the project had already established that the fine-region DAG was no longer only a scheduling abstraction:
+
+- dependency-driven region-group execution was working
+- `lane_scratch` and `reduction_buffer` had been proven by tests
+- a real ggml-style CPU op, F32 RMS_NORM, had been lowered into a 3-region DAG:
+  - `R0` partial sumsq per lane
+  - `R1` single-thread finalize
+  - `R2` lane-parallel apply
+- correctness was validated end to end
+
+So the central question changed from:
+
+> Can this design work?
+
+to:
+
+> Can this design work at a useful performance granularity?
+
+Phase 5 was therefore not an architecture-design phase in the abstract sense. It was a measurement and diagnosis phase.
+
+---
+
+## Phase 5 — performance diagnosis and granularity study
+
+### Goal
+
+Determine whether the new HPX-native fine-region execution model is viable for real work at the tested granularity, and identify where the cost is coming from.
+
+This phase was intentionally focused on:
+
+- measurement
+- overhead decomposition
+- low-risk runner experiments
+- deciding whether the current scheduling granularity is performance-viable
+
+It was **not** about:
+
+- adding more ops
+- broad integration into llama / ggml graph execution
+- rewriting the scheduler
+- optimizing arithmetic kernels
+
+---
+
+## Phase 5A — baseline measurement
+
+### Purpose
+
+Establish a baseline comparison between:
+
+- a direct scalar/reference RMS_NORM path
+- the new 3-region HPX fine-region DAG path
+
+### Work done
+
+A new benchmark was created under:
+
+- `hpx-bench/bench_hpx_rms_norm_f32.cpp`
+
+with results saved under repo-local benchmark results directories rather than system temp space.
+
+The benchmark measured:
+
+- `ref`: scalar RMS_NORM baseline
+- `dag`: real 3-region RMS_NORM DAG using production callbacks
+
+Sweep dimensions included:
+- multiple row sizes
+- multiple lane counts
+
+### Outcome
+
+The benchmark showed that the new DAG path was much slower than the scalar reference at the tested sizes.
+
+The first important signal was:
+
+- correctness held
+- but the path was **overhead-dominated**
+
+This answered the first practical Phase 5 question:
+
+> No, the current fine-region RMS_NORM execution is not yet a performance win.
+
+---
+
+## Phase 5B — overhead decomposition
+
+### Purpose
+
+Break the cost of the new path into understandable layers rather than treating “HPX overhead” as one undifferentiated number.
+
+### Work done
+
+The benchmark was extended with additional variants:
+
+#### `direct`
+A plain direct RMS_NORM path calling the production callbacks as ordinary function calls with no HPX and no region-group runner.
+
+This answered:
+> Are the production callbacks themselves expensive?
+
+#### `dag_empty`
+A synthetic near-no-op 3-region DAG with the same resource touch pattern but almost no math.
+
+This answered:
+> How much does the generic DAG machinery cost even when useful work is minimal?
+
+### Main findings
+
+The comparison ladder showed:
+
+- `direct ≈ ref`
+- `dag_empty >> direct`
+- `dag` only modestly above `dag_empty`
+
+This established:
+
+1. the production callbacks and real RMS_NORM arithmetic were **not** the main problem
+2. the dominant cost was the **generic per-call 3-region DAG machinery**
+
+This was the key transition in understanding.
+
+The project was no longer asking:
+> Is HPX slow?
+
+It was now asking:
+> Is this scheduling granularity too fine for generic HPX DAG composition?
+
+---
+
+## Phase 5C — targeted overhead experiments
+
+Once Phase 5B showed that the generic DAG path dominated cost, the project moved into small, targeted experiments to see which parts of that overhead were actually material.
+
+### 5C.1 — remove the outer HPX crossing
+
+A `nowrap` variant was introduced so the benchmark no longer paid an outer:
+
+- `hpx::async([&]{ ... }).get()`
+
+for each repetition.
+
+This showed:
+
+- removing the outer crossing saved a small but real amount of time
+- the remaining floor stayed much larger than the pure math cost
+
+Conclusion:
+- the outer HPX boundary was **not** the main bottleneck
+
+### 5C.2 — remove per-call heap churn inside the group runner
+
+`ggml_hpx_run_region_group(...)` was given a small-buffer / stack-allocated fast path for tiny groups so that per-call heap allocations for runner bookkeeping could be avoided in the benchmarked RMS_NORM case.
+
+The semantics remained unchanged:
+- same Kahn topo logic
+- same dependency-driven future composition
+- same wait/join behavior
+
+Re-running the benchmark showed that the min-time floor barely moved.
+
+Conclusion:
+- per-call heap allocation in the group runner was **not** the bottleneck
+
+### 5C.3 — fused one-dispatch ceiling measurement
+
+A fused benchmark path was added:
+
+- `fused_async`
+
+This performed the full RMS_NORM body inside one:
+
+- `hpx::async(...).get()`
+
+with no generic region DAG around the internal stages.
+
+This created the decisive cost ladder:
+
+- `direct`
+- `fused_async`
+- `dag_empty_nowrap`
+- `dag_nowrap`
+
+### Main findings from 5C.3
+
+The fused result showed:
+
+- `direct` = math only
+- `fused_async` = math + one HPX post
+- `dag_empty_nowrap` = 3-region DAG machinery with near-no-op callbacks
+- `dag_nowrap` = real 3-region DAG
+
+The comparison made the cost structure clear:
+
+1. one HPX post was relatively cheap
+2. the extra cost of the 3-region DAG itself was roughly a fixed several-microsecond tax
+3. the real production callbacks added very little on top of the generic DAG machinery
+
+This gave the cleanest Phase 5 conclusion:
+
+> The dominant cost is not arithmetic, callback structure, outer HPX entry, or per-call heap churn.
+> The dominant cost is the per-call generic 3-region HPX DAG dispatch/composition model at this granularity.
+
+---
+
+## What Phase 5 proved
+
+Phase 5 proved something more precise than “fine-grained HPX is slow.”
+
+It showed:
+
+- the fine-region model is **correct**
+- the production callbacks are **cheap**
+- one HPX dispatch around coarser work is **plausible**
+- the generic per-call tiny 3-stage DAG is **too expensive** at the tested sizes
+
+This means the central issue is not merely “tuning HPX harder.”
+It is the placement of the HPX runtime boundary.
+
+The fine-region DAG remains valuable as:
+- a semantic model
+- a planning model
+- a dependency/resource description
+
+But Phase 5 showed that it is not necessarily the right **runtime scheduling granularity** for tiny per-op chains like this RMS_NORM example.
+
+---
+
+## Phase 5 conclusion
+
+By the end of Phase 5, the project had a much sharper result:
+
+> The current HPX-native fine-region representation is valid and expressive, but the generic per-call scheduling of tiny dependent region chains is too fine-grained to be performance-competitive at the tested sizes.
+
+This was the important design insight.
+
+Phase 5 therefore did not merely produce “bad benchmark numbers.”
+It established where the HPX boundary likely needs to move:
+
+- upward
+- to coarser execution units
+- so that HPX manages larger chunks of useful inference work rather than tiny per-op chains
+
+That set up the next architectural question:
+
+> What is the right coarse-grained HPX execution boundary for real inference work?
+
+## 9. HPX-native frozen-packet redesign
+
+### Motivation
+
+The fine-region DAG design was already the right semantic representation:
+it made dependencies explicit, preserved legality, and gave us a clean
+source of truth for region-level execution.
+
+But using the fine DAG directly as the runtime execution surface still left
+too much generic per-call machinery in the hot path:
+- per-call DAG composition
+- dependency rebuild / topo handling
+- per-region future-style execution structure
+- per-call runtime orchestration around very small repeated units
+
+The redesign started from a different premise:
+
+> keep the fine-region DAG as the semantic and planning representation,
+> but do **not** execute that generic structure directly every time.
+
+Instead, compile it once into a reusable linear execution object.
+
+### Design
+
+The redesign introduced a second execution surface above the fine-region DAG:
+
+fine-region DAG
+→ sublayer-level lowering
+→ frozen packet
+→ per-invocation binding
+→ packet execution
+
+The fine DAG remains the authoritative input. The runtime executes a compiled
+projection of it.
+
+A **frozen packet** is:
+- compiled once from a fine-region group
+- immutable after compilation
+- reusable across invocations
+- executed as a straight-line step program instead of generic DAG machinery
+
+Three-way split:
+
+- `ggml_hpx_frozen_packet`
+  - immutable compiled object
+  - shareable across calls and threads
+
+- `ggml_hpx_packet_frame`
+  - mutable per-invocation state
+  - receives the current call’s bindings
+  - one frame per in-flight invocation
+
+- `ggml_hpx_packet_runtime`
+  - execution substrate
+  - owns the pinned decode-side HPX execution context for packet execution
+
+This enforced the central invariant:
+
+> bind mutates the frame, never the packet.
+
+### First prototype target: RMS_NORM_F32
+
+The first prototype packet used the existing `RMS_NORM_F32` decomposition.
+
+That target was chosen because it was:
+- real
+- small
+- already understood
+- simple enough to validate the packet model before moving to larger units
+
+Its fine-region group was compiled into a 3-step packet.
+
+### Packet execution model
+
+The packet execution path deliberately removed generic DAG machinery from the
+runtime hot path.
+
+Execution is step-based:
+
+- `SERIAL`
+  - runs directly on the caller thread
+
+- `LANE_FANOUT`
+  - runs over lane indices using a pinned HPX execution context
+  - uses `hpx::experimental::for_loop(...)`
+  - synchronously joins before the next step
+
+The runtime path therefore avoids:
+- per-step `async`
+- `dataflow`
+- `shared_future`
+- `wait_all`
+- per-step heap allocation
+
+At `n_lanes == 1`, fan-out steps are promoted to serial at compile time, so
+the packet executes with zero HPX crossings.
+
+### API direction
+
+The packet surface was designed around a small explicit API.
+
+Public structure:
+- compile packet
+- query frame size / alignment
+- query resource requirements
+- initialize caller-owned frame
+- bind typed invocation values
+- run frozen packet
+
+For the prototype, binding stayed **typed per sublayer** rather than generic.
+
+For `RMS_NORM_F32`, that meant a typed binding struct carrying:
+- `x`
+- `dst`
+- `n`
+- `eps`
+
+This kept the first implementation honest and avoided introducing a generic
+slot-walking ABI before the packet model itself was proven.
+
+### Important correction during implementation
+
+The first interpretation was that packet lane fan-out should reuse
+`ggml_hpx_runtime_dispatch_decode/_prefill`.
+
+Inspection showed those functions were currently serial stubs and therefore
+not the real parallel execution primitive.
+
+The actual reusable substrate was one layer deeper:
+a pinned HPX execution object used with `hpx::experimental::for_loop(...)`.
+
+The packet runtime was therefore corrected to use that pinned execution
+context directly for `LANE_FANOUT` steps.
+
+This changed the implementation detail, but not the design intent:
+- keep persistent pinned HPX execution
+- avoid generic DAG runtime machinery
+- avoid per-step async/future composition
+
+### Header and implementation work
+
+The redesign was first turned into a real packet header and implementation.
+
+The header established:
+- immutable packet / mutable frame / runtime split
+- structural plan key
+- team identity in the key
+- frame size and alignment queries
+- resource requirement introspection
+- typed RMS_NORM binding
+- compile / bind / run entry points
+- explicit invariants at the top of the file
+
+The implementation then added:
+- `ggml-hpx-packet.cpp`
+- packet compile for `RMS_NORM_F32`
+- frame init
+- typed bind
+- packet run loop
+- CMake wiring into the HPX library
+
+The benchmark binary re-linked cleanly against the updated library.
+
+### RMS_NORM benchmark extension
+
+A new `frozen_packet` row was added to the RMS_NORM benchmark ladder.
+
+The timed body measured:
+- `bind`
+- `run_frozen_packet`
+
+Compile and frame allocation happened once per `(n, lanes)` outside the timed
+loop so the benchmark reflected the steady-state execution model rather than
+one-time setup cost.
+
+The benchmark used the same resource layout shape as the comparable
+fine-DAG-based path so the comparison stayed fair.
+
+### RMS_NORM result
+
+The `RMS_NORM_F32` packet prototype validated the redesign.
+
+Headline result:
+- `frozen_packet` beat `dag_nowrap` in every measured `(n, lanes)` cell
+- at `lanes = 1`, `frozen_packet` approached `direct`
+- the remaining `n = 512` gap persisted under `NDEBUG`, showing it is real
+  step-loop dispatch overhead rather than debug scaffolding
+
+Representative min-ns results:
+
+| n    | direct | frozen_packet(1) | frozen_packet(2) | frozen_packet(4) | dag_nowrap(1) | dag_nowrap(2) | dag_nowrap(4) | fused_async |
+|------|--------|------------------|------------------|------------------|---------------|---------------|---------------|-------------|
+| 512  | 250    | 459              | 4917             | 6125             | 7416          | 12375         | 12750         | 1000        |
+| 2048 | 1125   | 1166             | 5958             | 6667             | 8958          | 13042         | 12416         | 3208        |
+| 4096 | 2333   | 2250             | 6792             | 5625             | 10000         | 13875         | 13375         | 7500        |
+| 8192 | 4916   | 4667             | 8709             | 9125             | 13709         | 14500         | 14875         | 10375       |
+
+Ratios against `dag_nowrap` (min-ns):
+
+| n    | lanes=1 | lanes=2 | lanes=4 |
+|------|---------|---------|---------|
+| 512  | 0.062   | 0.397   | 0.480   |
+| 2048 | 0.130   | 0.457   | 0.537   |
+| 4096 | 0.225   | 0.489   | 0.420   |
+| 8192 | 0.340   | 0.601   | 0.613   |
+
+`lanes = 1` sanity check against `direct`:
+
+| n    | direct | frozen_packet(1) | ratio |
+|------|--------|------------------|-------|
+| 512  | 250    | 459              | 1.84  |
+| 2048 | 1125   | 1166             | 1.04  |
+| 4096 | 2333   | 2250             | 0.96  |
+| 8192 | 4916   | 4667             | 0.95  |
+
+### Interpretation of the first prototype
+
+These results established three important points.
+
+#### 1. The redesign removed the right overhead
+
+`frozen_packet` beating `dag_nowrap` everywhere showed that the main cost
+really was the generic per-call DAG machinery, not the mathematical work
+itself.
+
+#### 2. The packet model is correct for steady-state reuse
+
+For meaningful sizes, `lanes = 1` collapsed close to direct execution.
+That is exactly what the packet model was meant to recover:
+- compile once
+- bind cheaply
+- run without rebuilding execution structure
+
+#### 3. The remaining floor is small and concrete
+
+The surviving `n = 512` gap after `NDEBUG` showed that the remaining fixed
+cost is real packet step-loop dispatch overhead:
+- frame indirection
+- step dispatch
+- small constant runtime overhead
+
+That is fundamentally different from the old multi-microsecond generic DAG
+floor and is small enough that it did not change the overall conclusion.
+
+### What was still missing after RMS_NORM
+
+At that point Section 9 had proven the packet mechanism, but only for one
+prototype target. The codebase still did **not** have a reusable:
+
+- `ggml op/tensor -> fine-region group`
+
+lowering layer.
+
+The shipped fine-region callbacks were only:
+- `MUL_MAT F32`
+- `RMS_NORM` partial / finalize / apply
+
+That meant a real repeated subgraph, such as the llama-style MLP gate/up
+pattern,
+
+- `gate = MUL_MAT(W_gate, x)`
+- `up = MUL_MAT(W_up, x)`
+- `gate_act = SiLU(gate)`
+- `out = MUL(gate_act, up)`
+
+could not yet be built cleanly, because:
+- `SiLU` and elementwise `MUL` were missing as fine-region callbacks
+- lowering from real ggml nodes did not exist
+- the existing packet success was still tied to the RMS_NORM prototype path
+
+### Primitive fine-region expansion
+
+To close that gap, two new primitive callbacks were added:
+
+- `SiLU_F32`
+- `MUL_F32`
+
+These were implemented first and tested independently before lowering work
+began.
+
+Important design points:
+- explicit ctx structs
+- fixed work-range execution
+- aliasing behavior documented and tested
+
+### Real lowering layer
+
+A real lowering layer was then added:
+
+- `ggml_hpx_lower_op(...)`
+
+Key design decision:
+- one ggml op lowers to one **region group**
+- single-region ops emit `n_regions = 1`
+- multi-stage ops like `RMS_NORM` emit multiple regions
+
+Lowering does **not** return borrowed ctx/region pointers into temporary
+storage. Instead it lowers into a self-contained arena object that owns:
+- region array
+- dep array
+- per-region ctx storage
+
+That gave lowering a clean lifetime boundary and let later packet compile
+consume a stable group representation safely.
+
+Supported ops after this step:
+- `MUL_MAT`
+- `SiLU`
+- `MUL`
+- `RMS_NORM`
+
+The first implementation was intentionally strict:
+- F32 only
+- explicit contiguity/layout checks
+- shape consistency checks
+- null-pointer rejection
+- `RMS_NORM` limited to the single-row form already supported by the callback path
+
+### Lowering correctness status
+
+Lowering was validated with execution-based tests, not just structural checks.
+
+Coverage included:
+- region count / dep count
+- kind / work ranges
+- ctx placement
+- actual execution vs scalar reference
+- rejection cases
+- aliasing cases
+
+Test status at the end of this step:
+
+| suite | tests | result |
+|---|---:|---|
+| `test_hpx_region_primitives_silu_mul_f32` | 6 | all passed |
+| `test_hpx_lower_op` | 15 | all passed |
+| pre-existing region DAG suites | 4 suites | no regressions |
+
+### Real MLP gate/up composition
+
+Once lowering existed, the next step was to prove that a **real repeated ggml
+subgraph** could be composed without hand-building regions.
+
+A new composer was added for the MLP gate/up unit:
+
+- `gate = MUL_MAT(W_gate, x)`
+- `up = MUL_MAT(W_up, x)`
+- `gate_act = SiLU(gate)`
+- `out = MUL(gate_act, up)`
+
+The composed group uses a fixed 4-region layout:
+
+| idx | op | kind |
+|---:|---|---|
+| 0 | `gate = MUL_MAT(W_gate, x)` | `MATMUL` |
+| 1 | `up = MUL_MAT(W_up, x)` | `MATMUL` |
+| 2 | `gate_act = SiLU(gate)` | `ELEMENTWISE` |
+| 3 | `out = MUL(gate_act, up)` | `ELEMENTWISE` |
+
+Cross-op deps:
+
+| src | dst | meaning |
+|---:|---:|---|
+| 0 | 2 | `gate -> silu` |
+| 1 | 3 | `up -> mul` |
+| 2 | 3 | `silu -> mul` |
+
+The composer also validates the expected topology:
+- `gate_act` must be `silu(gate)`
+- `out` must be `mul(gate_act, up)`
+- commuted final `mul(up, gate_act)` is rejected intentionally
+- wrong op kinds are rejected
+- null inputs are rejected
+
+This mattered because the composer is not just a convenience helper. It is the
+first real proof that the new lowering layer can support a repeated ggml
+subgraph without falling back to hand-built region groups.
+
+### Frozen-packet support for MLP gate/up
+
+With composition proven, packet support was extended to this new sublayer.
+
+Added to `ggml-hpx-packet.h/.cpp`:
+- `GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_F32 = 2`
+- `ggml_hpx_mlp_gate_up_binding`
+- `ggml_hpx_bind_mlp_gate_up_packet(frame *, const binding *)`
+
+The packet-key shape convention for this sublayer was defined as:
+- `shape[0] = out_cols`
+- `shape[1] = cols`
+- `shape[2] = rows`
+- `shape[3] = 0`
+
+Important packet design points:
+- compile validates the composed 4-region group
+- compile bakes structural dimensions into the packet template
+- bind patches only the 7 data pointers
+- dimensions are **not** rebound per invocation
+- run executes a fixed 4-step topo-valid program
+
+The MLP packet frame layout was fixed and explicit:
+- 4 ctx slots
+- total frame size 160 B
+- bind patches only pointer fields at fixed offsets
+
+### Packet correctness and hardening
+
+The packet path was then validated in three layers:
+
+1. **Packet correctness**
+   - build ggml subgraph
+   - compose group
+   - compile packet
+   - allocate/init frame
+   - bind one invocation
+   - run packet
+   - compare to scalar reference
+
+2. **Wrong key-shape rejection**
+   - `shape[0] == 0`
+   - mismatched `rows`
+
+3. **Malformed-group rejection**
+   - empty group
+   - valid MLP group under the wrong sublayer key
+
+This established that the packet path was not just happy-path correct; it also
+rejected invalid compile contracts.
+
+### Benchmark design for the MLP unit
+
+With correctness established, the benchmark compared three execution surfaces
+for the same MLP gate/up unit:
+
+- `dag_group`
+- `frozen_packet`
+- `direct_manual`
+
+Where:
+- `dag_group` = composed fine-region DAG executed through the generic scheduler/runtime path
+- `frozen_packet` = compile once, bind, run fixed packet program
+- `direct_manual` = same callback kernels, same buffers, but hand-written 4-op execution order with no generic DAG machinery
+
+This was the right benchmark structure because it separated:
+- generic scheduler overhead
+- packet overhead
+- raw callback/math cost
+
+The initial correctness check for the sweep used absolute tolerance, but larger
+shapes produced legitimate larger absolute accumulation error. That was changed
+to a relative tolerance of `1e-5`, after which all 12 shapes passed.
+
+### MLP packet vs DAG results
+
+Median times from the benchmark:
+
+| shape (`out_cols × cols × rows`) | `dag_group` | `frozen_packet` | ratio (`dag/pkt`) |
+|---|---:|---:|---:|
+| `3×4×2` | 9083 ns | 125 ns | 73× |
+| `64×64×1` | 9208 ns | 500 ns | 18× |
+| `64×64×16` | 18666 ns | 7583 ns | 2.5× |
+| `64×256×1` | 11916 ns | 1708 ns | 7× |
+
+### MLP packet vs direct/manual results
+
+The direct/manual comparison clarified what the packet cost really is.
+
+| shape class | `direct_manual` vs `frozen_packet` | interpretation |
+|---|---|---|
+| tiny (`3×4×2`) | packet is ~40 ns slower | almost entirely bind cost (patching 7 pointers) |
+| `64×64` and above | `dm/pkt ≈ 1.0` | packet overhead is effectively negligible above raw callback execution |
+
+One representative datapoint:
+
+| shape | `direct_manual` | `dag_group` | interpretation |
+|---|---:|---:|---|
+| `64×64×1` | 500 ns | 9583 ns | the extra ~9 µs is generic DAG scheduler/runtime overhead |
+
+### Tail behavior
+
+The p95 behavior reinforced the same conclusion:
+- `dag_group` p95 regularly spikes to about **1 ms**
+- `frozen_packet` p95 stays very close to the median
+- `direct_manual` p95 also stays tight to the median
+
+That means the long tail belongs to the generic scheduler path, not the packet
+design and not the math kernels.
+
+### Interpretation of the MLP results
+
+These results establish three important points.
+
+#### 1. The generic DAG path has a real fixed floor
+
+The `dag_group` path sits at roughly **7–10 µs** regardless of shape. That
+cost is not the math; it is:
+- `shared_future` allocation
+- dataflow chain construction
+- topological dispatch
+- generic runtime machinery around tiny repeated units
+
+#### 2. The frozen packet removes almost all of that floor
+
+Its cost scales with the actual mathematical work instead of paying a large
+fixed orchestration tax.
+
+#### 3. For meaningful shapes, packet is already at the callback-level lower bound
+
+Above toy shapes, `direct_manual ≈ frozen_packet`.
+
+So packetization is not just faster than the generic DAG path. It is also
+already very close to the best-case hand-written execution surface for this
+sublayer.
+
+### What Section 9 established overall
+
+Section 9 established all of the following:
+
+- the project can compile a fine-region group into a reusable execution unit
+- packet reuse works with immutable compiled state plus mutable per-call state
+- typed bind per sublayer is sufficient for the first prototype and the first
+  real composed ggml subgraph
+- the packet runtime can execute the compiled schedule without generic DAG
+  machinery in the hot path
+- a real `ggml op -> region group` lowering layer now exists
+- a real MLP gate/up subgraph can be composed from ggml nodes and frozen into
+  a packet
+- the result is materially faster than executing the equivalent work through
+  the generic fine-region runtime path
+- for meaningful MLP shapes, frozen-packet execution is effectively on par
+  with direct/manual callback execution
+
+### Conclusion of this phase
+
+At the end of Section 9, the project has moved beyond packet feasibility.
+
+The frozen-packet model is now validated in two ways:
+
+1. as a reusable execution abstraction (`RMS_NORM_F32`)
+2. as the right execution form for a real repeated ggml subgraph (MLP gate/up)
+
+The main result of Section 9 is therefore:
+
+> the frozen-packet design removes the generic fine-DAG scheduler floor while
+> getting essentially all the way down to direct/manual callback execution
+> cost for meaningful repeated ggml subgraphs.
+
+That makes frozen packets the right next-level execution form for repeated
+ggml work at this layer of the HPX design.

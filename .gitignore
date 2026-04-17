@@ -160,6 +160,5 @@ build.ninja
 build/
 build-*/
 
-docs/HPX_BUILD.md
 /CLAUDE.local.md
 /compile_commands.json

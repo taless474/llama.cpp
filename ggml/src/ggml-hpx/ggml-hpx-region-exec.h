@@ -162,6 +162,51 @@ void ggml_hpx_rms_norm_apply_f32_run_range(
     int64_t                     end,
     ggml_hpx_region_resources * resources);
 
+// ── F32 SiLU kernel ──────────────────────────────────────────────────────────
+//
+// Elementwise SiLU: dst[i] = x[i] * sigmoid(x[i]) = x[i] / (1 + exp(-x[i]))
+//
+// The run_range begin/end index elements in [0, n).
+// Uses no resources (no lane_scratch, no reduction_buffer).
+
+typedef struct ggml_hpx_silu_f32_ctx
+{
+    const float * x;    // input  [n]
+    float *       dst;  // output [n]; may alias x
+    int64_t       n;    // total element count
+} ggml_hpx_silu_f32_ctx;
+
+void ggml_hpx_silu_f32_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
+// ── F32 elementwise MUL kernel ───────────────────────────────────────────────
+//
+// Elementwise multiply: dst[i] = a[i] * b[i]
+//
+// The run_range begin/end index elements in [0, n).
+// Uses no resources (no lane_scratch, no reduction_buffer).
+
+typedef struct ggml_hpx_mul_f32_ctx
+{
+    const float * a;    // first input  [n]
+    const float * b;    // second input [n]
+    float *       dst;  // output       [n]; may alias a or b
+    int64_t       n;    // total element count
+} ggml_hpx_mul_f32_ctx;
+
+void ggml_hpx_mul_f32_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
 #ifdef __cplusplus
 }    // extern "C"
 #endif

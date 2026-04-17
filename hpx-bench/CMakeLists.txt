@@ -66,4 +66,20 @@ if(GGML_HPX_REGION_DAG)
     )
     target_compile_features(bench_hpx_rms_norm_f32 PRIVATE cxx_std_17)
     message(STATUS "hpx-bench: bench_hpx_rms_norm_f32 target added")
+
+    add_executable(bench_hpx_mlp_gate_up_f32
+        bench_hpx_mlp_gate_up_f32.cpp
+    )
+    target_compile_definitions(bench_hpx_mlp_gate_up_f32
+        PRIVATE
+            GGML_HPX_REGION_DAG
+    )
+    target_link_libraries(bench_hpx_mlp_gate_up_f32
+        PRIVATE
+            ggml-hpx
+            ggml
+            HPX::hpx
+    )
+    target_compile_features(bench_hpx_mlp_gate_up_f32 PRIVATE cxx_std_17)
+    message(STATUS "hpx-bench: bench_hpx_mlp_gate_up_f32 target added")
 endif()

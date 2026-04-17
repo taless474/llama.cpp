@@ -46,6 +46,7 @@
 
 // std
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -305,6 +306,47 @@ void ggml_hpx_rms_norm_apply_f32_run_range(
     for (int64_t i = begin; i < end; ++i)
     {
         ctx->dst[i] = ctx->x[i] * scale;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F32 SiLU kernel
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_silu_f32_run_range(
+    void *                      ctx_void,
+    int                         /*ith*/,
+    int                         /*nth*/,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * /*resources*/)
+{
+    auto * ctx = static_cast<ggml_hpx_silu_f32_ctx *>(ctx_void);
+    assert(end <= ctx->n);
+    for (int64_t i = begin; i < end; ++i)
+    {
+        const float v = ctx->x[i];
+        ctx->dst[i] = v / (1.0f + std::exp(-v));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F32 elementwise MUL kernel
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_mul_f32_run_range(
+    void *                      ctx_void,
+    int                         /*ith*/,
+    int                         /*nth*/,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * /*resources*/)
+{
+    auto * ctx = static_cast<ggml_hpx_mul_f32_ctx *>(ctx_void);
+    assert(end <= ctx->n);
+    for (int64_t i = begin; i < end; ++i)
+    {
+        ctx->dst[i] = ctx->a[i] * ctx->b[i];
     }
 }
 

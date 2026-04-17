@@ -60,6 +60,6 @@ if(GGML_HPX_REGION_DAG)
     # The source is gated here rather than in the main source list so it is
     # only compiled (and GGML_HPX_REGION_DAG can be assumed present) when
     # the flag is explicitly enabled.
-    target_sources(ggml-hpx PRIVATE ggml-hpx-region-exec.cpp)
+    target_sources(ggml-hpx PRIVATE ggml-hpx-region-exec.cpp ggml-hpx-packet.cpp ggml-hpx-lower.cpp ggml-hpx-compose.cpp)
     message(STATUS "ggml-hpx: GGML_HPX_REGION_DAG enabled")
 endif()
