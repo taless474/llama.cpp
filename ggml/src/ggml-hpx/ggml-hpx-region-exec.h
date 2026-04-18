@@ -207,6 +207,36 @@ void ggml_hpx_mul_f32_run_range(
     int64_t                     end,
     ggml_hpx_region_resources * resources);
 
+// ── F32 SwiGLU kernel (fused) ────────────────────────────────────────────────
+//
+// Fused SiLU-GLU: dst[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]
+//
+// Kernel-level equivalent of a SiLU on gate followed by an elementwise
+// multiply with up, computed in a single pass.  Matches the ggml GLU op with
+// subop GGML_GLU_OP_SWIGLU emitted by ggml_swiglu_split (see
+// src/llama-graph.cpp).  Exists so the MLP gate/up packet does not have to
+// decompose into the 4-op (MUL_MAT, MUL_MAT, SiLU, MUL) form that real
+// llama graphs no longer contain.
+//
+// The run_range begin/end index elements in [0, n).
+// Uses no resources (no lane_scratch, no reduction_buffer).
+
+typedef struct ggml_hpx_swiglu_f32_ctx
+{
+    const float * gate;    // SiLU input  [n]
+    const float * up;      // second multiplicand [n]
+    float *       dst;     // output [n]; may alias gate or up
+    int64_t       n;       // total element count
+} ggml_hpx_swiglu_f32_ctx;
+
+void ggml_hpx_swiglu_f32_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
 #ifdef __cplusplus
 }    // extern "C"
 #endif

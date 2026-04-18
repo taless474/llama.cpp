@@ -1,36 +1,69 @@
 # llama.cpp fork: HPX CPU execution redesign
 
-This branch is an experimental fork of llama.cpp exploring HPX for CPU inference execution.
+This branch is an experimental fork of `llama.cpp` exploring HPX for CPU
+inference execution.
+
+It began with HPX-based orchestration above ggml, then moved into `ggml-cpu`
+executor ownership, and now includes an HPX-native fine-region execution path
+for explicit CPU work regions.
 
 ## Goal
 
-- Do NOT replace ggml kernels or BLAS
-- Redesign CPU execution layer
+- Do **not** replace ggml kernels or BLAS
+- Redesign the CPU execution layer
+- Move from thread-centric execution toward explicit work-region execution
 
-## Execution model
+## Current execution model
 
-Two substrates:
+Two practical substrates are used on the coarse path:
 
 - pthread → small / latency-sensitive work
-- HPX → large / throughput work
+- HPX → large / throughput-oriented work
 
-Selection:
+Selection is based on:
 
+```cpp
 cplan->work_size
+```
 
-## Direction
+## Current direction
 
-- Keep pthread where it wins
-- Use HPX where it helps
-- Move toward explicit region-based execution (run_range)
+The strongest direction is no longer “HPX everywhere.”
 
-## Status
+It is:
 
-- End-to-end integration works (CPU path)
-- Work-size routing implemented
-- Fine-grained HPX execution under development
+- keep pthread where small work wins
+- use HPX where larger work amortizes overhead
+- move toward explicit fine-region execution:
+  - region DAG
+  - `run_range(...)`
+  - HPX futures / `dataflow`
 
+## Current status
 
+- end-to-end HPX integration works on the CPU path
+- work-size routing is implemented
+- fine-region DAG execution is real and tested
+- dependency-driven region scheduling via HPX futures / `dataflow` is implemented
+- selective graph-level mixed execution now exists for narrow experiments
+  (`mul_mat` lowered, everything else fallback)
+
+## Where to look
+
+- `README_HPX.md`
+  - HPX-specific architecture and current status
+- `ggml/src/ggml-hpx/`
+  - HPX lowering, region execution, selective execution, runtime code
+- `ggml/src/ggml-cpu/`
+  - CPU executor seam / substrate work
+- `tests/hpx/`
+  - HPX and fine-region tests
+- `hpx-bench/`
+  - HPX microbenchmarks
+- `docs/HPX_EXECUTOR_CONTRACT.md`
+  - design rules and execution boundaries
+- `docs/HPX_PROVENANCE.md`
+  - chronological project history
 
 
 # llama.cpp

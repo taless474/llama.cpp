@@ -351,6 +351,27 @@ void ggml_hpx_mul_f32_run_range(
 }
 
 // ---------------------------------------------------------------------------
+// F32 SwiGLU kernel (fused)
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_swiglu_f32_run_range(
+    void *                      ctx_void,
+    int                         /*ith*/,
+    int                         /*nth*/,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * /*resources*/)
+{
+    auto * ctx = static_cast<ggml_hpx_swiglu_f32_ctx *>(ctx_void);
+    assert(end <= ctx->n);
+    for (int64_t i = begin; i < end; ++i)
+    {
+        const float g = ctx->gate[i];
+        ctx->dst[i]   = (g / (1.0f + std::exp(-g))) * ctx->up[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Single-region executor
 // ---------------------------------------------------------------------------
 

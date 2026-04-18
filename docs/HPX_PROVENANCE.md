@@ -3566,3 +3566,535 @@ The main result of Section 9 is therefore:
 
 That makes frozen packets the right next-level execution form for repeated
 ggml work at this layer of the HPX design.
+
+## 10. Selective mixed execution and first real llama.cpp integration
+
+After the fine-region DAG executor was validated internally, the next step was to stop treating it as an isolated mechanism and ask a narrower integration question:
+
+> can one supported op go through the fine-region path while everything else still runs through the normal CPU path?
+
+This was the first real bridge from:
+- fine-region unit tests
+
+to:
+- actual llama.cpp execution
+
+### What already existed before this step
+
+Before adding a new graph-level selective executor, one important check was made:
+
+- **op-level lowering already existed**
+- `ggml_hpx_lower_op(...)` was already tested for:
+  - `SILU_F32`
+  - `MUL_F32`
+  - `MUL_MAT_F32`
+  - `RMS_NORM_F32`
+- rejection cases were already covered, including:
+  - unsupported ops
+  - non-F32 types
+  - invalid null-data cases
+  - multi-row `RMS_NORM`
+
+So a new “does `MUL_MAT` lower?” unit test would have duplicated existing coverage rather than adding a new capability. The real missing piece was not op-level lowering; it was **graph-level mixed execution**.
+
+### New graph-level selective executor
+
+A new selective execution path was added:
+
+- `ggml-hpx-exec-selective.h`
+- `ggml-hpx-exec-selective.cpp`
+
+Its job is intentionally narrow:
+
+- walk `gf->nodes[]` in graph order
+- try `ggml_hpx_lower_op(...)` on each node
+- if lowering succeeds, execute that node through the fine-region DAG path
+- if lowering fails, execute that node through the real CPU backend fallback path
+
+This created the first graph-level mixed mode:
+
+```text
+supported lowered op
+  → fine-region DAG path
+
+unsupported op
+  → normal CPU backend fallback
+```
+
+The first mixed execution target was deliberately small:
+
+- lowered `mul_mat`
+- fallback `neg`
+
+### Why the fallback path mattered
+
+The first design question was how unsupported nodes should be executed.
+
+A toy hand-written scalar fallback (for example, a custom `neg` loop) would have been easy, but it would not have tested the actual intended integration. The selected fallback instead matched the existing coarse HPX decode execution style:
+
+- build a 1-node `ggml_graph_view`
+- call `ggml_backend_graph_compute(...)`
+
+That is the same general mechanism the existing decode path already uses for graph slices: a `ggml_graph_view(...)` over the live graph and a real backend compute call. The decode executor already requires a live caller-owned CPU backend handle in `ggml_hpx_decode_backends`, with `cpu` required and used as the normal decode backend.
+
+This made the fallback path a real execution path, not a test-only imitation.
+
+### First mixed execution test
+
+A new test was added:
+
+- `tests/hpx/test_hpx_region_mixed_mul_mat.cpp`
+
+Its graph shape was intentionally tiny:
+
+```text
+w, x
+  → mul_mat   [supported: lowered]
+  → neg       [unsupported: fallback]
+```
+
+The test used identity-like weights so the expected output was exact and simple:
+
+- `mul_mat` produced known values
+- `neg` flipped them
+- final output could be checked element-by-element
+
+This proved the first important mixed-mode property:
+
+> one node can run through the fine-region path while a later node in the same graph falls back to the normal CPU backend path, and the final result still matches exactly
+
+### Proving the lowered path really ran
+
+After the first mixed test passed, two test-only counters were added under a dedicated testing guard:
+
+- lowered count
+- executed count
+
+The mixed test then asserted:
+
+- lowered == 1
+- executed == 1
+
+This was important because a passing output check alone would not prove that `mul_mat` actually went through the fine-region path. With the counters, the test established both:
+
+- final output correctness
+- routing correctness
+
+### First llama.cpp integration
+
+Once graph-level selective execution worked in isolation, the next step was to connect it to the real llama path.
+
+The following changes were made:
+
+- `src/llama-context.h`
+  - added a `hpx_selective_mul_mat` flag under `#ifdef GGML_HPX`
+- `src/llama-context.cpp`
+  - read `LLAMA_HPX_SELECTIVE_MUL_MAT` at context construction
+  - inside `graph_compute(...)`, under the existing HPX path and an additional `#ifdef GGML_HPX_REGION_DAG` guard, route to the selective graph executor when the flag is enabled
+- `tests/hpx/test_hpx_llama_selective_mul_mat_smoke.cpp`
+  - added a new smoke test reusing the same structure as the existing HPX smoke test:
+    - reference context: `LLAMA_USE_HPX` unset
+    - selective context: `LLAMA_USE_HPX=1` and `LLAMA_HPX_SELECTIVE_MUL_MAT=1`
+    - run one decode batch
+    - compare every logit exactly
+
+This was the first real llama-integrated test of the fine-region work.
+
+### First real integration bug: reduction-backed lowering
+
+The first llama smoke integration crashed.
+
+The initial suspicion was quantized `MUL_MAT`, but debug output showed the actual cause:
+
+- `RMS_NORM` was still being lowered on the single-token decode path
+- its lowered group had three regions and included a `REDUCTION` region
+- the selective executor was constructing a minimal `ggml_hpx_region_resources` with null `lane_scratch` and null `reduction_buffer`
+- the reduction path dereferenced `lane_scratch[ith]`
+
+This matched the existing op-level tests:
+
+- `RMS_NORM_F32` lowering is valid for single-row inputs
+- but the execution tests only work when `lane_scratch` and `reduction_buffer` are populated for the lowered group
+
+So the smoke crash was not caused by the selective path being fundamentally invalid. It was caused by the selective path lowering a resource-heavy group without also providing the resources that group requires.
+
+### Narrow fix: reduction guard
+
+The fix was intentionally narrow.
+
+For the selective llama integration, lowered groups are now rejected from the selective path if they contain a `REDUCTION` region.
+
+That means:
+
+- resource-light lowered groups may still run through the fine-region path
+- reduction-backed groups fall back to the real CPU backend path
+
+This kept the selective integration small and safe without prematurely broadening the scope into full resource-backed lowering inside real llama execution.
+
+The debug print used to confirm this root cause was then kept only as an optional env-gated diagnostic.
+
+### Making the selective path measurement-ready
+
+After the smoke test passed, the next question became not correctness but observability and fairness.
+
+Two improvements were added:
+
+#### 1. Lightweight selective stats
+A per-call selective stats struct was added with:
+- lowered node count
+- fallback node count
+- lowered execution time
+- fallback execution time
+
+`llama_context` stores the last selective stats and prints:
+
+```text
+[hpx-selective] lowered=N fallback=M lowered_ms=X fallback_ms=Y
+```
+
+when `LLAMA_HPX_SELECTIVE_STATS=1` is set.
+
+This made the selective path observable during real llama runs.
+
+#### 2. Real live-backend fallback
+The selective path was updated to use the live CPU backend from the llama context rather than treating fallback as a standalone arena-style execution.
+
+This followed the existing decode execution model more closely:
+- decode already expects a live caller-owned CPU backend in the backend bundle
+- decode slices are executed by building a `ggml_graph_view(...)` and calling `ggml_backend_graph_compute(...)` on that live backend
+
+Using the live CPU backend made the selective path fairer to measure and avoided introducing obviously artificial per-call backend creation into the real llama path.
+
+### What this milestone proved
+
+At the end of this step, the project had established all of the following:
+
+- op-level lowering already existed and was already tested
+- graph-level mixed execution now exists
+- a lowered node and a fallback node can coexist in one graph correctly
+- routing correctness is testable through explicit counters
+- the selective path is integrated into the real llama HPX branch
+- a real model-backed smoke test passes with exact logit equality
+- reduction-backed lowered groups are safely rejected to fallback for now
+- the selective path is now stats-enabled and measurement-ready
+
+### What this milestone did **not** prove
+
+This step did **not** yet prove:
+
+- end-to-end performance benefit from selective lowering
+- that a quantized TinyLlama run actually lowers any `MUL_MAT`
+- that resource-heavy lowered groups are ready for real llama execution
+
+In particular, TinyLlama Q4_K_M is expected to produce `lowered=0` for quantized `MUL_MAT`, so this model validates:
+- real llama-path routing
+- real fallback correctness
+- selective stats plumbing
+
+but not necessarily the performance benefit of real selective `mul_mat` lowering.
+
+### Interpretation
+
+This is the point where the fine-region DAG work stopped being:
+- a purely internal execution experiment
+
+and became:
+- a real llama-integrated execution experiment with selective lowering, fallback, and stats
+
+That is a meaningful transition in the project.
+
+The next step is no longer “does the selective path work at all?”
+
+That part is now established.
+
+The next step is:
+- run real decode/prefill comparison cases
+- inspect `lowered` / `fallback` stats
+- determine whether the chosen model/path actually exercises meaningful selective lowering or only validates real fallback behavior
+
+## 11. v1 packet integration in llama and the activation-proof finding
+
+Section 10 closed with a working selective integration but a remaining gap:
+the selective executor still dispatched lowered nodes through the generic
+fine-region DAG runtime, not through the frozen-packet surface Section 9
+had validated as the right execution form for repeated sublayers. Every
+small elementwise op therefore paid the generic DAG per-call floor.
+
+v1 was scoped to close that gap at the narrowest honest surface — one
+sublayer (MLP gate/up), one compiled packet per shape, decode-only
+dispatch, a single-lane packet runtime — and to do so without disturbing
+any of the existing selective routing when the packet path is not engaged.
+The goal of this milestone was explicitly a clean integration boundary,
+not a performance claim.
+
+### CPU-only guard — Section 10 refinement
+
+Before the packet work started, one narrow refinement to Section 10's
+selective wiring was required. Earlier 3-case runs on TinyLlama Q4_K_M
+at default `-ngl` had been dispatching entire Metal-offloaded graphs
+through the CPU backend, producing degenerate output (all `<unk>` tokens)
+and meaningless timing — the selective path replaced
+`ggml_backend_sched_graph_compute_async` and then fed a graph whose
+nodes were tagged for Metal through a single CPU backend.
+
+The fix was a three-condition structural guard at the selective call
+site in `llama_context::graph_compute`:
+
+- `ggml_backend_sched_get_n_splits(sched) == 1`
+- `gf->n_nodes > 0`
+- `ggml_backend_sched_get_tensor_backend(sched, gf->nodes[0]) == backend_cpu`
+
+If any condition fails, the selective path is disabled for that call and
+the graph flows through the normal scheduler. Mixed-backend graphs
+(Metal-offloaded TinyLlama) therefore no longer contaminate selective
+measurement; selective only engages on genuinely CPU-only graphs. This
+is a caller-side decision; `ggml_hpx_exec_graph_selective_mul_mat`
+itself does not inspect the scheduler.
+
+### v1 API shape
+
+The v1 design added five concrete pieces and deliberately did not modify
+the shape of the existing selective entry point beyond two new optional
+parameters.
+
+1. **Stats buckets**
+   `ggml_hpx_selective_stats` gained three fields: `packet_matches`,
+   `packet_nodes`, `packet_dispatch_ns`. These are disjoint from
+   `lowered_*` and `fallback_*`: when packet dispatch is enabled, every
+   node in `gf` lands in exactly one of the three buckets.
+
+2. **Opaque sublayer-specific cache**
+   `ggml_hpx_mlp_gate_up_packet_cache`. Per-entry key is
+   `(out_cols, cols, rows)`; cache-wide create-time parameters are
+   `(n_lanes, seq_regime, policy_version)`. The cache is a **plan
+   store** and holds no reference to a packet runtime. That split is
+   load-bearing: if the cache had owned a runtime reference, plan and
+   executor would have conflated, which Section 9 was careful to avoid.
+
+3. **Extended selective entry point**
+   `ggml_hpx_exec_graph_selective_mul_mat` gained two optional
+   parameters `packet_rt` and `mlp_cache`. Both null → behaviour
+   identical to Section 10's selective executor. Both non-null → the
+   matcher pre-scan runs and recognized MLP gate/up subgraphs dispatch
+   as frozen packets. Exactly one of the two non-null → debug-assert,
+   release treats as "packet off". The contract is documented in the
+   header directly.
+
+4. **llama_context ownership**
+   `llama_context` gained one flag (`hpx_mlp_gate_up_packet`, from
+   `LLAMA_HPX_SELECTIVE_MLP_PACKET=1`) and two lazily-owned pointers.
+   The runtime and cache are constructed on the first decode-side
+   selective-eligible `graph_compute` call; if either construct fails,
+   any partial state is destroyed and the call falls back cleanly to
+   packet-off, rather than half-enabling the path.
+
+5. **Decode-only gating at the caller**
+   The MLP gate/up packet is compiled for `team = DECODE`, and prefill
+   shapes (`rows > 1`) would require a separate packet per batch size.
+   Gating is therefore done in `llama_context::graph_compute` by
+   passing non-null packet arguments only when `!batched`. The
+   selective executor itself does not inspect a "decode" flag.
+
+### Matcher and dispatch site
+
+The pre-scan and main loop are deliberately simple, with one load-
+bearing invariant.
+
+- One pass over `gf->nodes`. For each `GGML_OP_MUL`, walk back through
+  its sources: `src[0]` must be a `GGML_OP_UNARY` with subop SiLU whose
+  own `src[0]` is a `MUL_MAT` (the gate), and `src[1]` must be a
+  `MUL_MAT` (the up). A shared-x check (`gate.src[1] == up.src[1]`)
+  rules out coincidental matches. An overlap guard rejects any
+  candidate whose four nodes are already claimed by a prior match.
+  `consumed[]` and `match_at_final[]` are updated **only after**
+  `lookup_or_compile_mlp` succeeds; a failed compose/compile leaves the
+  nodes on the normal lowered/fallback path.
+
+- Main loop state per index `i`:
+  - `!consumed[i]` — standard lowered/fallback routing
+  - `consumed[i] && match_at_final[i] < 0` — non-trigger packet member (skip)
+  - `consumed[i] && match_at_final[i] >= 0` — final MUL of a match (dispatch packet)
+
+The "final MUL owns dispatch" invariant means the packet's dependencies
+(gate MUL_MAT, up MUL_MAT, SiLU output) have all been materialized in
+ggml order by the time we dispatch; dispatching at the gate index would
+read an unmaterialized up output.
+
+The dispatch site binds from **live** ggml tensor `->data` pointers at
+every call. Only `packet` and `frame` come from the cache; the seven
+binding pointers (`w_gate`, `w_up`, `x`, `gate`, `up`, `gate_act`,
+`out`) are read from the actual matched tensors on each dispatch.
+
+Two test-only atomics provide the cache-reuse observable:
+`g_hpx_mlp_packet_compile_count` is bumped on cache miss after compile
+succeeds; `g_hpx_mlp_packet_dispatch_count` is bumped on every dispatch
+(hit or miss).
+
+### Isolation test
+
+Before any llama wiring, a dedicated test
+(`test_hpx_selective_mlp_gate_up_packet.cpp`) builds the 4-op graph
+explicitly via ggml ops and drives it through the new selective entry
+point with `n_lanes = 1`. The test asserts:
+
+- matcher recognizes the 4-node pattern (`packet_matches == 1`,
+  `packet_nodes == 4`)
+- first call: `compile_count == 1`, `dispatch_count == 1`
+- second call: `compile_count` still `1`, `dispatch_count == 2`
+- `lowered_nodes == 0` and `fallback_nodes == 0` on both calls
+- `packet_dispatch_ns > 0` (timing present; no further timing claim)
+- output matches the scalar reference within relative `1e-5`, including
+  after the output buffer is zeroed between the two calls (which proves
+  bind really does read live tensor data each time)
+
+Runtime: 7–19 ms including HPX startup. The test runs in the same
+target structure as `test_hpx_region_mixed_mul_mat` — it re-compiles
+`ggml-hpx-exec-selective.cpp` with `GGML_HPX_EXEC_SELECTIVE_TESTING` so
+the atomics are visible.
+
+### Q4_K_M smoke — transparent when the matcher finds nothing
+
+Once v1 was wired through llama, the first end-to-end smoke ran on the
+existing TinyLlama Q4_K_M model with `LLAMA_HPX_SELECTIVE_MLP_PACKET=1`
+and `-ngl 0`.
+
+Result: every `[hpx-selective]` line reported `packet=0(0 nodes)`.
+`lowered` and `fallback` counters were identical to the pre-packet-flag
+run on the same model (`lowered=2 fallback=687` at prefill,
+`lowered=45 fallback=644` every decode). Output was coherent. The lazy-
+init log `HPX MLP gate/up packet dispatch ready (n_lanes=1)` appeared
+exactly once, on the first decode-side graph_compute. Context teardown
+clean.
+
+This matches what the header's "first-deployment scope" block said to
+expect: on Q4_K_M the MLP MUL_MATs are quantized,
+`ggml_hpx_lower_op` rejects them, `ggml_hpx_compose_mlp_gate_up_group`
+fails, the cache never records an entry, and the selective path behaves
+exactly as it did before v1. The integration is transparent when the
+matcher finds nothing.
+
+### Milestone A — activation-proof attempt on F32 weights
+
+With v1 closed as a clean integration surface, a narrow follow-up
+milestone (A) asked the simplest possible next question:
+
+> does `packet_matches > 0` in real llama when the MLP projections are F32?
+
+A was scoped explicitly as an activation proof — a mechanism milestone,
+not a performance milestone. It was kept separate from any widening of
+lowering or composition (the intended follow-up, milestone B).
+
+The F32 model was produced by dequantizing the existing Q4_K_M GGUF:
+
+```
+build-hpx-dag/bin/llama-quantize --allow-requantize \
+    models/tinyllama/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    models/tinyllama/tinyllama-1.1b-chat-v1.0.F32.gguf \
+    F32
+```
+
+5.3 s, 4196 MiB output. Every `ffn_gate.weight` and `ffn_up.weight` was
+converted from `q4_K` to `f32` (logged per-tensor during quantize). This
+is dequantization, not recovered F32 precision: values remain Q4_K-
+rounded, only the tensor dtype changes. That is exactly what the
+matcher needs — F32 **type**, not F32 **accuracy** — and was flagged
+explicitly in the result-directory README so the run is not misread as
+a quality baseline.
+
+### Unexpected result — packet_matches stayed at 0
+
+The smoke ran coherently, but every stats line still reported
+`packet=0(0 nodes)`. Two things did change compared to the Q4_K_M run:
+
+- `lowered` rose from 45 → 200 per decode (and 2 → 157 for prefill).
+  The MLP and attention MUL_MATs now pass the F32 gate in
+  `ggml_hpx_lower_op`, and the fine-region path does real work on a
+  realistic graph.
+- Per-decode `lowered_ms` rose to ~4 s, reflecting the cost of running
+  22 layers of F32 MUL_MAT through the generic fine-region runtime
+  without packet acceleration.
+
+But zero packet dispatches.
+
+### Root cause — GLU[SWIGLU] fusion
+
+`src/llama-graph.cpp:1074` emits the MLP tail as a single fused op:
+
+```
+cur = ggml_swiglu_split(ctx0, cur, tmp);
+```
+
+which produces one `GGML_OP_GLU` node with subop `GGML_GLU_OP_SWIGLU`,
+not the three-op decomposition `SiLU(gate) → MUL(silu, up)` that v1's
+matcher scans for. The fused GLU node is a ggml-level optimization
+independent of the HPX work; it simply predates v1.
+
+So the real per-layer MLP tail in TinyLlama's decode graph is:
+
+```
+gate = MUL_MAT(W_gate, x)
+up   = MUL_MAT(W_up,   x)
+cur  = GLU[SWIGLU](gate, up)    <-- one node, not three
+out  = MUL_MAT(W_down, cur)
+```
+
+None of that contains the 3-op SiLU+MUL tail v1 expects. `packet_matches
+== 0` by construction, regardless of weight dtype.
+
+### What Milestone A established
+
+- v1's end-to-end path runs on a real F32 model without regression:
+  env flag honoured, lazy creation fires exactly once, matcher scans
+  every decode graph, selective stats include the packet bucket,
+  teardown clean.
+- Flipping MLP weight dtype from Q4_K to F32 really does unlock
+  `ggml_hpx_lower_op` acceptance for the MUL_MAT nodes — `lowered`
+  goes from 45 → 200 per decode step on this model. The fine-region
+  path is capable of operating on a realistic graph once the dtype
+  constraint is lifted.
+- v1's matcher is **shape-incomplete** for real llama, independent of
+  any quantization work. The gap is a ggml-level fusion, not an
+  HPX-layer bug.
+
+### What A does NOT prove
+
+- Packet dispatch actually firing in llama — did not happen on this
+  model because the graph does not contain the v1-assumed pattern.
+- Any speedup claim at any layer.
+
+### Consequence for Milestone B
+
+A was designed to run to a conclusion and close. It did. It also
+sharpened B's scope by turning the original "broaden lowering and
+composition for quantized workloads" into a more precise pair of
+sub-targets:
+
+1. **GLU[SWIGLU]-aware composition.** Either a second matcher shape
+   (two `MUL_MAT` + one `GLU`) or a GLU-aware composer variant, plus a
+   new sublayer id
+   (`GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_GLU_F32 = 3`) so the plan
+   key stays structurally distinct from the existing 4-op form.
+2. **Q4_K-aware MUL_MAT lowering.** The original B scope. Requires
+   `dtype`/quant-scheme in the packet plan key so cached packets do
+   not collide across quant schemes.
+
+Landing (1) alone lets an F32-dequant model fire real packet dispatch
+in llama. Landing (2) alone removes the dequantization dependency for
+all quantized models. Landing both closes the full
+Section 7 → 8 → 9 → 10 → 11 arc on realistic quantized inference.
+
+### Conclusion of Section 11
+
+v1 is complete: the mechanism is proven in isolation, integrated into
+llama behind the `LLAMA_HPX_SELECTIVE_MLP_PACKET` flag, transparent
+when the matcher finds nothing, lazy-lifecycled, honest observables.
+
+Milestone A is complete as a finding, not a speedup: activation on a
+real llama graph does not happen with v1's matcher shape because llama
+emits a single `GLU[SWIGLU]` node where v1 expects three ops. A's
+value is in the finding, not in a positive activation count.
+
+Milestone B is now scoped with one concrete first target
+(GLU-aware composition) alongside its original quantized-MUL_MAT
+target. B is its own milestone, with its own provenance section, and
+deliberately not mixed into v1 or A.

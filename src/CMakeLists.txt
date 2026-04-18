@@ -167,6 +167,9 @@ if (GGML_HPX)
     target_compile_definitions(llama PUBLIC GGML_HPX)
     target_include_directories(llama PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-hpx)
+    if (GGML_HPX_REGION_DAG)
+        target_compile_definitions(llama PRIVATE GGML_HPX_REGION_DAG)
+    endif()
 endif()
 
 if (BUILD_SHARED_LIBS)

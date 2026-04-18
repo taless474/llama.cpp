@@ -4,11 +4,14 @@
 # Included only when GGML_HPX is ON.
 #
 # Note:
-#   Two translation units include ggml-backend.h:
-#     ggml-hpx-adapter.cpp — scheduler coupling and split state
-#     ggml-hpx-exec.cpp    — ggml_backend_graph_compute and
-#                            ggml_backend_sched_get_tensor_backend at run time
-#   All other files in this directory must not include ggml-backend.h directly.
+#   ggml-backend.h is pulled in by ggml-hpx-exec-selective.h (its public
+#   interface uses ggml_backend_t) and therefore transitively by every TU
+#   that includes that header.  The three TUs that use ggml-backend.h
+#   directly are:
+#     ggml-hpx-adapter.cpp          — scheduler coupling and split state
+#     ggml-hpx-exec.cpp             — ggml_backend_graph_compute and
+#                                     ggml_backend_sched_get_tensor_backend at run time
+#     ggml-hpx-exec-selective.cpp   — per-node CPU fallback via ggml_backend_graph_compute
 
 find_package(HPX REQUIRED)
 
@@ -60,6 +63,6 @@ if(GGML_HPX_REGION_DAG)
     # The source is gated here rather than in the main source list so it is
     # only compiled (and GGML_HPX_REGION_DAG can be assumed present) when
     # the flag is explicitly enabled.
-    target_sources(ggml-hpx PRIVATE ggml-hpx-region-exec.cpp ggml-hpx-packet.cpp ggml-hpx-lower.cpp ggml-hpx-compose.cpp)
+    target_sources(ggml-hpx PRIVATE ggml-hpx-region-exec.cpp ggml-hpx-packet.cpp ggml-hpx-lower.cpp ggml-hpx-compose.cpp ggml-hpx-exec-selective.cpp)
     message(STATUS "ggml-hpx: GGML_HPX_REGION_DAG enabled")
 endif()

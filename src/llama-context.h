@@ -11,6 +11,9 @@
 
 #ifdef GGML_HPX
 struct ggml_hpx_exec;
+#  ifdef GGML_HPX_REGION_DAG
+#    include "ggml-hpx-exec-selective.h"
+#  endif
 #endif
 
 #include <map>
@@ -352,6 +355,49 @@ private:
     // env: LLAMA_USE_HPX — set to 1 to route graph_compute through HPX exec.
     // Null when the env var is absent or GGML_HPX is not compiled in.
     ggml_hpx_exec * hpx_exec = nullptr;
+
+    // env: LLAMA_HPX_SELECTIVE_MUL_MAT — set to 1 (requires LLAMA_USE_HPX=1 and
+    // GGML_HPX_REGION_DAG) to route graph_compute through
+    // ggml_hpx_exec_graph_selective_mul_mat: supported nodes run on the fine-region
+    // DAG path; everything else falls back to the CPU backend per node.
+    bool hpx_selective_mul_mat = false;
+
+#ifdef GGML_HPX_REGION_DAG
+    // stats from the most recent ggml_hpx_exec_graph_selective_mul_mat call.
+    ggml_hpx_selective_stats hpx_selective_last_stats{};
+    // env: LLAMA_HPX_SELECTIVE_STATS=1 — print per-call stats to the log.
+    bool hpx_selective_stats_print = false;
+
+    // env: LLAMA_HPX_SELECTIVE_MLP_PACKET=1 (requires LLAMA_USE_HPX=1,
+    // LLAMA_HPX_SELECTIVE_MUL_MAT=1, and GGML_HPX_REGION_DAG) — enables the
+    // v1 frozen-packet dispatch path for MLP gate/up sublayers inside
+    // ggml_hpx_exec_graph_selective_mul_mat.
+    //
+    // Scope note (v1): single-lane (n_decode_threads = 1), team = DECODE,
+    // only one sublayer (MLP gate/up) matched and dispatched.  This is
+    // deliberately narrow — the first-deployment goal is to validate
+    // matcher / cache / bind / dispatch correctness through the real llama
+    // path, not to widen packet execution.
+    bool hpx_mlp_gate_up_packet = false;
+
+    // Lazily constructed on the first decode-side graph_compute that is
+    // eligible for packet dispatch (selective CPU-only path, !batched) when
+    // hpx_mlp_gate_up_packet is true.  The current smoke model (TinyLlama
+    // Q4_K_M) produces quantized MUL_MAT that ggml_hpx_compose_mlp_gate_up_
+    // group rejects, so these pointers may remain null on that model even
+    // when the env var is set: the matcher simply never finds a compile-
+    // able pattern.
+    //
+    // Lifecycle:
+    //   hpx_packet_runtime    — pinned decode Exec for packet lane fan-out
+    //                           (n_lanes = 1 in v1)
+    //   hpx_mlp_gate_up_cache — compiled packets + caller-owned frames
+    //                           keyed on (out_cols, cols, rows)
+    //
+    // Destroyed in the llama_context dtor (cache first, then runtime).
+    ggml_hpx_packet_runtime *           hpx_packet_runtime    = nullptr;
+    ggml_hpx_mlp_gate_up_packet_cache * hpx_mlp_gate_up_cache = nullptr;
+#endif
 
     // GGML_HPX_TPOOL_ONLY=1: HPX threadpool for large graphs (work_size >= threshold).
     // The standard threadpool / threadpool_batch members serve as the pthread substrate

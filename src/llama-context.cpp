@@ -11,6 +11,13 @@
 
 #ifdef GGML_HPX
 #include "ggml-hpx-exec.h"
+#ifdef GGML_HPX_REGION_DAG
+#include "ggml-hpx-exec-selective.h"
+#include "ggml-hpx-packet.h"
+// ggml-impl.h is not on the llama include path; use the repo-relative path to
+// get the full ggml_cgraph definition needed to read gf->nodes[].
+#include "../ggml/src/ggml-impl.h"
+#endif
 #endif
 
 #include <cinttypes>
@@ -385,6 +392,26 @@ llama_context::llama_context(
                 ggml_hpx_exec_params hpx_params{};
                 hpx_exec = ggml_hpx_exec_create(hpx_params);
                 LLAMA_LOG_INFO("%s: HPX exec enabled (LLAMA_USE_HPX=1)\n", __func__);
+
+                const char * sel_env = getenv("LLAMA_HPX_SELECTIVE_MUL_MAT");
+                hpx_selective_mul_mat = (sel_env && atoi(sel_env) != 0);
+                if (hpx_selective_mul_mat) {
+                    LLAMA_LOG_INFO("%s: HPX selective mul_mat path enabled\n", __func__);
+                }
+#ifdef GGML_HPX_REGION_DAG
+                const char * stats_env = getenv("LLAMA_HPX_SELECTIVE_STATS");
+                hpx_selective_stats_print = (stats_env && atoi(stats_env) != 0);
+
+                // Packet dispatch is opt-in and requires the selective path.
+                // The runtime + cache are constructed lazily at the call
+                // site on the first eligible decode graph (see graph_compute
+                // below), not here — that keeps the cost off contexts that
+                // never decode and matches the "honest integration surface"
+                // note in ggml-hpx-exec-selective.h.
+                const char * pkt_env = getenv("LLAMA_HPX_SELECTIVE_MLP_PACKET");
+                hpx_mlp_gate_up_packet =
+                    hpx_selective_mul_mat && pkt_env && atoi(pkt_env) != 0;
+#endif
             }
         }
     }
@@ -393,6 +420,20 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
 #ifdef GGML_HPX
+#ifdef GGML_HPX_REGION_DAG
+    // Cache first (its entries hold compiled packets), then the runtime.
+    // Both null until the first eligible decode-side graph_compute; safe
+    // to call destroy with null is not guaranteed by the packet API, so
+    // guard explicitly.
+    if (hpx_mlp_gate_up_cache != nullptr) {
+        ggml_hpx_mlp_gate_up_packet_cache_destroy(hpx_mlp_gate_up_cache);
+        hpx_mlp_gate_up_cache = nullptr;
+    }
+    if (hpx_packet_runtime != nullptr) {
+        ggml_hpx_packet_runtime_destroy(hpx_packet_runtime);
+        hpx_packet_runtime = nullptr;
+    }
+#endif
     if (hpx_exec != nullptr) {
         ggml_hpx_exec_destroy(hpx_exec);
         hpx_exec = nullptr;
@@ -2241,6 +2282,105 @@ ggml_status llama_context::graph_compute(
 
 #ifdef GGML_HPX
     if (hpx_exec != nullptr) {
+#ifdef GGML_HPX_REGION_DAG
+        // Selective fine-region path: only engages when the entire graph is
+        // assigned to the CPU backend (n_splits == 1 and the sole split owner
+        // is backend_cpu).  Mixed-backend graphs (e.g. Metal offload) fall
+        // through to the normal scheduler path below.
+        // The PREFILL_MIN_TOKENS threshold below applies only to the coarse HPX path.
+        if (hpx_selective_mul_mat) {
+            const int  n_splits   = ggml_backend_sched_get_n_splits(sched.get());
+            const bool is_cpu_only = (n_splits == 1)
+                && (gf->n_nodes > 0)
+                && (ggml_backend_sched_get_tensor_backend(sched.get(), gf->nodes[0]) == backend_cpu);
+
+            if (!is_cpu_only) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    static const bool dbg = [] {
+                        const char * e = getenv("LLAMA_HPX_SELECTIVE_DEBUG");
+                        return e && atoi(e) != 0;
+                    }();
+                    if (dbg) {
+                        LLAMA_LOG_INFO(
+                            "[hpx-selective] disabled: mixed backend graph"
+                            " (splits=%d) — falling back to scheduler\n",
+                            n_splits);
+                    }
+                }
+                // fall through to ggml_backend_sched_graph_compute_async below
+            } else {
+                // tensor->data is already valid: process_ubatch calls alloc_graph
+                // before graph_compute.  The selective executor dispatches each
+                // node to either the fine-region path or the CPU backend.
+
+                // Packet dispatch eligibility: env flag + decode-only.
+                // The MLP gate/up packet is team=DECODE and batched shapes
+                // would need a different (rows>1) packet anyway, so prefill
+                // graphs always pass null packet args.
+                const bool packet_eligible = hpx_mlp_gate_up_packet && !batched;
+
+                // Lazy-create on the first eligible call. If either object
+                // fails to construct, clean up any partial state and leave
+                // both pointers null — that falls the call back to packet-
+                // off behaviour cleanly instead of half-enabling the path.
+                if (packet_eligible
+                    && hpx_packet_runtime    == nullptr
+                    && hpx_mlp_gate_up_cache == nullptr) {
+                    constexpr uint32_t n_lanes        = 1;
+                    constexpr uint32_t seq_regime     = 0;
+                    constexpr uint32_t policy_version = 1;
+
+                    ggml_hpx_packet_runtime * rt_new =
+                        ggml_hpx_packet_runtime_create(n_lanes);
+                    ggml_hpx_mlp_gate_up_packet_cache * cache_new =
+                        rt_new
+                        ? ggml_hpx_mlp_gate_up_packet_cache_create(
+                              n_lanes, seq_regime, policy_version)
+                        : nullptr;
+
+                    if (rt_new && cache_new) {
+                        hpx_packet_runtime    = rt_new;
+                        hpx_mlp_gate_up_cache = cache_new;
+                        LLAMA_LOG_INFO(
+                            "%s: HPX MLP gate/up packet dispatch ready"
+                            " (n_lanes=%u)\n", __func__, n_lanes);
+                    } else {
+                        if (cache_new) {
+                            ggml_hpx_mlp_gate_up_packet_cache_destroy(cache_new);
+                        }
+                        if (rt_new) {
+                            ggml_hpx_packet_runtime_destroy(rt_new);
+                        }
+                    }
+                }
+
+                const bool packet_active = packet_eligible
+                    && hpx_packet_runtime    != nullptr
+                    && hpx_mlp_gate_up_cache != nullptr;
+
+                const bool ok = ggml_hpx_exec_graph_selective_mul_mat(
+                    gf, backend_cpu, 0, &hpx_selective_last_stats,
+                    packet_active ? hpx_packet_runtime    : nullptr,
+                    packet_active ? hpx_mlp_gate_up_cache : nullptr);
+                if (hpx_selective_stats_print) {
+                    LLAMA_LOG_INFO(
+                        "[hpx-selective] lowered=%u fallback=%u"
+                        " packet=%u(%u nodes)"
+                        " lowered_ms=%.3f fallback_ms=%.3f packet_ms=%.3f\n",
+                        hpx_selective_last_stats.lowered_nodes,
+                        hpx_selective_last_stats.fallback_nodes,
+                        hpx_selective_last_stats.packet_matches,
+                        hpx_selective_last_stats.packet_nodes,
+                        hpx_selective_last_stats.lowered_ns         * 1e-6,
+                        hpx_selective_last_stats.fallback_ns        * 1e-6,
+                        hpx_selective_last_stats.packet_dispatch_ns * 1e-6);
+                }
+                return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+            }
+        }
+#endif
         // Tiny prefill batches pay more in HPX dispatch overhead than they
         // gain from parallel execution.  Route them through the normal
         // scheduler path instead.  Threshold is tunable; 16 tokens is a

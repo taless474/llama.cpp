@@ -4,16 +4,19 @@
 
 This project redesigns the CPU execution model of `llama.cpp` using HPX.
 
-Earlier phases used HPX primarily as an orchestration layer above ggml.
-That approach established correctness and clarified the workload split between decode and prefill, but it also exposed a structural limit for intra-region CPU parallelism.
+It began with HPX-based orchestration above ggml, then moved deeper into
+`ggml-cpu` executor ownership, and now includes an HPX-native fine-region
+execution path in `ggml/src/ggml-hpx/`.
 
-The current direction goes deeper:
-- HPX inside the `ggml-cpu` execution layer
-- work-size-based routing between pthread and HPX substrates
-- an experimental HPX-native fine-grained CPU work DAG
+The goal is not to replace ggml kernels or BLAS. The goal is to improve how
+CPU work is:
+- represented
+- scheduled
+- dispatched
+- executed
 
-The goal is not to rewrite ggml kernels or replace ggml itself. The goal is to
-improve how CPU work is structured, dispatched, and executed.
+The strongest current direction is no longer “HPX as orchestration.”
+It is **HPX as the execution model for explicit CPU work regions**.
 
 ---
 
@@ -26,11 +29,12 @@ The real question is:
 > What is the right execution contract for inference?
 
 This project evolved through three layers:
+
 1. HPX above ggml as orchestration
 2. HPX as a CPU executor substrate inside `ggml-cpu`
 3. HPX as a direct executor of explicit fine-grained CPU work regions
 
-The strongest current direction is the third one.
+The third layer is now the most important one.
 
 ---
 
@@ -47,7 +51,7 @@ graph (ggml)
 
 This model ties execution to worker identity and a rigid barrier structure.
 
-### Current execution model in this project
+### Existing practical substrate policy in this project
 
 ```text
 small work (decode-like)
@@ -59,17 +63,19 @@ large work (prefill-like)
 
 Routing is based on `cplan->work_size`.
 
-### Experimental next layer
+This remains the practical coarse-path policy.
+
+### New fine-region execution layer
 
 ```text
 coarse graph region
   → fine CPU region DAG
   → run_range(...)
-  → HPX block_fork_join_executor
+  → HPX futures / dataflow
 ```
 
-This path executes real CPU work units directly instead of routing through the
-old ggml worker loop.
+This path executes explicit CPU work units directly instead of routing through
+the old ggml worker loop.
 
 ---
 
@@ -83,55 +89,81 @@ old ggml worker loop.
   - `run_job`
   - `destroy`
 - HPX-backed threadpool implementation
-- bulk-region execution
-- later tuning toward lower-overhead executor choices
+- work-size-based pthread / HPX substrate split
 
-### 2. Work-size-based routing
+### 2. Fine-region DAG contract
 
-Key discovery:
+Implemented under `GGML_HPX_REGION_DAG`:
 
-- graph topology does **not** distinguish decode from prefill
-- `cplan->work_size` does
-
-Policy:
-
-```cpp
-if (work_size < threshold)
-    → pthread
-else
-    → HPX
-```
-
-Observed result:
-- decode returns to near baseline
-- prefill remains near parity or slightly better
-
-### 3. HPX-native fine-region DAG (experimental)
-
-New direct execution contract:
-
-```cpp
-run_range(ctx, ith, nth, begin, end, resources)
-```
-
-Characteristics:
-- direct kernel entry
-- no `ggml_graph_compute_thread_run(...)`
-- no graph re-entry
-- explicit region DAG
-- explicit resource ownership
-
-New abstractions:
 - `ggml_hpx_cpu_region`
 - `ggml_hpx_cpu_region_group`
 - `ggml_hpx_dep_edge`
 - `ggml_hpx_region_resources`
+- `ggml_hpx_run_range_fn`
+
+This defines a fine-grained CPU work DAG with:
+- explicit work ranges
+- explicit dependencies
+- explicit resource bundle
+
+### 3. Fine-region execution path
+
+Implemented in `ggml-hpx-region-exec.*`:
+
+- region-group validator
+- direct F32 `mul_mat` kernel
+- `ggml_hpx_run_single_region(...)`
+- `ggml_hpx_run_region_group(...)`
+
+Current properties:
+- direct `run_range(...)` execution
+- no `ggml_graph_compute_thread_run(...)`
+- no graph re-entry
+- dependency-driven inter-region scheduling with HPX futures / `dataflow`
+- real same-level region overlap
+
+### 4. Selective graph-level mixed execution
+
+A narrow selective execution path now exists for graph-level experiments:
+
+- supported lowered ops use the fine-region path
+- unsupported ops fall back to the real CPU backend path
+
+The first mixed execution target is:
+- lowered `mul_mat`
+- fallback for everything else
+
+This is the current bridge toward real llama.cpp comparison.
+
+---
+
+## Current validated behavior
+
+The following fine-region tests pass:
+
+- `test_hpx_region_group_validate`
+- `test_hpx_region_group_run`
+- `test_hpx_region_group_parallel`
+- `test_hpx_region_single_mul_mat`
+- `test_hpx_region_mixed_mul_mat`
+
+These prove:
+
+- malformed region groups are rejected
+- a small region DAG executes correctly
+- same-level overlap is real
+- direct single-region `mul_mat` works
+- mixed lowered/fallback execution works
+- fine-region execution does not re-enter:
+  - `ggml_graph_compute`
+  - `ggml_backend_graph_compute`
+  - `ggml_graph_compute_thread_run`
 
 ---
 
 ## Performance highlights
 
-### Work-size routing result
+### Coarse-path work-size routing result
 
 | case  | t | base | hpx | delta |
 |------|---:|-----:|----:|------:|
@@ -146,28 +178,44 @@ Interpretation:
 - decode is protected from the HPX small-work penalty
 - prefill stays competitive on the HPX path
 
-### Fine-region DAG result
+### Fine-region DAG highlights
 
-#### Bench 1 — matmul dispatch
+The fine-region path has already shown:
+- direct `mul_mat` region execution works
+- dependency-driven scheduling works
+- same-level concurrency is real
 
-| shape   | nth | scheduler_exec (prev) | fork_join_exec (now) |
-|---------|-----|------------------------|----------------------|
-| decode  | 1   | ~990 µs                | 993 µs (≈ same)      |
-| decode  | 2   | ~880 µs                | 894 µs (≈ same)      |
-| decode  | 4   | ~660 µs                | 642 µs (slightly faster) |
-| prefill | 1   | ~31 ms                 | 31.2 ms (≈ same)     |
-| prefill | 2   | ~28 ms                 | 27.8 ms (≈ same)     |
-| prefill | 4   | ~21 ms                 | 20.5 ms (slightly faster) |
+At this stage, the fine-region story is primarily a correctness and
+execution-model milestone, not yet a broad end-to-end performance claim inside
+llama.cpp.
 
-#### Bench 2 — 3-region chain
+---
 
-| shape   | nth | pool      | fork_join_exec | speedup |
-|---------|-----|-----------|----------------|---------|
-| decode  | 4   | 1145 µs   | 643 µs         | 1.78×   |
-| prefill | 4   | 23.4 ms   | 21.9 ms        | 1.07×   |
+## Where to look
 
-This is the first clear positive performance result from the HPX-native
-fine-region design.
+### Core implementation
+- `ggml/src/ggml-hpx/`
+  - HPX-specific lowering, region execution, selective execution, and runtime code
+- `ggml/src/ggml-cpu/`
+  - CPU executor seam and substrate work
+
+### Tests
+- `tests/hpx/`
+  - fine-region DAG tests
+  - selective mixed-execution tests
+  - llama smoke tests
+
+### Benchmarks
+- `hpx-bench/`
+  - standalone HPX microbenchmarks and region benchmarks
+
+### Design / docs
+- `README_HPX.md`
+  - current HPX architecture and status
+- `docs/HPX_EXECUTOR_CONTRACT.md`
+  - strict design rules and execution boundaries
+- `docs/HPX_PROVENANCE.md`
+  - chronological project history and results
 
 ---
 
@@ -181,8 +229,7 @@ Replacing pthread with HPX does not automatically improve inference.
 - repeated short multithreaded dispatches do not
 
 ### 3. Graph shape is the wrong discriminator
-Decode and prefill often use the same topology. `work_size` is the useful
-signal.
+Decode and prefill often use the same topology. `work_size` is the useful signal.
 
 ### 4. The right abstraction is explicit work, not worker identity
 
@@ -193,28 +240,30 @@ HPX → logical worker ids → ggml worker loop
 
 Better direction:
 ```text
-HPX → explicit work units → direct execution
+HPX → explicit work units → dependency futures → direct execution
 ```
+
+### 5. Fine-region execution is now the most important direction
+The project’s most promising path is no longer “HPX everywhere.”
+It is:
+- pthread where small work wins
+- HPX where large work wins
+- explicit fine-region execution where the old worker-loop model is the wrong abstraction
 
 ---
 
 ## Current limitations
 
-- fine-region DAG is not yet integrated into the full llama.cpp execution path
-- only selected kernels have direct `run_range` implementations
-- same-level region parallelism is still conservative in the first prototype
-- reduction and scratch-heavy fine-region cases are not yet generalized
-
----
-
-## Recommended reading order
-
-1. `README.md` — current architecture and results
-2. `docs/HPX_EXECUTOR_CONTRACT.md` — design rules and execution boundaries
-3. `docs/HPX_PROVENANCE.md` — full chronological provenance
+- only selected direct kernel paths exist so far
+- `mul_mat` is the first real direct fine-region kernel path
+- resource-heavy region cases (`reduction_buffer`, `lane_scratch`) still need stronger coverage
+- selective graph-level lowering is still narrow
+- full end-to-end llama.cpp comparison for the fine-region path is still in progress
 
 ---
 
 ## One-line summary
 
-This project moves llama.cpp CPU execution from a thread-centric model toward a structure-aware model where HPX executes explicit CPU work units directly, and only where that pays off.
+This project moves llama.cpp CPU execution from a thread-centric model toward a
+structure-aware model where HPX executes explicit CPU work regions directly and
+composes them through dependency futures.
