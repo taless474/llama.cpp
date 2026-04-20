@@ -4098,3 +4098,437 @@ Milestone B is now scoped with one concrete first target
 (GLU-aware composition) alongside its original quantized-MUL_MAT
 target. B is its own milestone, with its own provenance section, and
 deliberately not mixed into v1 or A.
+
+### Opening phase of Milestone B.1 — graph shape before quantization
+
+Milestone A closed with one specific finding: packet activation in real
+llama was blocked first by **graph shape**, not by packet plumbing.
+Real llama emits a fused `GGML_OP_GLU` node with subop
+`GGML_GLU_OP_SWIGLU`; v1's packet path expected the unfused
+`MUL_MAT, MUL_MAT, SiLU, MUL` tail and therefore could never match a
+production llama MLP, even on the F32-dequant model.
+
+That observation fixed the order of work for milestone B:
+
+- **B.1 first:** make the packet/composer path match the real llama MLP
+  graph shape (`MUL_MAT, MUL_MAT, GLU[SWIGLU]`)
+- **B.2 later:** broaden lowering/composition to realistic quantized
+  workloads
+
+This ordering matters. If quantized-MUL_MAT work had been started first,
+a failure to activate packet dispatch in llama would still have been
+ambiguous: it could have been a packet bug, a quantized-lowering bug, or
+the already-known graph-shape mismatch. By landing B.1 first, the graph-
+shape problem is isolated and solved on its own terms.
+
+### Item 1 — fused SWIGLU primitive
+
+The first B.1 step was to add the missing primitive at the fine-region
+layer: a fused `SWIGLU_F32` elementwise callback.
+
+The existing `SiLU_F32` and `MUL_F32` kernels in
+`ggml-hpx-region-exec.cpp` are both straight-line loops over an
+elementwise context struct. `SWIGLU_F32` was therefore a trivial
+extension of the same surface:
+
+- new context struct:
+  - `const float * gate`
+  - `const float * up`
+  - `float * dst`
+  - `int64_t n`
+- new run-range callback:
+  - `dst[i] = silu(gate[i]) * up[i]`
+
+No scratch, no reductions, no new region kind. The primitive is still
+`GGML_HPX_CPU_REGION_KIND_ELEMENTWISE`, like `SiLU_F32` and `MUL_F32`.
+
+A dedicated primitive test file established three things:
+
+1. scalar equivalence against `(g / (1 + exp(-g))) * u`
+2. alias safety for `dst == gate`
+3. correct `[begin, end)` partial-range behavior
+
+All three tests passed. This mattered not just for correctness, but for
+resource shape: the fused GLU region has the same "no scratch" profile
+as the earlier SiLU/MUL pair, so packet resources for the GLU-fused
+sublayer remain zero-sized outside of `n_lanes`.
+
+### Item 2 — lowering `GGML_OP_GLU` with `GGML_GLU_OP_SWIGLU`
+
+With the primitive in place, the next step was to make the lowered
+region surface capable of expressing the real llama graph node.
+
+`ggml_hpx_lower_op` in `ggml-hpx-lower.cpp` gained a new
+`case GGML_OP_GLU:` arm, gated strictly on
+
+- `ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU`
+
+and then on the same basic shape/type checks already used for existing
+F32 elementwise lowering:
+
+- F32 dtype
+- contiguous storage
+- matching element counts
+
+The emitted lowering is a single-region `ELEMENTWISE` group backed by
+the new `SWIGLU_F32` callback. In other words, the real llama fused GLU
+node now lowers directly, without being decomposed back into `SiLU`
+plus `MUL`.
+
+That detail is load-bearing. Decomposing inside lowering or composition
+would have reintroduced an intermediate `gate_act` buffer that the ggml
+graph itself no longer materializes. Keeping the GLU node fused at the
+HPX layer preserves the same "one node, one region" shape the real
+graph already has.
+
+The existing `test_hpx_lower_op` suite still passed unchanged after this
+addition, so the new GLU case did not regress SiLU, MUL, MUL_MAT, or
+RMS_NORM lowering.
+
+### Item 3 — GLU-aware composer
+
+Once `GGML_OP_GLU[SWIGLU]` could lower as a single region, the composer
+layer could be made to reflect the real llama MLP tail directly.
+
+The new composer adds a second MLP sublayer form alongside the earlier
+4-op gate/up form:
+
+- `gate = MUL_MAT(W_gate, x)`
+- `up   = MUL_MAT(W_up,   x)`
+- `glu  = GLU[SWIGLU](gate, up)`
+
+This is a 3-op, 3-region, 2-dependency group:
+
+- region 0: gate MATMUL
+- region 1: up MATMUL
+- region 2: fused GLU elementwise
+- deps:
+  - `0 -> 2`
+  - `1 -> 2`
+
+The new composed group mirrors the existing
+`ggml_hpx_mlp_gate_up_group` pattern closely:
+
+- fixed arrays for `lowers[]`, `combined_regions[]`, `combined_deps[]`
+- outer `ggml_hpx_cpu_region_group`
+- same ownership rule: once composed, do not move/copy the group
+- same single-region / zero-dep validation on each constituent `lower_op`
+  result
+
+The new entry point takes three ggml nodes:
+
+- `node_gate`
+- `node_up`
+- `node_glu`
+
+and performs strict topology checks before lowering:
+
+- `node_gate->op == GGML_OP_MUL_MAT`
+- `node_up->op == GGML_OP_MUL_MAT`
+- `node_glu->op == GGML_OP_GLU`
+- `ggml_get_glu_op(node_glu) == GGML_GLU_OP_SWIGLU`
+- `node_glu->src[0] == node_gate`
+- `node_glu->src[1] == node_up`
+
+The input order is asserted strictly rather than treated as commutative.
+Even though the math of the fused SWIGLU tail could be seen as symmetric
+at a high level, the ggml graph has a real producer/consumer convention,
+and the composer preserves it directly.
+
+With Item 3 landed, the fine-region and composer layers were no longer
+assuming the old `SiLU + MUL` tail. The real llama graph shape was now
+expressible all the way through composition.
+
+### Item 4 — `MLP_GLU_F32` packet sublayer
+
+The fourth step packetized that new composed sublayer.
+
+A new packet sublayer id was added:
+
+- `GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32 = 3`
+
+This is append-only after `MLP_GATE_UP_F32 = 2`. It is a new structural
+packet family, not a revision of the earlier 4-op form, so it begins its
+own fresh per-sublayer version space at `policy_version = 1`.
+
+The new binding drops the old `gate_act` pointer and becomes a six-
+pointer structure:
+
+- `w_gate`
+- `w_up`
+- `x`
+- `gate`
+- `up`
+- `out`
+
+The `shape[]` convention remains identical to `MLP_GATE_UP_F32`:
+
+- `{out_cols, cols, rows, 0}`
+
+so callers share the same structural dimension layout, but the packet
+key remains distinct because `sublayer` differs.
+
+The packet arena is smaller than the earlier 4-region packet:
+
+- frame header
+- gate MATMUL ctx
+- up MATMUL ctx
+- fused SWIGLU ctx
+
+Total: 136 B, 8-byte aligned.
+
+`ggml_hpx_compile_packet` gained a third packet branch for
+`MLP_GLU_F32`:
+
+1. gate MATMUL
+2. up MATMUL
+3. fused SWIGLU
+
+The validator mirrors `validate_mlp_gate_up_group`, but for the fused
+3-region shape:
+
+- region kinds:
+  - MATMUL
+  - MATMUL
+  - ELEMENTWISE
+- run-range callbacks:
+  - `mul_mat`
+  - `mul_mat`
+  - `swiglu`
+- work ranges:
+  - `[0, out_cols)`
+  - `[0, out_cols)`
+  - `[0, out_cols * rows)`
+- deps:
+  - `0 -> 2`
+  - `1 -> 2`
+
+As with the earlier packet, resources remain zero-sized outside
+`n_lanes`: no reduction buffer, no lane scratch, no shared scratch.
+
+A narrow packet test then proved the GLU packet surface in isolation.
+The test mirrors the earlier `MLP_GATE_UP_F32` packet test, but builds
+the fused ggml subgraph via `ggml_swiglu_split(gate, up)` and binds
+through the new six-pointer structure. It asserts:
+
+1. compile + bind + run matches the scalar reference
+2. wrong key shape is rejected
+3. malformed-group and wrong-sublayer cases are rejected
+
+All three tests passed.
+
+The wrong-sublayer case was intentionally made adversarial by using the
+sibling `MLP_GATE_UP_F32` sublayer as the mismatched key rather than
+something obviously unrelated like RMS_NORM. That matters because the
+two MLP packet families share the same `shape[]` convention; the test
+therefore exercises the per-sublayer validator dispatch path directly.
+
+### Interim state at this pause point
+
+At the end of Item 4, B.1 had completed the packetization groundwork
+needed to match the real llama GLU-fused MLP shape:
+
+- fused `SWIGLU_F32` primitive
+- `GGML_OP_GLU[SWIGLU]` lowering
+- GLU-aware composer
+- `MLP_GLU_F32` packet sublayer with compile/bind/run support
+- narrow tests for primitive, lowering, and packetization all green
+
+What remained after this pause point was not packet construction, but
+integration:
+
+1. selective matcher/cache/env integration for the new GLU-fused
+   sublayer
+2. `llama_context` wiring for the second packet cache
+3. real F32-dequant llama smoke with `packet_matches > 0`
+
+In other words, by the end of Item 4, B.1 had already solved the
+**representation problem** — the real llama MLP shape could now be
+expressed and packetized at the HPX layer — but had not yet reconnected
+that new packet family back into the selective llama path.
+
+### Item 5 — selective matcher/cache/env integration for the GLU path
+
+Item 5 closed the integration gap on the executor side.
+
+A second prescan pass `prescan_mlp_glu_matches` was added, structurally
+symmetric to the gate/up scan: walk `gf->nodes`; on each
+`GGML_OP_GLU` with `GGML_GLU_OP_SWIGLU`, require both `src[0]` and
+`src[1]` to be `GGML_OP_MUL_MAT` appearing earlier in the node order,
+with a shared-x check between the two matrix multiplies. Overlap guard
+and `consumed[]` discipline mirror the 4-node scan exactly. Only three
+node indices are claimed per match (gate, up, glu-trigger) instead of
+four.
+
+A second cache type `ggml_hpx_mlp_glu_packet_cache` was added alongside
+the gate/up cache. Both caches are owned by the same `llama_context`
+lazy-creation block, and both key on `(out_cols, cols, rows)`, but they
+remain separate types because the packet plan key carries a different
+`sublayer` discriminator and a different per-shape policy_version
+space.
+
+The dispatch site in `ggml_hpx_exec_graph_selective_mul_mat` gained
+three optional parameters (`packet_rt`, `mlp_cache`, `mlp_glu_cache`).
+Null triple → legacy selective behavior. All three non-null → both
+matchers pre-scan the graph and claim disjoint node sets; the main
+loop treats a node as a GLU trigger, a gate/up trigger, a non-trigger
+claimed member, or a normal lowered/fallback node, in that priority.
+The execution order constraint is that `GLU` trigger dispatch must
+retire gate and up results before firing — this matches the fine-region
+dependency edges `0 -> 2, 1 -> 2` already enforced by the packet's
+region DAG.
+
+A narrow selective GLU isolation test was added to cover the integrated
+path end-to-end (pattern recognition → compile → bind → dispatch)
+without llama involvement, plus a regression test to confirm the
+gate/up packet still fires on synthetic 4-node graphs where GLU is
+absent.
+
+### Item 6 — `llama_context` wiring and first F32-dequant smoke
+
+Item 6 wired the new GLU cache through `llama_context` and ran the
+first real-llama smoke.
+
+The context-side env gate (`LLAMA_HPX_SELECTIVE_MLP_PACKET=1`) was
+extended so that on first decode-eligible graph_compute the context
+lazily creates one packet runtime plus **both** packet caches together.
+If any of the three allocations fail, all partial state is destroyed
+and the call falls back to packet-off, preserving the all-or-nothing
+rule from v1. Prefill graphs continue to pass a null packet-argument
+triple to the selective entry point, because both caches are compiled
+for `team = DECODE` and `rows = 1`.
+
+The 2026-04-18 smoke on TinyLlama F32 (dequantized from Q4_K_M), with
+`-ngl 0 -n 16 "Hello"`, reported:
+
+- `packet=22(66 nodes)` per decode graph — 22 transformer layers, each
+  contributing `MUL_MAT(gate) + MUL_MAT(up) + GLU[SWIGLU]`
+- `lowered=156` (down from the PACKET=0 baseline's 222)
+- `fallback=467` unchanged
+- the gate/up matcher did **not** fire — on real llama graphs, the
+  SWIGLU fusion subsumes the older 4-node pattern entirely
+
+This confirmed activation, but the initial speedup reading from that
+smoke (2.0× decode, 3.9× prefill) was later shown to be largely a
+measurement artifact.
+
+### Warmup-cliff investigation and honest B.1 speedup
+
+The 2026-04-18 smoke had noted an "HPX packet warmup cliff": per-token
+`packet_ms` started high on the first decode tokens (225 ms on token
+0, declining toward ~60 ms steady state) and the PACKET=0 comparator
+appeared to suffer a thermal cliff on long F32 decode. Before scoping
+B.2, the cliff was investigated directly.
+
+### Hypotheses from code trace
+
+Four candidate sources of one-time-per-process cost were identified by
+reading the dispatch path end-to-end:
+
+1. **Lazy packet-runtime init** on the first eligible decode token
+   (`llama_context::graph_compute`), which constructs the scheduler
+   and decode executor with processing-units pinning.
+2. **First-shape packet compile** in `lookup_or_compile_mlp_glu`,
+   including `ggml_hpx_compile_packet` + aligned frame allocation.
+   TinyLlama has one MLP shape, so at most one compile per process.
+3. **HPX runtime first-task cost**: cold TLB, NUMA first-touch,
+   worker wake-up on the first `hpx::async` / first LANE_FANOUT
+   `for_loop` on the decode executor.
+4. **CPU-level warmup**: page faults on F32 weight matrices, cold L2/L3,
+   DVFS ramp-up.
+
+### Measurement protocol established during the investigation
+
+The first retry of the smoke produced packet_ms values of 1100–3200 ms
+and lowered_ms values varying 6× on identical work. A `ps` check
+identified a stray `build-hpx-cpu/bin/llama-bench` consuming ~98% CPU;
+after it was killed, a follow-up also surfaced `mds_stores` (Spotlight
+indexing rebuilt binaries) at 56% CPU. Waiting out both produced a
+quiet-machine run.
+
+A rebuild at clean commit `26578ce22` (working tree stashed) was also
+made to separate code drift from machine drift. That clean-commit run
+produced stable lowered_ms in the 94–202 ms range but did not fire the
+GLU matcher at all, confirming that the GLU packet path lives only in
+the working-tree Items 5–6 changes. Code drift was ruled out as the
+source of the earlier wild numbers.
+
+### Quiet-machine Exp 1 v2 — no cliff at all
+
+Rerunning the Apr 18 invocation exactly, on a verified-quiet machine
+with working tree restored, produced per-token `packet_ms`:
+
+- first three tokens: 39.4 / 40.3 / 38.4 ms
+- last three tokens: 43.5 / 35.4 / 40.1 ms
+- n=15, mean = 41.4 ms, stdev = 3.2 ms (8% of mean)
+
+Token 0 is already at steady state. There is no monotonic decay.
+The "warmup cliff" described in the Apr 18 smoke was a consequence of
+CPU contention and thermal state, not a property of the HPX packet
+path.
+
+### Compile cost measured directly
+
+An env-gated stderr log was added at both compile sites (`matcher=glu`
+at `lookup_or_compile_mlp_glu` and `matcher=gate_up` at
+`lookup_or_compile_mlp`), activated by
+`LLAMA_HPX_PACKET_COMPILE_LOG=1`, with a cached one-shot `getenv`
+read. Exactly one line fires per process on real TinyLlama:
+
+```
+[hpx-packet-compile] matcher=glu out_cols=5632 cols=2048 rows=1 compile_ns=1083
+```
+
+**1083 ns ≈ 1 µs.** Four orders of magnitude below the 42 ms first-token
+dispatch cost. Compile is not a hidden warmup source. The `matcher=gate_up`
+line never fires on real llama, matching the Item 5/6 finding that GLU
+fusion subsumes the old 4-node pattern.
+
+### Honest PACKET=0 vs PACKET=1 comparison on a quiet machine
+
+Same binary, same invocation, back-to-back on the verified-quiet machine:
+
+| bucket            | PACKET=0       | PACKET=1       | delta     |
+|-------------------|---------------:|---------------:|----------:|
+| `lowered_ms`      | 213.4 ± 57.2   | 144.2 ± 47.8   | −69.2 ms  |
+| `fallback_ms`     |  33.5 ± 14.9   |  34.0 ± 16.3   |  +0.5 ms  |
+| `packet_ms`       |   0            |  41.4 ± 3.2    | +41.4 ms  |
+| **total**         | 246.9 ± 58.9   | 219.6 ± 55.6   | −27.3 ms  |
+
+Eval throughput: 4.05 → 4.55 tok/s. **Honest B.1 decode speedup
+on CPU-only F32 TinyLlama: 1.12× (≈11%).**
+
+The arithmetic closes: moving 66 nodes out of `lowered` costs the
+packet bucket 41.4 ms and saves 69.2 ms in lowered work, net 27.8 ms
+saved per token, matching the observed 27.3 ms total delta within
+rounding.
+
+### Why the Apr 18 "2×" was inflated
+
+PACKET=0 has 66 more nodes flowing through the generic lowered path,
+which is more sensitive to thread contention and scheduler jitter than
+the frozen packet. On a contested machine, PACKET=0 suffers
+disproportionately, enlarging the apparent PACKET=1 advantage. On a
+quiet machine the gap shrinks from 2× to 1.12×.
+
+### Outcome of this investigation
+
+- The GLU packet path is real, correct, and fires as intended on real
+  llama decode (22 matches per graph, 66 nodes reclaimed).
+- The honest decode win on CPU-only F32 TinyLlama is ~12%, not 2×.
+- No warmup cliff exists on a quiet machine; compile cost is
+  negligible (~1 µs).
+- A fair-comparison protocol was captured in `CLAUDE.local.md` for
+  future HPX decode benchmarks: quiet-machine check, single rebuild,
+  back-to-back runs with alternating arm order, per-bucket mean ±
+  stdev reporting, arithmetic cross-check, no cross-machine
+  comparisons.
+- Instrumentation left behind: `LLAMA_HPX_PACKET_COMPILE_LOG` env gate
+  at both compile sites, zero overhead when unset. Reference run
+  directories: `hpx-bench/results/2026-04-20-packet-warmup-trace-v2/`,
+  `2026-04-20-packet-baseline-quiet/`, `2026-04-20-compile-log/`.
+
+With this, B.1 closes as an integration + honest speedup milestone,
+and the remaining challenge — making the packet path useful on
+realistic quantized models — remains scoped to B.2.
+

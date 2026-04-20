@@ -9,6 +9,7 @@
 //   GGML_OP_MUL                           → 1-region ELEMENTWISE
 //   GGML_OP_MUL_MAT                       → 1-region MATMUL
 //   GGML_OP_RMS_NORM (ne[1]==1 only)      → 3-region DAG (partial/finalize/apply)
+//   GGML_OP_GLU / GGML_GLU_OP_SWIGLU      → 1-region ELEMENTWISE (fused SwiGLU)
 
 #ifndef GGML_HPX_REGION_DAG
 #  error "ggml-hpx-lower.cpp requires -DGGML_HPX_REGION_DAG"
@@ -35,6 +36,8 @@ static_assert(sizeof(ggml_hpx_silu_f32_ctx)             <= GGML_HPX_LOWERING_CTX
     "ggml_hpx_silu_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_mul_f32_ctx)              <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
     "ggml_hpx_mul_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
+static_assert(sizeof(ggml_hpx_swiglu_f32_ctx)           <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
+    "ggml_hpx_swiglu_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_rms_norm_partial_f32_ctx) <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
     "ggml_hpx_rms_norm_partial_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_rms_norm_finalize_f32_ctx)<= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
@@ -137,6 +140,43 @@ bool ggml_hpx_lower_op(
             0, n, 0,
             out->ctx_buf[0],
             ggml_hpx_mul_f32_run_range,
+        };
+        out->group.n_regions = 1;
+        return true;
+    }
+
+    // ── GLU[SWIGLU] (fused SiLU(gate) * up) ───────────────────────────────
+    //
+    // ggml emits this as a single GGML_OP_GLU node with subop SWIGLU when the
+    // MLP is built via ggml_swiglu_split (src/llama-graph.cpp:1074).  v1's
+    // matcher expects three nodes (SiLU, MUL_MAT, MUL) and therefore does
+    // not fire on real llama graphs.  B.1 lowers the fused op into a single
+    // ELEMENTWISE region backed by the SWIGLU_F32 kernel.
+    case GGML_OP_GLU:
+    {
+        if (ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU) return false;
+
+        const ggml_tensor * gate = node->src[0];
+        const ggml_tensor * up   = node->src[1];
+        if (!gate || !up || !gate->data || !up->data || !node->data) return false;
+        if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32)  return false;
+
+        const int64_t n = ggml_nelements(node);
+        if (ggml_nelements(gate) != n || ggml_nelements(up) != n) return false;
+        if (!is_contiguous_f32(gate) || !is_contiguous_f32(up) || !is_contiguous_f32(node))
+            return false;
+
+        ::new (out->ctx_buf[0]) ggml_hpx_swiglu_f32_ctx{
+            static_cast<const float *>(gate->data),
+            static_cast<const float *>(up  ->data),
+            static_cast<float *>(node->data),
+            n,
+        };
+        out->regions[0] = {
+            GGML_HPX_CPU_REGION_KIND_ELEMENTWISE,
+            0, n, 0,
+            out->ctx_buf[0],
+            ggml_hpx_swiglu_f32_run_range,
         };
         out->group.n_regions = 1;
         return true;

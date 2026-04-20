@@ -39,8 +39,10 @@
 // Opaque forward-declarations. Full definitions live in:
 //   ggml_hpx_packet_runtime           — ggml-hpx-packet.h
 //   ggml_hpx_mlp_gate_up_packet_cache — this TU's .cpp (internal)
+//   ggml_hpx_mlp_glu_packet_cache     — this TU's .cpp (internal)
 struct ggml_hpx_packet_runtime;
 struct ggml_hpx_mlp_gate_up_packet_cache;
+struct ggml_hpx_mlp_glu_packet_cache;
 
 // Per-call counters filled by ggml_hpx_exec_graph_selective_mul_mat.
 // Times are in nanoseconds.
@@ -55,7 +57,7 @@ struct ggml_hpx_selective_stats {
     uint32_t fallback_nodes     = 0; // nodes through the CPU-backend fallback
     uint32_t packet_matches     = 0; // repeated sublayer patterns dispatched
     uint32_t packet_nodes       = 0; // ggml nodes consumed by packet matches
-                                     //   (MLP gate/up: 4 * packet_matches)
+                                     //   (MLP gate/up: 4 per match; MLP GLU: 3 per match)
     uint64_t lowered_ns         = 0; // wall time for all lowered dispatches
     uint64_t fallback_ns        = 0; // wall time for all fallback dispatches
     uint64_t packet_dispatch_ns = 0; // bind + run time across packet matches
@@ -93,52 +95,79 @@ void ggml_hpx_mlp_gate_up_packet_cache_destroy(
     ggml_hpx_mlp_gate_up_packet_cache * cache);
 
 // ---------------------------------------------------------------------------
+// MLP GLU (SWIGLU) packet cache
+// ---------------------------------------------------------------------------
+//
+// Plan store for the fused-SWIGLU sublayer. Real llama MLPs emit
+// GGML_OP_GLU with subop SWIGLU — a single node that fuses the separate
+// SiLU + elementwise MUL of the gate/up form. This cache is the GLU
+// counterpart to ggml_hpx_mlp_gate_up_packet_cache.
+//
+// Ownership, layering, and n_lanes / seq_regime / policy_version semantics
+// are identical to the gate/up cache above. The current compiler policy
+// for MLP_GLU_F32 is policy_version = 1; bump if lowering rules change.
+ggml_hpx_mlp_glu_packet_cache * ggml_hpx_mlp_glu_packet_cache_create(
+    uint32_t n_lanes,
+    uint32_t seq_regime,
+    uint32_t policy_version);
+
+void ggml_hpx_mlp_glu_packet_cache_destroy(
+    ggml_hpx_mlp_glu_packet_cache * cache);
+
+// ---------------------------------------------------------------------------
+// Packet env — bundles runtime + all sublayer caches
+// ---------------------------------------------------------------------------
+//
+// Passed as a single optional pointer to the selective entry point. Pass
+// nullptr to disable all packet dispatch (identical to the pre-packet path).
+// Individual cache fields may be null to disable that sublayer's packet path
+// while leaving the other enabled; rt must be non-null whenever any cache
+// field is non-null.
+//
+// Caller owns all three pointers; lifetimes must exceed every call that
+// receives this env.
+struct ggml_hpx_selective_packet_env
+{
+    ggml_hpx_packet_runtime *             rt;           // shared execution substrate
+    ggml_hpx_mlp_gate_up_packet_cache *   mlp_cache;    // null → gate/up path disabled
+    ggml_hpx_mlp_glu_packet_cache *       mlp_glu_cache; // null → GLU path disabled
+};
+
+// ---------------------------------------------------------------------------
 // Selective graph executor
 // ---------------------------------------------------------------------------
 //
-// Walks gf->nodes[0..n_nodes). When packet dispatch is enabled, a pre-scan
-// recognizes repeated sublayer patterns and marks their nodes for packet
-// dispatch. Then, for each node in order:
+// Walks gf->nodes[0..n_nodes). When packet dispatch is enabled via
+// packet_env, two pre-scans run (gate/up first, GLU second) over a shared
+// consumed[] bitmap, then the main loop dispatches in node order:
 //
-//   - packet-marked                  -> dispatched as part of its packet
-//                                       match at the final node of the
-//                                       pattern; other pattern nodes skip
+//   - gate/up final MUL    -> bind + run MLP_GATE_UP_F32 frozen packet
+//   - GLU final node       -> bind + run MLP_GLU_F32    frozen packet
+//   - other consumed node  -> skip (non-trigger packet member)
 //   - ggml_hpx_lower_op succeeds     -> ggml_hpx_run_region_group
-//   - ggml_hpx_lower_op returns false -> ggml_backend_graph_compute on a
-//                                        1-node ggml_graph_view via cpu_be
+//   - ggml_hpx_lower_op returns false -> ggml_backend_graph_compute via cpu_be
 //
-// cpu_be must be a live CPU backend owned by the caller (e.g. the
-// llama_context::backend_cpu that already participates in the scheduler).
-// The caller retains ownership; this function does not free it.
+// cpu_be must be a live CPU backend owned by the caller. The caller retains
+// ownership; this function does not free it.
 //
-// n_lanes controls the fine-region fan-out for the lowered path only.
-// Pass 0 (or omit) to use hpx::get_num_worker_threads() at call time.
-// Pass a positive integer to fix the lane count explicitly (useful in
-// tests for reproducibility). This is independent of the packet runtime's
-// n_lanes.
+// n_lanes controls fine-region fan-out for the lowered path only. Pass 0
+// to use hpx::get_num_worker_threads() at call time; pass > 0 to fix the
+// lane count (useful in tests). Independent of packet_env->rt's n_lanes.
 //
 // stats_out, if non-null, is filled with per-call counters.
 //
-// packet_rt and mlp_cache are optional and must be supplied together.
-// Exactly one of these conditions holds on entry:
-//   (a) both null     -> packet dispatch is disabled; behaviour is
-//                        identical to a pure selective call
-//   (b) both non-null -> packet dispatch is enabled for MLP gate/up
-//   (c) exactly one   -> debug-asserts; release treats as (a)
-//
-// Decode-only gating is a caller responsibility: pass null packet args on
-// prefill ubatches. The packet runtime is team=DECODE only, so non-null
-// packet args on a prefill graph is unsupported in v1.
+// packet_env is optional. Pass nullptr to disable all packet dispatch.
+// Decode-only gating is a caller responsibility: pass nullptr on prefill
+// ubatches. The packet runtime is team=DECODE only.
 //
 // Requires the HPX runtime to be started (ggml_hpx_tpool_start()).
 // Returns true if all nodes complete without error.
 bool ggml_hpx_exec_graph_selective_mul_mat(
-    ggml_cgraph *                         gf,
-    ggml_backend_t                        cpu_be,
-    int                                   n_lanes    = 0,
-    ggml_hpx_selective_stats *            stats_out  = nullptr,
-    ggml_hpx_packet_runtime *             packet_rt  = nullptr,
-    ggml_hpx_mlp_gate_up_packet_cache *   mlp_cache  = nullptr);
+    ggml_cgraph *                              gf,
+    ggml_backend_t                             cpu_be,
+    int                                        n_lanes    = 0,
+    ggml_hpx_selective_stats *                 stats_out  = nullptr,
+    const ggml_hpx_selective_packet_env *      packet_env = nullptr);
 
 // Convenience wrapper for arena-style unit tests (ggml_init with no_alloc=false).
 // Creates a fresh CPU backend internally, runs the graph, then frees the backend.
@@ -156,14 +185,17 @@ bool ggml_hpx_exec_graph_selective_mul_mat_arena(
 // Test-only instrumentation — compiled in only when
 // GGML_HPX_EXEC_SELECTIVE_TESTING is defined.
 //
-// g_hpx_selective_lowered_count    — ++ when ggml_hpx_lower_op succeeds
-//                                    for a graph node (lowered path)
-// g_hpx_selective_executed_count   — ++ when the fine-region group for a
-//                                    lowered node is dispatched
-// g_hpx_mlp_packet_compile_count   — ++ on every MLP gate/up cache miss
-//                                    (compose + compile path)
-// g_hpx_mlp_packet_dispatch_count  — ++ on every MLP gate/up packet
-//                                    dispatch (miss + hit alike)
+// g_hpx_selective_lowered_count        — ++ when ggml_hpx_lower_op succeeds
+//                                        for a graph node (lowered path)
+// g_hpx_selective_executed_count       — ++ when the fine-region group for a
+//                                        lowered node is dispatched
+// g_hpx_mlp_packet_compile_count       — ++ on every MLP gate/up cache miss
+//                                        (compose + compile path)
+// g_hpx_mlp_packet_dispatch_count      — ++ on every MLP gate/up packet
+//                                        dispatch (miss + hit alike)
+// g_hpx_mlp_glu_packet_compile_count   — ++ on every MLP GLU cache miss
+// g_hpx_mlp_glu_packet_dispatch_count  — ++ on every MLP GLU packet
+//                                        dispatch (miss + hit alike)
 //
 // Reset to 0 before each test that checks them.
 // ---------------------------------------------------------------------------
@@ -173,6 +205,8 @@ extern std::atomic<int> g_hpx_selective_lowered_count;
 extern std::atomic<int> g_hpx_selective_executed_count;
 extern std::atomic<int> g_hpx_mlp_packet_compile_count;
 extern std::atomic<int> g_hpx_mlp_packet_dispatch_count;
+extern std::atomic<int> g_hpx_mlp_glu_packet_compile_count;
+extern std::atomic<int> g_hpx_mlp_glu_packet_dispatch_count;
 #endif
 
 #endif // GGML_HPX_REGION_DAG

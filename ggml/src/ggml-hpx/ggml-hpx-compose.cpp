@@ -75,3 +75,67 @@ bool ggml_hpx_compose_mlp_gate_up_group(
     grp->group.n_deps    = GGML_HPX_MLP_GATE_UP_N_DEPS;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// ggml_hpx_compose_mlp_glu_group
+// ---------------------------------------------------------------------------
+
+namespace {
+enum {
+    GLU_IDX_GATE = 0,
+    GLU_IDX_UP   = 1,
+    GLU_IDX_GLU  = 2,
+};
+}    // namespace
+
+bool ggml_hpx_compose_mlp_glu_group(
+    const ggml_tensor *       node_gate,
+    const ggml_tensor *       node_up,
+    const ggml_tensor *       node_glu,
+    ggml_hpx_mlp_glu_group *  grp)
+{
+    if (!grp) return false;
+
+    grp->group.n_regions = 0;
+    grp->group.n_deps    = 0;
+    grp->group.regions   = grp->combined_regions;
+    grp->group.deps      = grp->combined_deps;
+
+    if (!node_gate || !node_up || !node_glu) return false;
+
+    // ── Op-kind checks ────────────────────────────────────────────────────────
+    if (node_gate->op != GGML_OP_MUL_MAT) return false;
+    if (node_up->op   != GGML_OP_MUL_MAT) return false;
+    if (node_glu->op  != GGML_OP_GLU
+        || ggml_get_glu_op(node_glu) != GGML_GLU_OP_SWIGLU) return false;
+
+    // ── Topology checks ───────────────────────────────────────────────────────
+    // Operand order is strict: src[0]=gate, src[1]=up.  A reversed pairing is
+    // rejected even though SiLU(gate)*up == SiLU(up)*gate only by coincidence;
+    // callers must supply nodes in the canonical order.
+    if (node_glu->src[0] != node_gate) return false;
+    if (node_glu->src[1] != node_up)   return false;
+
+    // ── Lower each op ─────────────────────────────────────────────────────────
+    const ggml_tensor * nodes[GGML_HPX_MLP_GLU_N_OPS] = {
+        node_gate, node_up, node_glu,
+    };
+
+    for (int i = 0; i < GGML_HPX_MLP_GLU_N_OPS; ++i)
+    {
+        if (!ggml_hpx_lower_op(nodes[i], &grp->lowers[i])) return false;
+        if (grp->lowers[i].group.n_regions != 1) return false;
+        if (grp->lowers[i].group.n_deps    != 0) return false;
+        grp->combined_regions[i] = grp->lowers[i].regions[0];
+    }
+
+    // ── Cross-op dep edges (global combined_regions[] indices) ────────────────
+    //   GLU_IDX_GATE → GLU_IDX_GLU   (gate feeds SWIGLU)
+    //   GLU_IDX_UP   → GLU_IDX_GLU   (up   feeds SWIGLU)
+    grp->combined_deps[0] = {GLU_IDX_GATE, GLU_IDX_GLU};
+    grp->combined_deps[1] = {GLU_IDX_UP,   GLU_IDX_GLU};
+
+    grp->group.n_regions = GGML_HPX_MLP_GLU_N_REGIONS;
+    grp->group.n_deps    = GGML_HPX_MLP_GLU_N_DEPS;
+    return true;
+}

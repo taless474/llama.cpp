@@ -4,7 +4,7 @@
 
 1. README_HPX.md
 2. docs/HPX_EXECUTOR_CONTRACT.md
-3. docs/HPX_PROVENANCE.md (optional, historical only, only read if needed)
+3. docs/HPX_PROVENANCE.md (optional, historical only, only read if needed and start from the last section)
 
 ### Core principles
 

@@ -196,6 +196,7 @@ typedef enum ggml_hpx_packet_sublayer
     GGML_HPX_PACKET_SUBLAYER_INVALID         = 0,
     GGML_HPX_PACKET_SUBLAYER_RMS_NORM_F32    = 1,    // 3-region: partial / finalize / apply
     GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_F32 = 2,    // 4-region: gate MUL_MAT / up MUL_MAT / SiLU / MUL
+    GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32     = 3,    // 3-region: gate MUL_MAT / up MUL_MAT / fused SWIGLU
     // future: ATTENTION_QKV, ...
 
     GGML_HPX_PACKET_SUBLAYER_CUSTOM_BASE     = 1 << 16,
@@ -547,6 +548,60 @@ typedef struct ggml_hpx_mlp_gate_up_binding
 void ggml_hpx_bind_mlp_gate_up_packet(
     struct ggml_hpx_packet_frame *           frame,
     const ggml_hpx_mlp_gate_up_binding *     binding);
+
+// ---------------------------------------------------------------------------
+// Typed binding — MLP_GLU_F32
+// ---------------------------------------------------------------------------
+//
+// One binding struct for
+//   key.sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32.
+//
+// This is the fused-SWIGLU counterpart to MLP_GATE_UP_F32. Real llama MLPs
+// emit GGML_OP_GLU with subop SWIGLU (via ggml_swiglu_split), collapsing the
+// separate SiLU + elementwise MUL of the gate/up form into one region. The
+// compiled packet therefore has 3 steps, not 4, and the binding has 6
+// pointers, not 7 (there is no separate gate_act buffer — the SWIGLU kernel
+// reads `gate` directly as its SiLU source).
+//
+// Shape convention (must match key.shape[] used at compile time), identical
+// to MLP_GATE_UP_F32:
+//   shape[0] = out_cols  — output columns; work range for the two MUL_MAT regions
+//   shape[1] = cols      — shared (reduction) dimension
+//   shape[2] = rows      — batch dimension
+//   shape[3] = 0         — unused
+//
+// Fields (per-invocation data pointers only — dimensions are structural,
+// baked into the packet at compile time, and must NOT be re-patched per call):
+//
+//   w_gate : [out_cols × cols]  gate weight matrix   (read-only)
+//   w_up   : [out_cols × cols]  up weight matrix     (read-only)
+//   x      : [rows × cols]      input activations    (read-only)
+//   gate   : [rows × out_cols]  gate MUL_MAT output  (write; also SWIGLU gate input)
+//   up     : [rows × out_cols]  up   MUL_MAT output  (write; also SWIGLU up input)
+//   out    : [rows × out_cols]  fused SWIGLU output  (write; may alias gate or up
+//                                                    per the SWIGLU kernel contract)
+//
+// Hard preconditions (debug-asserted; undefined behaviour if violated):
+//   - frame must have been frame_init'd against a packet with
+//     key.sublayer == MLP_GLU_F32.
+//   - All six pointers must be non-null and validly sized.
+//   - gate and up must not alias each other (the two MUL_MAT regions write
+//     them independently and SWIGLU reads both). `out` may alias either per
+//     the SWIGLU kernel's aliasing contract, but the caller owns that choice.
+
+typedef struct ggml_hpx_mlp_glu_binding
+{
+    const float *  w_gate;    // gate weight matrix    [out_cols × cols]
+    const float *  w_up;      // up weight matrix      [out_cols × cols]
+    const float *  x;         // input activations     [rows × cols]
+    float *        gate;      // gate MUL_MAT output   [rows × out_cols]
+    float *        up;        // up   MUL_MAT output   [rows × out_cols]
+    float *        out;       // fused SWIGLU output   [rows × out_cols]
+} ggml_hpx_mlp_glu_binding;
+
+void ggml_hpx_bind_mlp_glu_packet(
+    struct ggml_hpx_packet_frame *      frame,
+    const ggml_hpx_mlp_glu_binding *    binding);
 
 #ifdef __cplusplus
 }    // extern "C"

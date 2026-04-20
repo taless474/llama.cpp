@@ -425,6 +425,10 @@ llama_context::~llama_context() {
     // Both null until the first eligible decode-side graph_compute; safe
     // to call destroy with null is not guaranteed by the packet API, so
     // guard explicitly.
+    if (hpx_mlp_glu_cache != nullptr) {
+        ggml_hpx_mlp_glu_packet_cache_destroy(hpx_mlp_glu_cache);
+        hpx_mlp_glu_cache = nullptr;
+    }
     if (hpx_mlp_gate_up_cache != nullptr) {
         ggml_hpx_mlp_gate_up_packet_cache_destroy(hpx_mlp_gate_up_cache);
         hpx_mlp_gate_up_cache = nullptr;
@@ -2327,7 +2331,8 @@ ggml_status llama_context::graph_compute(
                 // off behaviour cleanly instead of half-enabling the path.
                 if (packet_eligible
                     && hpx_packet_runtime    == nullptr
-                    && hpx_mlp_gate_up_cache == nullptr) {
+                    && hpx_mlp_gate_up_cache == nullptr
+                    && hpx_mlp_glu_cache     == nullptr) {
                     constexpr uint32_t n_lanes        = 1;
                     constexpr uint32_t seq_regime     = 0;
                     constexpr uint32_t policy_version = 1;
@@ -2339,14 +2344,23 @@ ggml_status llama_context::graph_compute(
                         ? ggml_hpx_mlp_gate_up_packet_cache_create(
                               n_lanes, seq_regime, policy_version)
                         : nullptr;
+                    ggml_hpx_mlp_glu_packet_cache * glu_cache_new =
+                        cache_new
+                        ? ggml_hpx_mlp_glu_packet_cache_create(
+                              n_lanes, seq_regime, policy_version)
+                        : nullptr;
 
-                    if (rt_new && cache_new) {
+                    if (rt_new && cache_new && glu_cache_new) {
                         hpx_packet_runtime    = rt_new;
                         hpx_mlp_gate_up_cache = cache_new;
+                        hpx_mlp_glu_cache     = glu_cache_new;
                         LLAMA_LOG_INFO(
-                            "%s: HPX MLP gate/up packet dispatch ready"
-                            " (n_lanes=%u)\n", __func__, n_lanes);
+                            "%s: HPX MLP packet dispatch ready"
+                            " (gate/up + GLU, n_lanes=%u)\n", __func__, n_lanes);
                     } else {
+                        if (glu_cache_new) {
+                            ggml_hpx_mlp_glu_packet_cache_destroy(glu_cache_new);
+                        }
                         if (cache_new) {
                             ggml_hpx_mlp_gate_up_packet_cache_destroy(cache_new);
                         }
@@ -2358,12 +2372,18 @@ ggml_status llama_context::graph_compute(
 
                 const bool packet_active = packet_eligible
                     && hpx_packet_runtime    != nullptr
-                    && hpx_mlp_gate_up_cache != nullptr;
+                    && hpx_mlp_gate_up_cache != nullptr
+                    && hpx_mlp_glu_cache     != nullptr;
+
+                // Bundle the runtime + sublayer caches into an env struct.
+                ggml_hpx_selective_packet_env penv{};
+                penv.rt            = packet_active ? hpx_packet_runtime    : nullptr;
+                penv.mlp_cache     = packet_active ? hpx_mlp_gate_up_cache : nullptr;
+                penv.mlp_glu_cache = packet_active ? hpx_mlp_glu_cache     : nullptr;
 
                 const bool ok = ggml_hpx_exec_graph_selective_mul_mat(
                     gf, backend_cpu, 0, &hpx_selective_last_stats,
-                    packet_active ? hpx_packet_runtime    : nullptr,
-                    packet_active ? hpx_mlp_gate_up_cache : nullptr);
+                    packet_active ? &penv : nullptr);
                 if (hpx_selective_stats_print) {
                     LLAMA_LOG_INFO(
                         "[hpx-selective] lowered=%u fallback=%u"

@@ -152,6 +152,41 @@ constexpr size_t kMlpEwMulAOff   = offsetof(ggml_hpx_mul_f32_ctx, a);
 constexpr size_t kMlpEwMulBOff   = offsetof(ggml_hpx_mul_f32_ctx, b);
 constexpr size_t kMlpEwMulDstOff = offsetof(ggml_hpx_mul_f32_ctx, dst);
 
+// ---------------------------------------------------------------------------
+// MLP_GLU_F32 arena layout
+// ---------------------------------------------------------------------------
+//
+// Fused-SWIGLU counterpart to MLP_GATE_UP_F32. Three ctx structs laid out
+// sequentially after the frame header:
+//
+//   frame base + 0    : ggml_hpx_packet_frame header (back-pointer, 8 B)
+//   frame base + 8    : gate MUL_MAT ctx   { x*; w*; y*; rows; cols; out_cols } (48 B)
+//   frame base + 56   : up   MUL_MAT ctx   { x*; w*; y*; rows; cols; out_cols } (48 B)
+//   frame base + 104  : SWIGLU ctx         { gate*; up*; dst*; n }              (32 B)
+//   total frame size  : 136 B, 8-byte aligned
+//
+// Dimensions are baked at compile time; pointer fields are zeroed in the
+// template and patched per-invocation by ggml_hpx_bind_mlp_glu_packet.
+
+constexpr size_t kGluFrameHeaderSize = 8;
+
+constexpr size_t kGluGateCtxSize   = sizeof(ggml_hpx_mul_mat_f32_ctx);    // 48
+constexpr size_t kGluUpCtxSize     = sizeof(ggml_hpx_mul_mat_f32_ctx);    // 48
+constexpr size_t kGluSwigluCtxSize = sizeof(ggml_hpx_swiglu_f32_ctx);     // 32
+
+constexpr size_t kGluGateCtxOff   = kGluFrameHeaderSize;
+constexpr size_t kGluUpCtxOff     = kGluGateCtxOff   + kGluGateCtxSize;
+constexpr size_t kGluSwigluCtxOff = kGluUpCtxOff     + kGluUpCtxSize;
+constexpr size_t kGluFrameBytes   = kGluSwigluCtxOff + kGluSwigluCtxSize;
+constexpr size_t kGluFrameAlign   = 8;
+
+// Field-level offsets for bind patching. MUL_MAT offsets are reused from the
+// MLP_GATE_UP layout above (kMlpMulMatX/W/YOff) since the ctx struct is the
+// same type; only SWIGLU is distinct.
+constexpr size_t kGluSwigluGateOff = offsetof(ggml_hpx_swiglu_f32_ctx, gate);
+constexpr size_t kGluSwigluUpOff   = offsetof(ggml_hpx_swiglu_f32_ctx, up);
+constexpr size_t kGluSwigluDstOff  = offsetof(ggml_hpx_swiglu_f32_ctx, dst);
+
 }    // namespace
 
 // ---------------------------------------------------------------------------
@@ -401,6 +436,67 @@ const char * validate_mlp_gate_up_group(
     return nullptr;
 }
 
+// Validate that `group` is a 3-region MLP_GLU_F32 DAG:
+//   regions[0]: MATMUL,      run_range = mul_mat_f32, work [0, out_cols)
+//   regions[1]: MATMUL,      run_range = mul_mat_f32, work [0, out_cols)
+//   regions[2]: ELEMENTWISE, run_range = swiglu_f32,  work [0, out_cols*rows)
+//   deps: {0→2, 1→2}
+const char * validate_mlp_glu_group(
+    const ggml_hpx_cpu_region_group * group,
+    int64_t                           out_cols,
+    int64_t                           cols,
+    int64_t                           rows)
+{
+    (void)cols;    // cols is structural identity only; not visible in region metadata
+
+    if (group == nullptr)          return "fine_group is null";
+    if (group->n_regions != 3)     return "MLP_GLU_F32 requires exactly 3 regions";
+    if (group->regions == nullptr) return "regions is null";
+
+    const int64_t n_elem = out_cols * rows;
+
+    const ggml_hpx_cpu_region & r0 = group->regions[0];
+    const ggml_hpx_cpu_region & r1 = group->regions[1];
+    const ggml_hpx_cpu_region & r2 = group->regions[2];
+
+    if (r0.kind != GGML_HPX_CPU_REGION_KIND_MATMUL)
+        return "region 0 must be MATMUL (gate MUL_MAT)";
+    if (r1.kind != GGML_HPX_CPU_REGION_KIND_MATMUL)
+        return "region 1 must be MATMUL (up MUL_MAT)";
+    if (r2.kind != GGML_HPX_CPU_REGION_KIND_ELEMENTWISE)
+        return "region 2 must be ELEMENTWISE (fused SWIGLU)";
+
+    if (r0.run_range != ggml_hpx_mul_mat_f32_run_range)
+        return "region 0 run_range must be ggml_hpx_mul_mat_f32_run_range";
+    if (r1.run_range != ggml_hpx_mul_mat_f32_run_range)
+        return "region 1 run_range must be ggml_hpx_mul_mat_f32_run_range";
+    if (r2.run_range != ggml_hpx_swiglu_f32_run_range)
+        return "region 2 run_range must be ggml_hpx_swiglu_f32_run_range";
+
+    if (r0.begin != 0 || r0.end != out_cols)
+        return "region 0 work range must be [0, out_cols)";
+    if (r1.begin != 0 || r1.end != out_cols)
+        return "region 1 work range must be [0, out_cols)";
+    if (r2.begin != 0 || r2.end != n_elem)
+        return "region 2 work range must be [0, out_cols*rows)";
+
+    if (group->n_deps != 2)     return "MLP_GLU_F32 requires exactly 2 dep edges";
+    if (group->deps == nullptr) return "deps is null";
+
+    bool saw_0_2 = false, saw_1_2 = false;
+    for (int i = 0; i < 2; ++i)
+    {
+        const ggml_hpx_dep_edge & d = group->deps[i];
+        if      (d.src == 0 && d.dst == 2) saw_0_2 = true;
+        else if (d.src == 1 && d.dst == 2) saw_1_2 = true;
+        else return "unexpected dep edge (expected {0→2, 1→2})";
+    }
+    if (!saw_0_2 || !saw_1_2)
+        return "missing required dep edge in MLP_GLU_F32 group";
+
+    return nullptr;
+}
+
 }    // namespace
 
 // ---------------------------------------------------------------------------
@@ -622,6 +718,92 @@ ggml_hpx_frozen_packet * ggml_hpx_compile_packet(
         return packet;
     }
 
+    if (key->sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32)
+    {
+        const int64_t out_cols = key->shape[0];
+        const int64_t cols     = key->shape[1];
+        const int64_t rows     = key->shape[2];
+        if (out_cols <= 0 || cols <= 0 || rows <= 0)
+            return report_err(out_err, "key.shape[0..2] must be > 0 for MLP_GLU_F32");
+
+        if (const char * msg = validate_mlp_glu_group(fine_group, out_cols, cols, rows))
+            return report_err(out_err, msg);
+
+        auto * packet = new ggml_hpx_frozen_packet{};
+        packet->key             = *key;
+        packet->n_steps         = 3;
+        packet->steps           = new PacketStep[3];
+        packet->arena_offset    = kGluFrameHeaderSize;
+        packet->arena_bytes     = kGluFrameBytes - kGluFrameHeaderSize;
+        packet->frame_bytes     = kGluFrameBytes;
+        packet->frame_alignment = kGluFrameAlign;
+
+        // MLP_GLU has no REDUCTION regions: no lane_scratch or
+        // reduction_buffer needed.
+        packet->res.n_lanes                     = key->n_lanes;
+        packet->res.lane_scratch_bytes_per_lane = 0;
+        packet->res.reduction_buffer_bytes      = 0;
+        packet->res.shared_scratch_bytes        = 0;
+
+        packet->ctx_template = std::malloc(packet->arena_bytes);
+        if (packet->ctx_template == nullptr)
+        {
+            delete[] packet->steps;
+            delete packet;
+            return report_err(out_err, "ctx_template allocation failed");
+        }
+        std::memset(packet->ctx_template, 0, packet->arena_bytes);
+
+        auto tmpl_at = [&](size_t abs_off) -> char * {
+            return static_cast<char *>(packet->ctx_template)
+                   + (abs_off - kGluFrameHeaderSize);
+        };
+
+        // Bake dimensions; data pointers stay null (patched by bind).
+        auto * gate_ctx =
+            reinterpret_cast<ggml_hpx_mul_mat_f32_ctx *>(tmpl_at(kGluGateCtxOff));
+        gate_ctx->rows     = rows;
+        gate_ctx->cols     = cols;
+        gate_ctx->out_cols = out_cols;
+
+        auto * up_ctx =
+            reinterpret_cast<ggml_hpx_mul_mat_f32_ctx *>(tmpl_at(kGluUpCtxOff));
+        up_ctx->rows     = rows;
+        up_ctx->cols     = cols;
+        up_ctx->out_cols = out_cols;
+
+        reinterpret_cast<ggml_hpx_swiglu_f32_ctx *>(tmpl_at(kGluSwigluCtxOff))->n =
+            out_cols * rows;
+
+        // All 3 regions are MATMUL or ELEMENTWISE — no REDUCTION.
+        // Steps emitted in region-index order (0,1,2), which is a valid
+        // topological ordering of the {0→2, 1→2} dep edges.
+        const bool     serial  = (key->n_lanes == 1);
+        const uint32_t kind    = serial ? kStepKindSerial : kStepKindLaneFanout;
+        const uint16_t nlanes  = static_cast<uint16_t>(serial ? 1 : key->n_lanes);
+        const int64_t  n_elem  = out_cols * rows;
+
+        packet->steps[0] = PacketStep{
+            kind, ggml_hpx_mul_mat_f32_run_range,
+            static_cast<uint32_t>(kGluGateCtxOff),
+            static_cast<uint32_t>(kGluGateCtxSize),
+            0, out_cols, nlanes, 0,
+        };
+        packet->steps[1] = PacketStep{
+            kind, ggml_hpx_mul_mat_f32_run_range,
+            static_cast<uint32_t>(kGluUpCtxOff),
+            static_cast<uint32_t>(kGluUpCtxSize),
+            0, out_cols, nlanes, 0,
+        };
+        packet->steps[2] = PacketStep{
+            kind, ggml_hpx_swiglu_f32_run_range,
+            static_cast<uint32_t>(kGluSwigluCtxOff),
+            static_cast<uint32_t>(kGluSwigluCtxSize),
+            0, n_elem, nlanes, 0,
+        };
+        return packet;
+    }
+
     return report_err(out_err, "unsupported sublayer");
 }
 
@@ -781,6 +963,50 @@ void ggml_hpx_bind_mlp_gate_up_packet(
     *reinterpret_cast<const float **>(base + kMlpEwMulCtxOff + kMlpEwMulBOff)   =
         static_cast<const float *>(binding->up);
     *reinterpret_cast<float **>      (base + kMlpEwMulCtxOff + kMlpEwMulDstOff) =
+        binding->out;
+}
+
+// ---------------------------------------------------------------------------
+// Typed bind — MLP_GLU_F32
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_bind_mlp_glu_packet(
+    ggml_hpx_packet_frame *            frame,
+    const ggml_hpx_mlp_glu_binding *   binding)
+{
+    assert(frame != nullptr);
+    assert(binding != nullptr);
+    assert(frame->packet != nullptr);
+    assert(frame->packet->key.sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32);
+    assert(binding->w_gate != nullptr);
+    assert(binding->w_up   != nullptr);
+    assert(binding->x      != nullptr);
+    assert(binding->gate   != nullptr);
+    assert(binding->up     != nullptr);
+    assert(binding->out    != nullptr);
+
+    char * const base = reinterpret_cast<char *>(frame);
+
+    // gate MUL_MAT: x = input activations, w = W_gate, y = gate output
+    *reinterpret_cast<const float **>(base + kGluGateCtxOff + kMlpMulMatXOff) = binding->x;
+    *reinterpret_cast<const float **>(base + kGluGateCtxOff + kMlpMulMatWOff) = binding->w_gate;
+    *reinterpret_cast<float **>      (base + kGluGateCtxOff + kMlpMulMatYOff) = binding->gate;
+
+    // up MUL_MAT: x = input activations, w = W_up, y = up output
+    *reinterpret_cast<const float **>(base + kGluUpCtxOff + kMlpMulMatXOff) = binding->x;
+    *reinterpret_cast<const float **>(base + kGluUpCtxOff + kMlpMulMatWOff) = binding->w_up;
+    *reinterpret_cast<float **>      (base + kGluUpCtxOff + kMlpMulMatYOff) = binding->up;
+
+    // Fused SWIGLU: gate = gate MUL_MAT output, up = up MUL_MAT output,
+    // dst = final output. The kernel computes
+    //   dst[i] = silu(gate[i]) * up[i]
+    // in a single pass, replacing the separate SiLU + elementwise MUL of the
+    // MLP_GATE_UP_F32 variant.
+    *reinterpret_cast<const float **>(base + kGluSwigluCtxOff + kGluSwigluGateOff) =
+        static_cast<const float *>(binding->gate);
+    *reinterpret_cast<const float **>(base + kGluSwigluCtxOff + kGluSwigluUpOff)   =
+        static_cast<const float *>(binding->up);
+    *reinterpret_cast<float **>      (base + kGluSwigluCtxOff + kGluSwigluDstOff)  =
         binding->out;
 }
 

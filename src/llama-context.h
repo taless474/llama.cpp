@@ -391,12 +391,16 @@ private:
     // Lifecycle:
     //   hpx_packet_runtime    — pinned decode Exec for packet lane fan-out
     //                           (n_lanes = 1 in v1)
-    //   hpx_mlp_gate_up_cache — compiled packets + caller-owned frames
+    //   hpx_mlp_gate_up_cache — gate/up (MUL_MAT×2 + SiLU + MUL) packets
+    //                           keyed on (out_cols, cols, rows)
+    //   hpx_mlp_glu_cache     — GLU/SwiGLU (MUL_MAT×2 + GGML_OP_GLU) packets
     //                           keyed on (out_cols, cols, rows)
     //
-    // Destroyed in the llama_context dtor (cache first, then runtime).
+    // All three are created atomically on the first eligible decode graph and
+    // destroyed in the llama_context dtor (caches first, then runtime).
     ggml_hpx_packet_runtime *           hpx_packet_runtime    = nullptr;
     ggml_hpx_mlp_gate_up_packet_cache * hpx_mlp_gate_up_cache = nullptr;
+    ggml_hpx_mlp_glu_packet_cache *     hpx_mlp_glu_cache     = nullptr;
 #endif
 
     // GGML_HPX_TPOOL_ONLY=1: HPX threadpool for large graphs (work_size >= threshold).
