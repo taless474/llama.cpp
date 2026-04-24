@@ -348,13 +348,19 @@ namespace {
 
 struct mlp_glu_cache_key
 {
-    int64_t out_cols;
-    int64_t cols;
-    int64_t rows;
+    int64_t  out_cols;
+    int64_t  cols;
+    int64_t  rows;
+    uint32_t w_gate_type;    // ggml_type of gate weight; 0 = GGML_TYPE_F32
+    uint32_t w_up_type;      // ggml_type of up weight;   0 = GGML_TYPE_F32
 
     bool operator==(const mlp_glu_cache_key & o) const noexcept
     {
-        return out_cols == o.out_cols && cols == o.cols && rows == o.rows;
+        return out_cols    == o.out_cols
+            && cols        == o.cols
+            && rows        == o.rows
+            && w_gate_type == o.w_gate_type
+            && w_up_type   == o.w_up_type;
     }
 };
 
@@ -363,8 +369,10 @@ struct mlp_glu_cache_key_hash
     std::size_t operator()(const mlp_glu_cache_key & k) const noexcept
     {
         std::size_t h = std::hash<int64_t>{}(k.out_cols);
-        h ^= std::hash<int64_t>{}(k.cols) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int64_t>{}(k.rows) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.cols)          + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.rows)          + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>{}(k.w_gate_type)  + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>{}(k.w_up_type)    + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -449,9 +457,11 @@ const mlp_glu_packet_entry * lookup_or_compile_mlp_glu(
     //   gate->ne[1]         == rows
     //   gate->src[1]->ne[0] == cols (x input's leading dimension)
     mlp_glu_cache_key key{};
-    key.out_cols = node_gate->ne[0];
-    key.rows     = node_gate->ne[1];
-    key.cols     = node_gate->src[1]->ne[0];
+    key.out_cols    = node_gate->ne[0];
+    key.rows        = node_gate->ne[1];
+    key.cols        = node_gate->src[1]->ne[0];
+    key.w_gate_type = static_cast<uint32_t>(node_gate->src[0]->type);
+    key.w_up_type   = static_cast<uint32_t>(node_up  ->src[0]->type);
     if (key.out_cols <= 0 || key.cols <= 0 || key.rows <= 0)
     {
         return nullptr;
@@ -463,46 +473,101 @@ const mlp_glu_packet_entry * lookup_or_compile_mlp_glu(
         return it->second.get();
     }
 
-    // Cache miss: compose → compile → frame allocate.
-    ggml_hpx_mlp_glu_group grp;
-    ggml_hpx_mlp_glu_group_init(&grp);
-    if (!ggml_hpx_compose_mlp_glu_group(node_gate, node_up, node_glu, &grp))
+    // ---------------------------------------------------------------------------
+    // Cache miss. Branch on weight dtype.
+    //
+    //  F32 weights: full 3-step MLP_GLU_F32 packet (gate_mm + up_mm + swiglu).
+    //  Quantized:   1-step MLP_GLU_QBRIDGE packet (swiglu only; gate_mm + up_mm
+    //               execute via CPU fallback before this packet fires).
+    // ---------------------------------------------------------------------------
+
+    const bool is_f32_weights = (key.w_gate_type == GGML_TYPE_F32)
+                              && (key.w_up_type   == GGML_TYPE_F32);
+
+    ggml_hpx_frozen_packet * packet = nullptr;
+    const char * tag = nullptr;
+
+    if (is_f32_weights)
     {
-        return nullptr;
+        ggml_hpx_mlp_glu_group grp;
+        ggml_hpx_mlp_glu_group_init(&grp);
+        if (!ggml_hpx_compose_mlp_glu_group(node_gate, node_up, node_glu, &grp))
+        {
+            return nullptr;
+        }
+
+        ggml_hpx_packet_plan_key pkey{};
+        pkey.sublayer       = GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32;
+        pkey.team           = GGML_HPX_PACKET_TEAM_DECODE;
+        pkey.n_lanes        = cache->n_lanes;
+        pkey.dtype          = GGML_TYPE_F32;
+        pkey.seq_regime     = cache->seq_regime;
+        pkey.policy_version = cache->policy_version;
+        pkey.shape[0]       = key.out_cols;
+        pkey.shape[1]       = key.cols;
+        pkey.shape[2]       = key.rows;
+        pkey.shape[3]       = 0;
+        pkey.extra          = 0;
+
+        const char * err = nullptr;
+        packet = ggml_hpx_compile_packet(&grp.group, &pkey, &err);
+        tag    = "glu_f32";
+    }
+    else
+    {
+        // QBRIDGE: lower the GLU node alone into a 1-region group.
+        // gate->data and up->data are populated by the ggml scheduler before
+        // graph_compute is called, so lower_op can read their pointers now.
+        ggml_hpx_lowering lo;
+        ggml_hpx_lowering_init(&lo);
+        if (!ggml_hpx_lower_op(node_glu, &lo))
+        {
+            return nullptr;
+        }
+
+        // Pack weight types into pkey.extra (bits 0-7 = w_gate, bits 8-15 = w_up).
+        const uint64_t extra =
+              static_cast<uint64_t>(key.w_gate_type)
+            | (static_cast<uint64_t>(key.w_up_type) << 8);
+
+        ggml_hpx_packet_plan_key pkey{};
+        pkey.sublayer       = GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE;
+        pkey.team           = GGML_HPX_PACKET_TEAM_DECODE;
+        pkey.n_lanes        = cache->n_lanes;
+        pkey.dtype          = GGML_TYPE_F32;
+        pkey.seq_regime     = cache->seq_regime;
+        pkey.policy_version = cache->policy_version;
+        pkey.shape[0]       = key.out_cols;
+        pkey.shape[1]       = key.cols;
+        pkey.shape[2]       = key.rows;
+        pkey.shape[3]       = 0;
+        pkey.extra          = extra;
+
+        const char * err = nullptr;
+        packet = ggml_hpx_compile_packet(&lo.group, &pkey, &err);
+        tag    = "glu_qbridge";
     }
 
-    ggml_hpx_packet_plan_key pkey{};
-    pkey.sublayer       = GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32;
-    pkey.team           = GGML_HPX_PACKET_TEAM_DECODE;
-    pkey.n_lanes        = cache->n_lanes;
-    pkey.dtype          = GGML_TYPE_F32;
-    pkey.seq_regime     = cache->seq_regime;
-    pkey.policy_version = cache->policy_version;
-    pkey.shape[0]       = key.out_cols;
-    pkey.shape[1]       = key.cols;
-    pkey.shape[2]       = key.rows;
-    pkey.shape[3]       = 0;
-    pkey.extra          = 0;
-
-    const char *             err    = nullptr;
-    const auto               t0     = std::chrono::steady_clock::now();
-    ggml_hpx_frozen_packet * packet = ggml_hpx_compile_packet(&grp.group, &pkey, &err);
-    const auto               t1     = std::chrono::steady_clock::now();
     if (!packet)
     {
         return nullptr;
     }
+
     if (packet_compile_log_enabled())
     {
-        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        const auto t1_now = std::chrono::steady_clock::now();
+        (void)t1_now;
         fprintf(stderr,
-            "[hpx-packet-compile] matcher=glu out_cols=%lld cols=%lld rows=%lld compile_ns=%lld\n",
-            (long long) key.out_cols, (long long) key.cols, (long long) key.rows, (long long) ns);
+            "[hpx-packet-compile] matcher=%s out_cols=%lld cols=%lld rows=%lld"
+            " w_gate=%u w_up=%u\n",
+            tag,
+            (long long) key.out_cols, (long long) key.cols, (long long) key.rows,
+            key.w_gate_type, key.w_up_type);
     }
 
-    const std::size_t sz  = ggml_hpx_packet_frame_size (packet);
-    const std::size_t al  = ggml_hpx_packet_frame_align(packet);
-    void *            raw = ::operator new(sz, std::align_val_t{al});
+    const std::size_t sz    = ggml_hpx_packet_frame_size (packet);
+    const std::size_t al    = ggml_hpx_packet_frame_align(packet);
+    void *            raw   = ::operator new(sz, std::align_val_t{al});
     auto *            frame = static_cast<ggml_hpx_packet_frame *>(raw);
     ggml_hpx_packet_frame_init(frame, packet);
 
@@ -569,6 +634,11 @@ void prescan_mlp_glu_matches(
         const ggml_tensor * up_t   = glu_t->src[1];
         if (gate_t->op != GGML_OP_MUL_MAT)                     continue;
         if (up_t->op   != GGML_OP_MUL_MAT)                     continue;
+
+        // Gate and up MUL_MAT outputs must be F32 — the SWIGLU kernel reads
+        // them directly, regardless of what weight dtype was used.
+        if (gate_t->type != GGML_TYPE_F32)                      continue;
+        if (up_t->type   != GGML_TYPE_F32)                      continue;
 
         // Gate and up must share the same x input (src[1] in ggml convention).
         if (gate_t->src[1] != up_t->src[1])                    continue;
@@ -734,17 +804,63 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
                 const ggml_tensor *   up_t   = gf->nodes[m.nodes[1]];
                 ggml_tensor *         glu_t  = gf->nodes[m.nodes[2]];
 
-                ggml_hpx_mlp_glu_binding b{};
-                b.w_gate = static_cast<const float *>(gate_t->src[0]->data);
-                b.w_up   = static_cast<const float *>(up_t  ->src[0]->data);
-                b.x      = static_cast<const float *>(gate_t->src[1]->data);
-                b.gate   = static_cast<float *>(gate_t->data);
-                b.up     = static_cast<float *>(up_t  ->data);
-                b.out    = static_cast<float *>(glu_t ->data);
-                ggml_hpx_bind_mlp_glu_packet(m.entry->frame, &b);
+                const uint32_t sublayer =
+                    ggml_hpx_packet_key(m.entry->packet)->sublayer;
 
-                // MLP GLU has no REDUCTION regions; same null-lane-scratch
-                // approach as the gate/up path above.
+                if (sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE)
+                {
+                    // QBRIDGE: gate_mm and up_mm have quantized weights and
+                    // must run via the CPU backend before the SWIGLU packet.
+                    // Time each CPU call separately so bridge_fallback_ns
+                    // captures the true quantized MUL_MAT cost.
+                    {
+                        ggml_cgraph view = ggml_graph_view(gf, m.nodes[0], m.nodes[0] + 1);
+                        const auto tb0 = clock::now();
+                        if (ggml_backend_graph_compute(cpu_be, &view) != GGML_STATUS_SUCCESS)
+                        {
+                            ok = false;
+                        }
+                        const auto tb1 = clock::now();
+                        stats.bridge_fallback_nodes += 1;
+                        stats.bridge_fallback_ns    += static_cast<uint64_t>(
+                            std::chrono::duration_cast<nanosecs>(tb1 - tb0).count());
+                    }
+                    if (ok)
+                    {
+                        ggml_cgraph view = ggml_graph_view(gf, m.nodes[1], m.nodes[1] + 1);
+                        const auto tb0 = clock::now();
+                        if (ggml_backend_graph_compute(cpu_be, &view) != GGML_STATUS_SUCCESS)
+                        {
+                            ok = false;
+                        }
+                        const auto tb1 = clock::now();
+                        stats.bridge_fallback_nodes += 1;
+                        stats.bridge_fallback_ns    += static_cast<uint64_t>(
+                            std::chrono::duration_cast<nanosecs>(tb1 - tb0).count());
+                    }
+                    if (!ok) continue;
+
+                    ggml_hpx_mlp_glu_qbridge_binding b{};
+                    b.gate = static_cast<float *>(gate_t->data);
+                    b.up   = static_cast<float *>(up_t  ->data);
+                    b.out  = static_cast<float *>(glu_t ->data);
+                    ggml_hpx_bind_mlp_glu_qbridge_packet(m.entry->frame, &b);
+                }
+                else
+                {
+                    // MLP_GLU_F32: full 3-step packet; gate_mm + up_mm execute
+                    // inside the packet, no separate fallback needed.
+                    ggml_hpx_mlp_glu_binding b{};
+                    b.w_gate = static_cast<const float *>(gate_t->src[0]->data);
+                    b.w_up   = static_cast<const float *>(up_t  ->src[0]->data);
+                    b.x      = static_cast<const float *>(gate_t->src[1]->data);
+                    b.gate   = static_cast<float *>(gate_t->data);
+                    b.up     = static_cast<float *>(up_t  ->data);
+                    b.out    = static_cast<float *>(glu_t ->data);
+                    ggml_hpx_bind_mlp_glu_packet(m.entry->frame, &b);
+                }
+
+                // No REDUCTION regions in either variant; null lane-scratch.
                 ggml_hpx_packet_resource_requirements req{};
                 ggml_hpx_packet_get_resource_requirements(m.entry->packet, &req);
                 std::vector<void *> lane_ptrs(req.n_lanes, nullptr);
@@ -761,8 +877,13 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
                 }).get();
                 const auto t1 = clock::now();
 
+                // QBRIDGE: only the GLU trigger node runs inside the packet.
+                // gate_mm + up_mm are already counted in bridge_fallback_nodes.
+                // MLP_GLU_F32: all 3 nodes run inside the packet.
+                const bool is_qbridge =
+                    (sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE);
                 stats.packet_matches     += 1;
-                stats.packet_nodes       += 3;
+                stats.packet_nodes       += is_qbridge ? 1 : 3;
                 stats.packet_dispatch_ns += static_cast<uint64_t>(
                     std::chrono::duration_cast<nanosecs>(t1 - t0).count());
 
@@ -779,26 +900,34 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
 
         if (ggml_hpx_lower_op(gf->nodes[i], &lo))
         {
-            bool has_reduction = false;
+            // A REDUCTION region is safe to run via HPX only when its kernel
+            // is self-sufficient (uses_resources == 0), i.e. it writes to its
+            // own ctx scratch rather than resources->lane_scratch /
+            // resources->reduction_buffer.  Example: Q4_K quantize-to-Q8_K
+            // writes to the lowering struct's scratch arena — no external
+            // resources needed.  RMS_NORM finalize sets uses_resources = 1
+            // because it reads lane_scratch[0..n_lanes) and writes
+            // reduction_buffer; those are null in res{} and cannot run safely.
+            bool has_resource_reduction = false;
             for (int r = 0; r < lo.group.n_regions; ++r)
             {
-                if (lo.group.regions[r].kind == GGML_HPX_CPU_REGION_KIND_REDUCTION)
+                if (lo.group.regions[r].kind == GGML_HPX_CPU_REGION_KIND_REDUCTION
+                 && lo.group.regions[r].uses_resources)
                 {
-                    has_reduction = true;
+                    has_resource_reduction = true;
                 }
             }
             if (dbg)
             {
                 fprintf(stderr,
-                    "[hpx-selective-lower] op=%s n_regions=%d has_reduction=%d\n",
+                    "[hpx-selective-lower] op=%s n_regions=%d has_resource_reduction=%d\n",
                     ggml_op_name(gf->nodes[i]->op),
                     lo.group.n_regions,
-                    (int)has_reduction);
+                    (int)has_resource_reduction);
             }
 
-            // Reject groups that contain REDUCTION regions: those require
-            // lane_scratch and reduction_buffer which are null in res{}.
-            if (has_reduction)
+            // Reject groups with resource-dependent REDUCTION regions.
+            if (has_resource_reduction)
             {
                 ggml_cgraph view = ggml_graph_view(gf, i, i + 1);
                 const auto t0 = clock::now();

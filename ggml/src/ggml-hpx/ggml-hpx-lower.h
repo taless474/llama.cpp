@@ -32,6 +32,14 @@
 #define GGML_HPX_LOWERING_MAX_DEPS               6
 #define GGML_HPX_LOWERING_CTX_BYTES_PER_REGION 128
 
+// Scratch arena shared across regions within one lowered op.
+// Currently used by the Q4_K two-region pipeline: region 0 writes a Q8_K
+// quantized activation row here; region 1 reads from it.
+// Size: 4096 bytes supports cols up to 3640 for Q8_K
+// (ggml_row_size(Q8_K, 3584) = 14 blocks × 292 bytes = 4088 bytes).
+// lower_op rejects Q4_K nodes whose Q8_K row exceeds this limit.
+#define GGML_HPX_LOWERING_SCRATCH_BYTES 4096
+
 // ---------------------------------------------------------------------------
 // Output arena
 // ---------------------------------------------------------------------------
@@ -62,6 +70,9 @@ typedef struct ggml_hpx_lowering
     ggml_hpx_dep_edge          deps   [GGML_HPX_LOWERING_MAX_DEPS];
     alignas(max_align_t) unsigned char
         ctx_buf[GGML_HPX_LOWERING_MAX_REGIONS][GGML_HPX_LOWERING_CTX_BYTES_PER_REGION];
+    // Scratch arena for intermediate data shared across regions.
+    // Zero-initialised by ggml_hpx_lowering_init via memset.
+    alignas(max_align_t) unsigned char scratch[GGML_HPX_LOWERING_SCRATCH_BYTES];
 } ggml_hpx_lowering;
 
 // Zero the struct and re-wire the internal pointers. Call this before every

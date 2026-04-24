@@ -65,6 +65,20 @@ extern "C" void ggml_vec_dot_f32(
     const float * y,  size_t by,
     int           nrc);
 
+// Signatures match ggml/src/ggml-cpu/quants.h exactly.
+// No header is included because quants.h is an internal header not reachable
+// from ggml/include/. Same pattern as ggml_vec_dot_f32 above.
+extern "C"
+{
+    void quantize_row_q8_K(const float * x, void * y, int64_t k);
+    void ggml_vec_dot_q4_K_q8_K(
+        int           n,
+        float *       s,   size_t bs,
+        const void *  vx,  size_t bx,
+        const void *  vy,  size_t by,
+        int           nrc);
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -95,7 +109,17 @@ hpx::future<void> launch_region_async(
     int                         n_lanes,
     ggml_hpx_region_resources * res)
 {
-    return hpx::async([&r, n_lanes, res]()
+    // Capture r by value: launch_region_async returns before the async body
+    // executes, so `r` (a reference parameter on the caller's stack) would be
+    // dangling by the time an HPX worker picks up the task.  Copying the
+    // ggml_hpx_cpu_region struct (~40 bytes) is cheap; the ctx pointer inside
+    // the copy remains valid because the ggml_hpx_lowering object that owns
+    // ctx_buf lives until the outer .get() returns.
+    //
+    // Inner lane lambdas use [&r] referencing the outer lambda's local copy;
+    // that copy lives until hpx::wait_all(lane_futs) completes, so the inner
+    // references are valid.
+    return hpx::async([r, n_lanes, res]()
     {
         if (r.kind == GGML_HPX_CPU_REGION_KIND_REDUCTION || n_lanes <= 1)
         {
@@ -368,6 +392,74 @@ void ggml_hpx_swiglu_f32_run_range(
     {
         const float g = ctx->gate[i];
         ctx->dst[i]   = (g / (1.0f + std::exp(-g))) * ctx->up[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K decode pipeline — region 0: serial F32 → Q8_K quantization
+// ---------------------------------------------------------------------------
+//
+// Runs with ith=0, nth=1 (enforced by REDUCTION kind).
+// Writes one Q8_K-encoded row into x_q8 (points into lowering scratch arena).
+// No heap allocation; no resources consumed.
+
+void ggml_hpx_quantize_q8_k_f32_run_range(
+    void *                      ctx_void,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * /*resources*/)
+{
+    auto * c = static_cast<ggml_hpx_quantize_q8_k_f32_ctx *>(ctx_void);
+    assert(ith   == 0);
+    assert(nth   == 1);
+    assert(begin == 0);
+    assert(end   == c->cols);
+    assert(c->cols % 256 == 0);
+    assert(c->x    != nullptr);
+    assert(c->x_q8 != nullptr);
+    (void)ith; (void)nth; (void)begin; (void)end;
+
+    quantize_row_q8_K(c->x, c->x_q8, c->cols);
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K decode pipeline — region 1: parallel Q4_K × Q8_K dot products
+// ---------------------------------------------------------------------------
+//
+// For each output column j in [begin, end):
+//   y[j] = ggml_vec_dot_q4_K_q8_K(W_q4k[j], x_q8)
+// Dep edge from region 0 ensures x_q8 is fully written before this runs.
+// No heap allocation; no resources consumed.
+
+void ggml_hpx_mul_mat_q4_k_q8_k_run_range(
+    void *                      ctx_void,
+    int                         /*ith*/,
+    int                         /*nth*/,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * /*resources*/)
+{
+    auto * c = static_cast<ggml_hpx_mul_mat_q4_k_q8_k_ctx *>(ctx_void);
+    assert(c->cols % 256 == 0);
+    assert(c->w_q4k != nullptr);
+    assert(c->x_q8  != nullptr);
+    assert(c->y     != nullptr);
+    assert(begin >= 0 && end <= c->out_cols);
+
+    const auto * w_base = static_cast<const char *>(c->w_q4k);
+          auto * y_base = reinterpret_cast<char *>(c->y);
+
+    for (int64_t j = begin; j < end; ++j)
+    {
+        auto * dst = reinterpret_cast<float *>(y_base + static_cast<size_t>(j) * c->y_nb0);
+        ggml_vec_dot_q4_K_q8_K(
+            static_cast<int>(c->cols),
+            dst,                                                      /* s  */ sizeof(float),
+            w_base + static_cast<size_t>(j) * c->w_row_stride,       /* vx */ c->w_row_stride,
+            c->x_q8,                                                  /* vy */ c->q8k_row_bytes,
+            1);
     }
 }
 

@@ -193,10 +193,14 @@ typedef enum ggml_hpx_packet_team
 
 typedef enum ggml_hpx_packet_sublayer
 {
-    GGML_HPX_PACKET_SUBLAYER_INVALID         = 0,
-    GGML_HPX_PACKET_SUBLAYER_RMS_NORM_F32    = 1,    // 3-region: partial / finalize / apply
-    GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_F32 = 2,    // 4-region: gate MUL_MAT / up MUL_MAT / SiLU / MUL
-    GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32     = 3,    // 3-region: gate MUL_MAT / up MUL_MAT / fused SWIGLU
+    GGML_HPX_PACKET_SUBLAYER_INVALID           = 0,
+    GGML_HPX_PACKET_SUBLAYER_RMS_NORM_F32      = 1,    // 3-region: partial / finalize / apply
+    GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_F32   = 2,    // 4-region: gate MUL_MAT / up MUL_MAT / SiLU / MUL
+    GGML_HPX_PACKET_SUBLAYER_MLP_GLU_F32       = 3,    // 3-region: gate MUL_MAT / up MUL_MAT / fused SWIGLU
+    GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE   = 4,    // 1-region: fused SWIGLU only
+                                                        //   gate/up MUL_MAT execute via CPU backend before
+                                                        //   this packet fires; weight dtype is quantized.
+                                                        //   key.extra encodes weight types (see plan_key docs).
     // future: ATTENTION_QKV, ...
 
     GGML_HPX_PACKET_SUBLAYER_CUSTOM_BASE     = 1 << 16,
@@ -221,8 +225,15 @@ typedef enum ggml_hpx_packet_sublayer
 //                    packets compiled under older rules are never reused.
 //   shape          : up to four sublayer-specific structural dimensions
 //                    (e.g. for RMS_NORM_F32 : { n, 0, 0, 0 })
-//   extra          : packed caller-defined structural bits (e.g. has_bias,
-//                    rope_base, head_dim). Bit layout is per-sublayer.
+//   extra          : packed caller-defined structural bits. Bit layout is
+//                    per-sublayer. Current assignments:
+//
+//                    MLP_GLU_F32 / MLP_GLU_QBRIDGE:
+//                      bits  [0: 7] = w_gate ggml_type (0 = F32)
+//                      bits  [8:15] = w_up   ggml_type (0 = F32)
+//                      bits [16:63] = reserved, must be 0
+//
+//                    All other sublayers: must be 0.
 //
 // Two keys compare equal iff all fields compare equal byte-for-byte.
 // No padding should be present; the struct is declared with explicitly
@@ -602,6 +613,41 @@ typedef struct ggml_hpx_mlp_glu_binding
 void ggml_hpx_bind_mlp_glu_packet(
     struct ggml_hpx_packet_frame *      frame,
     const ggml_hpx_mlp_glu_binding *    binding);
+
+// ---------------------------------------------------------------------------
+// Typed binding — MLP_GLU_QBRIDGE
+// ---------------------------------------------------------------------------
+//
+// Binding for key.sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE.
+//
+// The QBRIDGE packet contains only the fused-SWIGLU step. Gate and up
+// MUL_MAT nodes execute via the CPU backend before this packet fires,
+// so their outputs (gate->data, up->data) are already populated when
+// bind is called.
+//
+// Shape convention: same as MLP_GLU_F32 (shape[0..2] = out_cols, cols, rows).
+//
+// Fields (per-invocation data pointers only):
+//   gate : [rows × out_cols]  gate MUL_MAT output  (populated by CPU fallback)
+//   up   : [rows × out_cols]  up   MUL_MAT output  (populated by CPU fallback)
+//   out  : [rows × out_cols]  fused SWIGLU output  (write)
+//
+// Hard preconditions (debug-asserted):
+//   - frame must have been frame_init'd against a packet with
+//     key.sublayer == MLP_GLU_QBRIDGE.
+//   - All three pointers must be non-null and validly sized.
+//   - gate and up must not alias each other.
+
+typedef struct ggml_hpx_mlp_glu_qbridge_binding
+{
+    float *  gate;    // gate MUL_MAT output   [rows × out_cols]
+    float *  up;      // up   MUL_MAT output   [rows × out_cols]
+    float *  out;     // fused SWIGLU output   [rows × out_cols]
+} ggml_hpx_mlp_glu_qbridge_binding;
+
+void ggml_hpx_bind_mlp_glu_qbridge_packet(
+    struct ggml_hpx_packet_frame *              frame,
+    const ggml_hpx_mlp_glu_qbridge_binding *    binding);
 
 #ifdef __cplusplus
 }    // extern "C"

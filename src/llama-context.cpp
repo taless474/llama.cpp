@@ -2292,7 +2292,7 @@ ggml_status llama_context::graph_compute(
         // is backend_cpu).  Mixed-backend graphs (e.g. Metal offload) fall
         // through to the normal scheduler path below.
         // The PREFILL_MIN_TOKENS threshold below applies only to the coarse HPX path.
-        if (hpx_selective_mul_mat) {
+        if (hpx_selective_mul_mat && !batched) {
             const int  n_splits   = ggml_backend_sched_get_n_splits(sched.get());
             const bool is_cpu_only = (n_splits == 1)
                 && (gf->n_nodes > 0)

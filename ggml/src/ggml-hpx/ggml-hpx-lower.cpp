@@ -30,8 +30,12 @@
 // if any assert fires; do NOT just delete the assert.
 // ---------------------------------------------------------------------------
 
-static_assert(sizeof(ggml_hpx_mul_mat_f32_ctx)          <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
+static_assert(sizeof(ggml_hpx_mul_mat_f32_ctx)              <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
     "ggml_hpx_mul_mat_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
+static_assert(sizeof(ggml_hpx_quantize_q8_k_f32_ctx)        <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
+    "ggml_hpx_quantize_q8_k_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
+static_assert(sizeof(ggml_hpx_mul_mat_q4_k_q8_k_ctx)        <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
+    "ggml_hpx_mul_mat_q4_k_q8_k_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_silu_f32_ctx)             <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
     "ggml_hpx_silu_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_mul_f32_ctx)              <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
@@ -110,6 +114,7 @@ bool ggml_hpx_lower_op(
             0, n, 0,
             out->ctx_buf[0],
             ggml_hpx_silu_f32_run_range,
+            0,
         };
         out->group.n_regions = 1;
         return true;
@@ -140,6 +145,7 @@ bool ggml_hpx_lower_op(
             0, n, 0,
             out->ctx_buf[0],
             ggml_hpx_mul_f32_run_range,
+            0,
         };
         out->group.n_regions = 1;
         return true;
@@ -177,6 +183,7 @@ bool ggml_hpx_lower_op(
             0, n, 0,
             out->ctx_buf[0],
             ggml_hpx_swiglu_f32_run_range,
+            0,
         };
         out->group.n_regions = 1;
         return true;
@@ -186,40 +193,120 @@ bool ggml_hpx_lower_op(
     //
     // ggml convention: src[0]=weight [cols × out_cols], src[1]=input [cols × rows].
     // The kernel iterates output columns in [0, out_cols) as its work range.
+    //
+    // Supported weight types:
+    //   GGML_TYPE_F32  — 1-region F32 mul_mat (existing path)
+    //   GGML_TYPE_Q4_K — 2-region Q4_K decode pipeline, rows == 1 only
     case GGML_OP_MUL_MAT:
     {
         const ggml_tensor * w = node->src[0];    // weight
         const ggml_tensor * x = node->src[1];    // activations
         if (!w || !x || !w->data || !x->data || !node->data) return false;
-        if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) return false;
 
         const int64_t cols     = w->ne[0];    // shared (reduction) dim
-        const int64_t out_cols = w->ne[1];    // output columns; also node->ne[0]
-        const int64_t rows     = x->ne[1];    // batch; also node->ne[1]
+        const int64_t out_cols = w->ne[1];    // output columns
+        const int64_t rows     = x->ne[1];    // batch
         if (cols <= 0 || out_cols <= 0 || rows <= 0) return false;
-        // Verify the output tensor shape is consistent with the sources.
         if (node->ne[0] != out_cols || node->ne[1] != rows) return false;
-        // Shared dimension must match between weight and activation.
         if (x->ne[0] != cols) return false;
-        if (!is_contiguous_2d_f32(w) || !is_contiguous_2d_f32(x) || !is_contiguous_2d_f32(node))
-            return false;
 
-        ::new (out->ctx_buf[0]) ggml_hpx_mul_mat_f32_ctx{
-            static_cast<const float *>(x->data),
-            static_cast<const float *>(w->data),
-            static_cast<float *>(node->data),
-            rows,
-            cols,
-            out_cols,
-        };
-        out->regions[0] = {
-            GGML_HPX_CPU_REGION_KIND_MATMUL,
-            0, out_cols, 0,
-            out->ctx_buf[0],
-            ggml_hpx_mul_mat_f32_run_range,
-        };
-        out->group.n_regions = 1;
-        return true;
+        // ── F32 × F32 path ────────────────────────────────────────────────
+        if (w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32)
+        {
+            if (!is_contiguous_2d_f32(w) || !is_contiguous_2d_f32(x)
+             || !is_contiguous_2d_f32(node))
+                return false;
+
+            ::new (out->ctx_buf[0]) ggml_hpx_mul_mat_f32_ctx{
+                static_cast<const float *>(x->data),
+                static_cast<const float *>(w->data),
+                static_cast<float *>(node->data),
+                rows, cols, out_cols,
+            };
+            out->regions[0] = {
+                GGML_HPX_CPU_REGION_KIND_MATMUL,
+                0, out_cols, 0,
+                out->ctx_buf[0],
+                ggml_hpx_mul_mat_f32_run_range,
+                0,
+            };
+            out->group.n_regions = 1;
+            return true;
+        }
+
+        // ── Q4_K weight × F32 activation → F32 output, rows == 1 ─────────
+        //
+        // Two-region pipeline:
+        //   R0 (REDUCTION, serial) : quantize F32 x → Q8_K scratch
+        //   R1 (MATMUL, parallel)  : Q4_K × Q8_K dot products
+        //   dep: 0 → 1
+        if (w->type == GGML_TYPE_Q4_K && x->type == GGML_TYPE_F32)
+        {
+            if (std::getenv("LLAMA_HPX_SELECTIVE_NO_Q4K")) return false;
+            if (rows != 1) return false;
+            if (cols % ggml_blck_size(GGML_TYPE_Q4_K) != 0) return false;
+
+            // Weight contiguity: nb[0] is one block's byte size, nb[1] is one row.
+            const size_t blk_sz  = ggml_type_size(GGML_TYPE_Q4_K);
+            const size_t blk_cnt = static_cast<size_t>(
+                cols / ggml_blck_size(GGML_TYPE_Q4_K));
+            if (w->nb[0] != blk_sz || w->nb[1] != blk_cnt * blk_sz) return false;
+
+            // Input x must be fully contiguous (both element and row strides).
+            // Output y: nb[0]==sizeof(float) is sufficient for rows=1 because
+            // the kernel writes element j at (char*)y + j*nb[0]; nb[1] may be
+            // larger than ne[0]*sizeof(float) for KV-cache view tensors.
+            if (!is_contiguous_2d_f32(x)) return false;
+            if (node->nb[0] != sizeof(float)) return false;
+
+            // Reject if the Q8_K scratch row won't fit in the lowering arena.
+            const size_t q8k_row = ggml_row_size(GGML_TYPE_Q8_K, cols);
+            if (q8k_row > GGML_HPX_LOWERING_SCRATCH_BYTES) return false;
+
+            const size_t w_row_stride = blk_cnt * blk_sz;
+            void * scratch = out->scratch;   // shared between the two regions
+
+            // R0: serial quantize
+            ::new (out->ctx_buf[0]) ggml_hpx_quantize_q8_k_f32_ctx{
+                static_cast<const float *>(x->data),
+                scratch,
+                cols,
+            };
+            out->regions[0] = {
+                GGML_HPX_CPU_REGION_KIND_REDUCTION,
+                0, cols, 0,
+                out->ctx_buf[0],
+                ggml_hpx_quantize_q8_k_f32_run_range,
+                0,  // self-sufficient: writes only to ctx->x_q8 (lo.scratch), no external resources
+            };
+
+            // R1: parallel dot products
+            ::new (out->ctx_buf[1]) ggml_hpx_mul_mat_q4_k_q8_k_ctx{
+                w->data,
+                scratch,
+                static_cast<float *>(node->data),
+                cols, out_cols,
+                w_row_stride,
+                q8k_row,
+                node->nb[0],
+            };
+            out->regions[1] = {
+                GGML_HPX_CPU_REGION_KIND_MATMUL,
+                0, out_cols, 0,
+                out->ctx_buf[1],
+                ggml_hpx_mul_mat_q4_k_q8_k_run_range,
+                0,
+            };
+
+            out->deps[0] = {0, 1};
+
+            out->group.n_regions = 2;
+            out->group.n_deps    = 1;
+            out->group.deps      = out->deps;
+            return true;
+        }
+
+        return false;
     }
 
     // ── RMS_NORM ──────────────────────────────────────────────────────────
@@ -255,15 +342,16 @@ bool ggml_hpx_lower_op(
 
         out->regions[0] = {
             GGML_HPX_CPU_REGION_KIND_ELEMENTWISE, 0, n, 0,
-            out->ctx_buf[0], ggml_hpx_rms_norm_partial_f32_run_range,
+            out->ctx_buf[0], ggml_hpx_rms_norm_partial_f32_run_range, 0,
         };
         out->regions[1] = {
             GGML_HPX_CPU_REGION_KIND_REDUCTION, 0, n, 0,
             out->ctx_buf[1], ggml_hpx_rms_norm_finalize_f32_run_range,
+            1,  // reads lane_scratch[0..n_lanes) + writes reduction_buffer
         };
         out->regions[2] = {
             GGML_HPX_CPU_REGION_KIND_ELEMENTWISE, 0, n, 0,
-            out->ctx_buf[2], ggml_hpx_rms_norm_apply_f32_run_range,
+            out->ctx_buf[2], ggml_hpx_rms_norm_apply_f32_run_range, 0,
         };
 
         out->deps[0] = {0, 1};

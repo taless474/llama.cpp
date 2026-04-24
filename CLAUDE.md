@@ -51,7 +51,7 @@ Future → region DAG
 
 ### Saving results
 
-Never write benchmark output to `/tmp`.  All results stay inside the repo.
+Never write any output to `/tmp`.  All results stay inside the repo.
 
 - `hpx-bench/results/<date>-<slug>/` — benchmark CSVs and logs
 - `local/results/` — experiment summaries, environment notes, anything not suitable for git

@@ -136,6 +136,13 @@ typedef void (*ggml_hpx_run_range_fn)(
 //
 // grain: minimum work unit size. The executor will not split a chunk smaller
 // than grain. Set to 0 to let the executor decide.
+//
+// uses_resources: non-zero if run_range reads or writes
+//   resources->lane_scratch or resources->reduction_buffer.
+//   Zero (default) means the kernel is self-sufficient (reads/writes only
+//   pointers embedded in ctx, e.g. Q4_K quantize-to-Q8_K scratch).
+//   The selective executor uses this flag to decide whether a REDUCTION
+//   region can run safely when external resource buffers are null.
 typedef struct ggml_hpx_cpu_region
 {
     ggml_hpx_cpu_region_kind    kind;           // dispatch policy hint
@@ -144,6 +151,7 @@ typedef struct ggml_hpx_cpu_region
     int64_t                     grain;          // minimum chunk size; 0 = executor decides
     void*                       ctx;            // opaque kernel context
     ggml_hpx_run_range_fn       run_range;      // kernel entry point; must be non-null
+    int                         uses_resources; // non-zero → run_range needs lane_scratch/reduction_buffer
 } ggml_hpx_cpu_region;
 
 // ---------------------------------------------------------------------------

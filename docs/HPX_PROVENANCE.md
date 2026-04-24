@@ -4083,7 +4083,7 @@ in llama. Landing (2) alone removes the dequantization dependency for
 all quantized models. Landing both closes the full
 Section 7 → 8 → 9 → 10 → 11 arc on realistic quantized inference.
 
-### Conclusion of Section 11
+### Conclusion
 
 v1 is complete: the mechanism is proven in isolation, integrated into
 llama behind the `LLAMA_HPX_SELECTIVE_MLP_PACKET` flag, transparent
@@ -4503,7 +4503,7 @@ packet bucket 41.4 ms and saves 69.2 ms in lowered work, net 27.8 ms
 saved per token, matching the observed 27.3 ms total delta within
 rounding.
 
-### Why the Apr 18 "2×" was inflated
+### Why the former "2×" was inflated
 
 PACKET=0 has 66 more nodes flowing through the generic lowered path,
 which is more sensitive to thread contention and scheduler jitter than
@@ -4532,3 +4532,644 @@ With this, B.1 closes as an integration + honest speedup milestone,
 and the remaining challenge — making the packet path useful on
 realistic quantized models — remains scoped to B.2.
 
+### Goal of B.2
+B.2 is the point where the packet work stops being an F32 proof-path result and starts targeting real quantized llama models. The intended first milestone was not “all quantization,” but a narrow, real path: **TinyLlama, decode-only, one quant scheme, one sublayer family**, with the GLU path as the first production target.
+
+The roadmap for B.2 had two candidate directions:
+
+- **true quant-aware lowering**
+- **quant→F32 bridge**
+
+plus an early extension of the packet key so quantized and non-quantized cache entries cannot alias.
+
+### What blocked the live GLU path on quantized models
+The live GLU selective path already matched the 3-node pattern:
+
+- `gate_mm`
+- `up_mm`
+- `glu`
+
+However, the original compile path for a matched GLU pattern always routed through the existing F32 compose/lower pipeline. That pipeline called `ggml_hpx_lower_op` on the `MUL_MAT` nodes, and lowering rejected them when the weight tensor type was not `GGML_TYPE_F32`. On real quantized models such as `Q4_K_M`, this meant:
+
+- prescan found the pattern correctly
+- `lookup_or_compile_mlp_glu()` tried to compose the packet
+- lowering rejected `gate_mm` / `up_mm`
+- packet compilation failed
+- no cache entry was created
+- all three nodes fell back to the CPU path
+
+So the immediate blocker for B.2 was **not** GLU pattern recognition, but the fact that the packet compile path still required **F32-weight MUL_MAT lowering**.
+
+### Decision record: why B.2 started with QBRIDGE
+Two candidate directions were considered.
+
+#### Option A: true quant-aware lowering
+Teach the lowering / compose / packet stack to accept quantized `MUL_MAT` directly, preserving the existing 3-step packet shape and moving toward a more native long-term design.
+
+#### Option B: quant→F32 bridge
+Let quantized `MUL_MAT` remain outside the packet for the first cut. Run those matmuls through the CPU backend first, then reuse the packet machinery only for the final fused SWIGLU elementwise stage.
+
+The smallest cut that could make the real quantized TinyLlama GLU path fire was **Option B**, implemented as **QBRIDGE**.
+
+### Chosen B.2 cut
+The selected design was:
+
+- keep the existing **3-step `MLP_GLU_F32`** packet path unchanged
+- add a sibling packet sublayer:
+  - **`GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE`**
+- for quantized-weight GLU matches:
+  - compile a **1-step SWIGLU-only packet**
+  - execute `gate_mm` and `up_mm` through the CPU backend at dispatch time
+  - then bind and run the SWIGLU packet over the already-produced F32 gate/up outputs
+
+This preserved the B.1 F32 path, avoided quant kernel work in the first cut, and allowed the selective executor to start matching real quantized GLU patterns.
+
+### Packet-key and cache-key extension
+Packet-key extension was required so cached entries do not collide across quant schemes.
+
+#### Internal selective cache key
+`mlp_glu_cache_key` was extended with:
+
+- `w_gate_type`
+- `w_up_type`
+
+so structurally identical GLU patterns with different weight dtypes now populate separate cache entries.
+
+#### Frozen packet key
+`ggml_hpx_packet_plan_key.extra` was assigned a documented per-sublayer convention for GLU packets:
+
+- bits `[0:7]`   = `w_gate_ggml_type`
+- bits `[8:15]`  = `w_up_ggml_type`
+
+For example:
+
+- F32/F32 weights → `extra = 0`
+- Q4_K/Q4_K weights → `extra = 0x0C0C`
+
+This keeps quantized and non-quantized GLU packet identities distinct even when shape and sublayer family are otherwise similar.
+
+---
+
+## File-level implementation provenance
+
+### `ggml-hpx-packet.h`
+This file was extended to define the new bridge sublayer and its binding contract.
+
+Changes:
+- added `GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE = 4`
+- documented the `extra` field bit layout for GLU packet families
+- added `ggml_hpx_mlp_glu_qbridge_binding`
+- added `ggml_hpx_bind_mlp_glu_qbridge_packet(...)`
+
+The new binding surface intentionally carries only:
+
+- `gate`
+- `up`
+- `out`
+
+because the quantized `MUL_MAT` stage is outside the packet in the bridge design.
+
+### `ggml-hpx-packet.cpp`
+This file gained the actual frozen-packet support for QBRIDGE.
+
+Changes:
+- added a new **arena layout** for a 1-step SWIGLU-only packet
+- added `validate_mlp_glu_qbridge_group(...)`
+- added a compile branch for `GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE`
+- added `ggml_hpx_bind_mlp_glu_qbridge_packet(...)`
+
+The frame contract is deliberately small:
+
+- frame header
+- one `ggml_hpx_swiglu_f32_ctx`
+- total frame size: 40 bytes
+
+The compile path bakes `n = out_cols * rows` into the SWIGLU context template and leaves only the pointers to be patched at dispatch time.
+
+### `ggml-hpx-exec-selective.h`
+This header was extended so the selective stats can represent the mixed bridge path honestly.
+
+Changes:
+- added `bridge_fallback_nodes`
+- added `bridge_fallback_ns`
+
+These fields count and time the CPU-backend work that still happens inside a QBRIDGE match:
+
+- `bridge_fallback_nodes` = number of gate/up nodes executed through the CPU backend
+- `bridge_fallback_ns` = wall time spent in those CPU backend calls
+
+### `ggml-hpx-exec-selective.cpp`
+This was the main behavioral change for B.2.
+
+#### Cache separation
+`mlp_glu_cache_key` and its hash/equality were extended with weight dtypes, so F32 and quantized GLU entries do not alias.
+
+#### Relaxed prescan
+`prescan_mlp_glu_matches(...)` no longer requires F32 weights. Instead, it accepts:
+
+- `gate_mm` and `up_mm` with any weight dtype
+- as long as the **MUL_MAT outputs are F32**
+- and the existing shape / shared-input pattern still holds
+
+That is the critical change that lets quantized GLU patterns enter the packet-selection path at all.
+
+#### Branching compile path
+`lookup_or_compile_mlp_glu(...)` now branches on weight dtype:
+
+- **F32/F32** → existing `MLP_GLU_F32` compose + compile path
+- **non-F32** → QBRIDGE path
+
+For the QBRIDGE branch:
+- it bypasses `ggml_hpx_compose_mlp_glu_group(...)`
+- lowers only the GLU node itself
+- compiles a 1-region SWIGLU packet
+- writes the weight dtypes into `pkey.extra`
+
+This is the key architectural point of the B.2 cut: the bridge path does **not** try to lower quantized `MUL_MAT`.
+
+#### Dispatch behavior
+At dispatch time, the GLU selective path now distinguishes between:
+
+- full `MLP_GLU_F32` packet
+- `MLP_GLU_QBRIDGE`
+
+For `QBRIDGE`:
+1. build a 1-node graph view for `gate_mm`
+2. execute it through the CPU backend
+3. build a 1-node graph view for `up_mm`
+4. execute it through the CPU backend
+5. bind the gate/up/output buffers to the QBRIDGE packet
+6. run the 1-step SWIGLU packet
+
+#### Stats accounting cleanup
+The first QBRIDGE cut undercounted the real matched-path cost because the two fallback `MUL_MAT` calls happened outside packet timing and were not represented in stats. That was corrected by extending `ggml_hpx_selective_stats` and updating the dispatch branch so the bridge path is accounted for explicitly.
+
+Current accounting for a QBRIDGE match is:
+
+- `packet_nodes == 1` for the GLU trigger
+- `bridge_fallback_nodes == 2` for `gate_mm` + `up_mm`
+- `bridge_fallback_ns` accumulates the CPU backend time for those two calls
+- `packet_dispatch_ns` covers only the SWIGLU packet execution
+
+This makes the bridge path stats honest without pretending that all three matched nodes were executed inside the packet.
+
+---
+
+## Test provenance
+
+### New isolation test
+A new test file was added:
+
+- `tests/hpx/test_hpx_selective_mlp_glu_qbridge.cpp`
+
+It currently adds two targeted tests.
+
+#### 1. `MatchesCompilesOnceDispatchesTwice`
+This test builds a minimal 3-op GLU subgraph with:
+
+- F16 gate weights
+- F16 up weights
+- F32 activations
+- F32 gate/up/glu outputs
+
+It verifies that:
+- prescan accepts the pattern for non-F32 weights
+- the first selective call compiles exactly one GLU packet
+- the second selective call reuses the cached packet
+- the output matches a scalar reference implementation
+- the packet path fires twice across two invocations
+- the updated stats are reported correctly:
+  - `packet_matches == 1`
+  - `packet_nodes == 1`
+  - `bridge_fallback_nodes == 2`
+  - `bridge_fallback_ns > 0`
+  - `lowered_nodes == 0`
+  - `fallback_nodes == 0`
+
+This proves that the **QBRIDGE mechanism** is alive end-to-end and that the bridge portion of the work is now counted explicitly.
+
+#### 2. `F32AndF16CacheEntriesAreDistinct`
+This test uses the same shape twice:
+
+- once with F32 weights
+- once with F16 weights
+
+and verifies that these populate **distinct cache entries** rather than aliasing through shape alone.
+
+### Current test status
+At this point the HPX test status is:
+
+- **26 / 26 HPX tests passing**
+
+A full background test run also reported two failing non-HPX tests:
+
+- `test-tokenizers-ggml-vocabs`
+- `test-jinja-py`
+
+Those are llama.cpp tokenizer / Python tests and were already failing before this B.2 work. They are unrelated to the HPX selective / packet path.
+
+---
+
+## What B.2 has achieved so far
+Up to this point, B.2 has established the following:
+
+1. **The blocker is understood and isolated**  
+   Quantized GLU was failing because the compile path still depended on F32-only `MUL_MAT` lowering.
+
+2. **A minimal real-path bridge exists**  
+   Quantized-weight GLU patterns can now enter the selective path and trigger a packet.
+
+3. **Quantized and non-quantized packet identities are separated**  
+   Both the internal selective cache and the frozen packet key now encode weight dtype.
+
+4. **The F32 path stays intact**  
+   The existing `MLP_GLU_F32` packet path remains unchanged.
+
+5. **Bridge stats are now represented honestly**  
+   The two CPU-backend `MUL_MAT` calls are no longer hidden behind packet-only accounting.
+
+6. **There is a working isolation harness for the bridge path**  
+   The new test covers compile, cache hit/miss behavior, output correctness, and the updated bridge stats.
+
+7. **The HPX test surface remains green**  
+   All 26 HPX tests pass after the QBRIDGE landing and stats cleanup.
+
+---
+
+## What landed in the validator + real-model smoke session 
+
+Three changes closed the remaining open items from the previous session.
+
+### 1. Validator tightening (`ggml-hpx-packet.cpp`)
+
+`validate_mlp_glu_qbridge_group` now explicitly enforces the zero-dependency
+contract:
+
+```cpp
+if (group->n_deps != 0)
+    return "MLP_GLU_QBRIDGE group must have zero dependency edges";
+```
+
+This was a structurally guaranteed invariant before; it is now a hard validator
+rejection.  All 26 HPX tests remain green.
+
+### 2. Selective path gated to decode-only (`src/llama-context.cpp`)
+
+The selective executor was previously engaged for **both** prefill and decode
+graphs.  For prefill (batched=true), this caused the scalar SWIGLU kernel to
+replace ggml's SIMD kernel in every layer, producing ~2–3% KV-cache drift that
+propagated into the decode logits.
+
+Fix: the outer guard changed from
+
+```cpp
+if (hpx_selective_mul_mat)
+```
+to
+```cpp
+if (hpx_selective_mul_mat && !batched)
+```
+
+Prefill now falls through to the normal ggml scheduler unconditionally.  The
+selective path engages only for single-token decode calls (`batched = n_tokens > 1`
+is false), which is the only regime the decode-team packets are designed for.
+
+### 3. Real-model smoke restructured and passing (`tests/hpx/test_hpx_llama_selective_mul_mat_smoke.cpp`)
+
+The smoke test previously fed all prompt tokens in a single `llama_batch_get_one`
+call.  With `n_tokens > 1`, `batched = true` and `packet_eligible = false`, so
+QBRIDGE never fired.
+
+The test now runs two phases per context:
+
+1. **Prefill** — all prompt tokens in one batch (`batched = true`, normal
+   scheduler, no selective path).
+2. **Decode** — one fixed token (`kDecodeToken = 1`, `batched = false`,
+   `packet_eligible = true`).
+
+Logits are captured only from the decode step and compared with
+`EXPECT_NEAR(..., kLogitTol)` where `kLogitTol = 5e-6f`.  The tolerance covers
+the ~4 ULP float32 noise between our scalar SWIGLU kernel and ggml's SIMD
+kernel; the prefill-path bug we gated out was ~0.2 off (four orders of
+magnitude larger), so the tolerance still catches any real error.
+
+**Confirmed on TinyLlama `Q4_K_M`, CPU-only, M4:**
+
+```
+graph_compute: HPX MLP packet dispatch ready (gate/up + GLU, n_lanes=1)
+[hpx-packet-compile] matcher=glu_qbridge out_cols=5632 cols=2048 rows=1 w_gate=12 w_up=12
+[  PASSED  ] 1 test.
+```
+
+- `w_gate=12` = `GGML_TYPE_Q4_K`
+- `out_cols=5632` = TinyLlama intermediate dimension
+- `rows=1` = single-token decode
+- logits within 5e-6 of reference
+
+---
+
+## Status summary
+The current B.2 state is best described as:
+
+- **design choice made:** quant→F32 bridge first
+- **implementation landed:** QBRIDGE sibling sublayer
+- **cache safety landed:** dtype-aware keying
+- **selective path landed:** quantized GLU can now match and dispatch
+- **stats cleanup landed:** bridge fallback work is counted explicitly
+- **isolation coverage landed:** targeted bridge tests passing
+- **validator tightened:** zero-dependency contract is now an explicit rejection
+- **selective path decode-gated:** prefill falls through to normal scheduler
+- **real-model smoke complete:** TinyLlama Q4_K_M, CPU-only, `matcher=glu_qbridge` confirmed
+- **HPX test surface green:** 26 / 26 HPX tests passing
+
+### Open items
+The one remaining item from the original list is direct key inspection:
+
+- `validate_mlp_glu_qbridge_group` and the isolation test prove cache separation
+  indirectly through compile behavior.  A packet-level test that directly reads
+  `ggml_hpx_packet_key(entry->packet)->sublayer` and the `extra` field would
+  complete the coverage story.
+
+That is lower priority now that the real-model smoke is confirmed.  The next
+meaningful step is **honest comparison work**: measure QBRIDGE decode throughput
+against the baseline (packet=0) under the fair-comparison protocol defined in
+`CLAUDE.local.md`.
+
+### Immediate next step when resuming
+1. (optional) add direct packet-key inspection test
+2. run A/B decode benchmark: QBRIDGE vs baseline, following the fair-comparison
+   protocol (quiet machine, single binary, alternating order, per-bucket stats)
+
+---
+
+## B3: Can HPX run Q4_K MUL_MAT?
+
+### Question
+
+The QBRIDGE path routes Q4_K MUL_MAT nodes through the ggml CPU backend
+(the "bridge fallback") before handing off only the SWIGLU step to HPX.  The
+question for B3 is whether HPX can run the Q4_K MUL_MAT itself — removing the
+CPU-backend dependency for the MLP projection step.
+
+### What ggml actually does for Q4_K × F32
+
+There is no `ggml_vec_dot_q4_K_f32` kernel.  ggml's design is:
+
+1. **Quantize activations**: the F32 input row is quantized to Q8_K once via
+   `quantize_row_q8_K`.  This is cheap relative to the dot products.
+2. **Dot products**: `ggml_vec_dot_q4_K_q8_K(n, s, bs, vx, bx, vy, by, nrc)`
+   computes the inner product of one Q4_K weight row with one Q8_K activation
+   row.  This function dispatches to architecture-specific SIMD (ARM NEON,
+   x86 AVX2, etc.) or a generic fallback.
+
+The block layout:
+- `block_q4_K`: 144 bytes, covers 256 elements (`QK_K = 256`).
+  Fields: `d` (ggml_half scale), `dmin` (ggml_half min), `scales[12]`
+  (6 bits each for 8 sub-scales and 8 sub-mins), `qs[128]` (4 bits/element).
+- `block_q8_K`: 292 bytes, covers 256 elements.
+  Fields: `d` (float scale), `qs[256]` (int8), `bsums[16]` (int16 subblock sums).
+
+Row sizes (TinyLlama decode, cols = 2048):
+- Q4_K row: `(2048/256) × 144 = 1152 bytes` (8 blocks)
+- Q8_K row: `(2048/256) × 292 = 2336 bytes`
+
+### Symbol visibility
+
+Both `quantize_row_q8_K` and `ggml_vec_dot_q4_K_q8_K` are declared in
+`ggml/src/ggml-cpu/quants.h` (internal, no `GGML_API`).  They are not
+reachable from `ggml/include/`.  The correct approach — already used in this
+codebase for `ggml_vec_dot_f32` — is `extern "C"` forward declarations in the
+implementation file.  Their symbols are present in the linked `ggml` library.
+
+### Two-region kernel design
+
+A single `run_range` that quantizes inside the parallel fan-out would cause
+every lane to redundantly quantize the same activation vector (wasteful) or
+race on shared scratch (incorrect).  The correct decomposition is two regions
+with a dep edge:
+
+```
+Region 0  REDUCTION (serial)   ggml_hpx_quantize_q8_k_f32_run_range
+          begin=0, end=cols
+          ctx: { x: F32 input, x_q8: scratch pointer, cols }
+          → calls quantize_row_q8_K once
+
+Region 1  MATMUL (parallel)    ggml_hpx_mul_mat_q4_k_q8_k_run_range
+          begin=0, end=out_cols
+          ctx: { w_q4k, x_q8 (shared), y, cols, out_cols, w_row_stride, q8k_row_bytes }
+          → calls ggml_vec_dot_q4_K_q8_K per output column
+
+Dep: 0 → 1
+```
+
+HPX owns the dependency edge.  The dep ensures region 1 does not fan out
+until region 0 has written the Q8_K scratch.  No allocation inside any
+`run_range` callback.
+
+The REDUCTION kind was chosen for region 0 because `launch_region_async`
+already enforces `ith=0, nth=1` for REDUCTION — exactly the serial-exactly-once
+semantics the quantize step needs — without requiring a new region kind.
+
+### Scratch storage
+
+The Q8_K activation row (2336 bytes for cols=2048) is too large for the
+128-byte `ctx_buf` slots.  A `scratch[4096]` arena was added to
+`ggml_hpx_lowering`.  Both ctx structs hold a pointer into this arena; it is
+zero-initialized by `ggml_hpx_lowering_init` via `memset`.  `lower_op` rejects
+Q4_K nodes whose `ggml_row_size(Q8_K, cols)` exceeds 4096 (covers all
+reasonable decode widths including TinyLlama's cols=2048).
+
+### lower_op branch
+
+The MUL_MAT case in `lower_op` was refactored from a single F32-only path into
+two branches gated on weight type:
+
+- `w->type == GGML_TYPE_F32` — existing 1-region path, unchanged.
+- `w->type == GGML_TYPE_Q4_K` — new 2-region path, `rows == 1` only.
+
+Contiguity check for Q4_K: `w->nb[0] == ggml_type_size(Q4_K)` and
+`w->nb[1] == ggml_row_size(Q4_K, cols)`.  The top-level
+`if (node->type != GGML_TYPE_F32) return false` in `lower_op` was not
+changed — it remains correct because `MUL_MAT(Q4_K, F32)` always produces a
+F32 output tensor.
+
+### Selective executor interaction
+
+The REDUCTION region in the Q4_K group causes `has_reduction = true` in
+`ggml_hpx_exec_graph_selective_mul_mat`.  The selective executor currently
+falls back to the ggml CPU backend for any group containing a REDUCTION region
+(to avoid null `lane_scratch` / `reduction_buffer`).  For Q4_K nodes the
+fallback is correct — ggml handles Q4_K natively — so no incorrect output
+occurs.  Routing Q4_K through the HPX selective path without falling back
+requires either a SERIAL region kind or relaxing the `has_reduction` check to
+distinguish scratch-using reductions from scratch-free serial steps.  That is
+left for a follow-on item.
+
+### Test
+
+`LowerOpMulMatQ4KF32.StructureAndExecution` in `test_hpx_lower_op.cpp`:
+
+1. Builds a `ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 256, 2)` weight tensor
+   and a `[1 × 256]` F32 activation tensor using `no_alloc=true`.
+2. Quantizes synthetic F32 weights to Q4_K via `quantize_row_q4_K` (also
+   forward-declared via `extern "C"`).
+3. Calls `lower_op` and asserts the 2-region structure, dep edge, and ctx
+   field values.
+4. Executes via `run_group(&lo, 1, nullptr, nullptr)`.
+5. Computes a reference by calling `quantize_row_q8_K` + `ggml_vec_dot_q4_K_q8_K`
+   directly.  Both paths are deterministic with the same inputs, so
+   `EXPECT_FLOAT_EQ` (exact equality) is used.
+
+`LowerOpRejects.Q4KMultiRowReturnsFalse`: verifies that `rows=2` is rejected.
+
+### Result
+
+```
+[  PASSED  ] LowerOpMulMatQ4KF32.StructureAndExecution (0 ms)
+[  PASSED  ] LowerOpRejects.Q4KMultiRowReturnsFalse (0 ms)
+[  PASSED  ] 17 tests.  (full lower_op suite — no regressions)
+```
+
+**Answer: yes, HPX can run Q4_K MUL_MAT.**  The two kernels are proven correct
+by the unit test.  The selective executor does not yet route Q4_K nodes through
+HPX (falls back to ggml CPU); that integration is the remaining open item.
+
+### Open items
+
+- Add a SERIAL region kind (or relax the `has_reduction` guard) so the
+  selective executor routes Q4_K MUL_MAT through HPX instead of falling back.
+- Extend `rows > 1` once the rows=1 path is confirmed in the selective executor.
+- Benchmark the HPX Q4_K path against the QBRIDGE baseline once the selective
+  path integration is done.
+
+## B4: Routing Q4_K through the selective executor (real-model integration)
+
+### Question
+
+After B3 proved that HPX can execute Q4_K `MUL_MAT` in isolation, the next
+question was:
+
+> Can the selective executor route real-model Q4_K nodes through HPX and
+> preserve correctness at decode time?
+
+---
+
+### Initial symptom
+
+Selective decode on TinyLlama `Q4_K_M` produced:
+
+<s> Paris is a<unk><unk><unk>
+
+CPU baseline produced:
+
+<s> Paris is a great place to
+
+Key observation:
+- Divergence begins at decode step 1
+- Pattern suggests state corruption, not numeric noise
+
+---
+
+### Isolation
+
+Selective breakdown:
+
+- MUL_MAT (Q4_K): 122
+- MUL: 45
+- GLU: 22
+- RMS_NORM: 44 (fallback)
+- Other: ~456 (fallback)
+
+Guard experiment:
+
+LLAMA_HPX_SELECTIVE_NO_Q4K=1
+
+Result:
+- With Q4_K → incorrect
+- Without Q4_K → correct
+
+Conclusion: bug is inside Q4_K lowering path
+
+---
+
+### Strided output hypothesis
+
+Fix implemented:
+- Relax contiguity guard for rows=1
+- Add y_nb0 stride
+- Write via byte arithmetic
+
+Result:
+- Tests pass
+- No change in real model
+
+Reason:
+TinyLlama uses contiguous temporaries + ggml_cpy
+
+---
+
+### Kernel correctness
+
+Tested at production shapes:
+- 2048×256
+- 2048×2048
+- 2048×5632
+
+All match CPU within tolerance
+
+Conclusion: kernel is correct
+
+---
+
+### Root cause hypothesis
+
+Q4_K lowering:
+
+R0: quantize → writes Q8_K scratch
+R1: parallel dot → reads scratch
+
+Scratch:
+ggml_hpx_lowering::scratch[4096]
+
+In real graph:
+- ~122 nodes per decode step
+- multiple groups in flight
+
+Hazard:
+scratch reused/overwritten before read completes
+
+---
+
+### Ruled out
+
+- Quantization noise
+- QBRIDGE path
+- GLU/MUL kernels
+- KV cache striding
+
+---
+
+### Current state
+
+- Q4_K lowering integrated ✔
+- Kernel correct ✔
+- Strided output fixed ✔
+- Real decode correctness ✖
+
+---
+
+### Next step
+
+Make scratch safe:
+
+Options:
+1. per-node scratch
+2. per-lane scratch
+3. synchronous execution
+4. redesign ownership
+
+---
+
+### Big picture
+
+This is a systems bug (memory/lifetime), not math.

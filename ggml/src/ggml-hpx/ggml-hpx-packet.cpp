@@ -153,6 +153,27 @@ constexpr size_t kMlpEwMulBOff   = offsetof(ggml_hpx_mul_f32_ctx, b);
 constexpr size_t kMlpEwMulDstOff = offsetof(ggml_hpx_mul_f32_ctx, dst);
 
 // ---------------------------------------------------------------------------
+// MLP_GLU_QBRIDGE arena layout
+// ---------------------------------------------------------------------------
+//
+// 1-step SWIGLU-only packet. Gate/up MUL_MAT run via the CPU backend before
+// this packet fires, so the frame contains only the SWIGLU ctx:
+//
+//   frame base + 0    : ggml_hpx_packet_frame header (back-pointer, 8 B)
+//   frame base + 8    : SWIGLU ctx  { gate*; up*; dst*; n }  (32 B)
+//   total frame size  : 40 B, 8-byte aligned
+
+constexpr size_t kGluQBFrameHeaderSize  = 8;
+constexpr size_t kGluQBSwigluCtxSize    = sizeof(ggml_hpx_swiglu_f32_ctx);    // 32
+
+constexpr size_t kGluQBSwigluCtxOff    = kGluQBFrameHeaderSize;
+constexpr size_t kGluQBFrameBytes      = kGluQBSwigluCtxOff + kGluQBSwigluCtxSize;
+constexpr size_t kGluQBFrameAlign      = 8;
+
+// Field-level offsets inside the single SWIGLU ctx.
+// Reuse kGluSwiglu* from the MLP_GLU_F32 layout (same ctx type).
+
+// ---------------------------------------------------------------------------
 // MLP_GLU_F32 arena layout
 // ---------------------------------------------------------------------------
 //
@@ -497,6 +518,34 @@ const char * validate_mlp_glu_group(
     return nullptr;
 }
 
+// Validate that `group` is a 1-region MLP_GLU_QBRIDGE group:
+//   regions[0]: ELEMENTWISE, run_range = swiglu_f32, work [0, out_cols*rows)
+//   n_deps: 0
+const char * validate_mlp_glu_qbridge_group(
+    const ggml_hpx_cpu_region_group * group,
+    int64_t                           out_cols,
+    int64_t                           rows)
+{
+    if (group == nullptr)          return "fine_group is null";
+    if (group->n_regions != 1)     return "MLP_GLU_QBRIDGE requires exactly 1 region";
+    if (group->regions == nullptr) return "regions is null";
+
+    const int64_t n_elem = out_cols * rows;
+    const ggml_hpx_cpu_region & r0 = group->regions[0];
+
+    if (r0.kind != GGML_HPX_CPU_REGION_KIND_ELEMENTWISE)
+        return "region 0 must be ELEMENTWISE (fused SWIGLU)";
+    if (r0.run_range != ggml_hpx_swiglu_f32_run_range)
+        return "region 0 run_range must be ggml_hpx_swiglu_f32_run_range";
+    if (r0.begin != 0 || r0.end != n_elem)
+        return "region 0 work range must be [0, out_cols*rows)";
+
+    if (group->n_deps != 0)
+        return "MLP_GLU_QBRIDGE group must have zero dependency edges";
+
+    return nullptr;
+}
+
 }    // namespace
 
 // ---------------------------------------------------------------------------
@@ -804,6 +853,58 @@ ggml_hpx_frozen_packet * ggml_hpx_compile_packet(
         return packet;
     }
 
+    if (key->sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE)
+    {
+        const int64_t out_cols = key->shape[0];
+        const int64_t cols     = key->shape[1];
+        const int64_t rows     = key->shape[2];
+        if (out_cols <= 0 || cols <= 0 || rows <= 0)
+            return report_err(out_err, "key.shape[0..2] must be > 0 for MLP_GLU_QBRIDGE");
+
+        if (const char * msg = validate_mlp_glu_qbridge_group(fine_group, out_cols, rows))
+            return report_err(out_err, msg);
+
+        auto * packet = new ggml_hpx_frozen_packet{};
+        packet->key             = *key;
+        packet->n_steps         = 1;
+        packet->steps           = new PacketStep[1];
+        packet->arena_offset    = kGluQBFrameHeaderSize;
+        packet->arena_bytes     = kGluQBFrameBytes - kGluQBFrameHeaderSize;
+        packet->frame_bytes     = kGluQBFrameBytes;
+        packet->frame_alignment = kGluQBFrameAlign;
+
+        packet->res.n_lanes                     = key->n_lanes;
+        packet->res.lane_scratch_bytes_per_lane = 0;
+        packet->res.reduction_buffer_bytes      = 0;
+        packet->res.shared_scratch_bytes        = 0;
+
+        packet->ctx_template = std::malloc(packet->arena_bytes);
+        if (packet->ctx_template == nullptr)
+        {
+            delete[] packet->steps;
+            delete packet;
+            return report_err(out_err, "ctx_template allocation failed");
+        }
+        std::memset(packet->ctx_template, 0, packet->arena_bytes);
+
+        // Bake n into the SWIGLU ctx template; pointers patched by bind.
+        reinterpret_cast<ggml_hpx_swiglu_f32_ctx *>(
+            packet->ctx_template)->n = out_cols * rows;
+
+        const bool     serial  = (key->n_lanes == 1);
+        const uint32_t kind    = serial ? kStepKindSerial : kStepKindLaneFanout;
+        const uint16_t nlanes  = static_cast<uint16_t>(serial ? 1 : key->n_lanes);
+        const int64_t  n_elem  = out_cols * rows;
+
+        packet->steps[0] = PacketStep{
+            kind, ggml_hpx_swiglu_f32_run_range,
+            static_cast<uint32_t>(kGluQBSwigluCtxOff),
+            static_cast<uint32_t>(kGluQBSwigluCtxSize),
+            0, n_elem, nlanes, 0,
+        };
+        return packet;
+    }
+
     return report_err(out_err, "unsupported sublayer");
 }
 
@@ -1007,6 +1108,32 @@ void ggml_hpx_bind_mlp_glu_packet(
     *reinterpret_cast<const float **>(base + kGluSwigluCtxOff + kGluSwigluUpOff)   =
         static_cast<const float *>(binding->up);
     *reinterpret_cast<float **>      (base + kGluSwigluCtxOff + kGluSwigluDstOff)  =
+        binding->out;
+}
+
+// ---------------------------------------------------------------------------
+// Typed bind — MLP_GLU_QBRIDGE
+// ---------------------------------------------------------------------------
+
+void ggml_hpx_bind_mlp_glu_qbridge_packet(
+    ggml_hpx_packet_frame *                     frame,
+    const ggml_hpx_mlp_glu_qbridge_binding *    binding)
+{
+    assert(frame != nullptr);
+    assert(binding != nullptr);
+    assert(frame->packet != nullptr);
+    assert(frame->packet->key.sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GLU_QBRIDGE);
+    assert(binding->gate != nullptr);
+    assert(binding->up   != nullptr);
+    assert(binding->out  != nullptr);
+
+    char * const base = reinterpret_cast<char *>(frame);
+
+    *reinterpret_cast<const float **>(base + kGluQBSwigluCtxOff + kGluSwigluGateOff) =
+        static_cast<const float *>(binding->gate);
+    *reinterpret_cast<const float **>(base + kGluQBSwigluCtxOff + kGluSwigluUpOff)   =
+        static_cast<const float *>(binding->up);
+    *reinterpret_cast<float **>      (base + kGluQBSwigluCtxOff + kGluSwigluDstOff)  =
         binding->out;
 }
 

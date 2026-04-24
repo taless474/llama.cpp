@@ -253,10 +253,9 @@ comparison protocol in `CLAUDE.local.md`:
 - PACKET=1: 4.55 tok/s (219.8 ms/token)
 - **Decode speedup: 1.12× (~12%)**
 
-The earlier 2× reading from the 2026-04-18 smoke was a measurement
-artifact of CPU contention, not a property of the packet path. The
+The
 investigation that closed B.1 is documented in
-`docs/HPX_PROVENANCE.md` section 12 and in
+`docs/HPX_PROVENANCE.md` and in
 `hpx-bench/results/2026-04-20-*/`.
 
 Instrumentation left in place: `LLAMA_HPX_PACKET_COMPILE_LOG=1`

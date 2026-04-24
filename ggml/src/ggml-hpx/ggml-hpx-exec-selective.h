@@ -49,19 +49,34 @@ struct ggml_hpx_mlp_glu_packet_cache;
 //
 // When packet dispatch is enabled (both packet args non-null) and the
 // matcher pre-scan runs, every node in gf is counted in exactly one of
-// lowered_nodes, fallback_nodes, or packet_nodes. When packet dispatch is
-// disabled, packet_matches and packet_nodes stay 0 and every node lands
-// in lowered_nodes or fallback_nodes.
+// lowered_nodes, fallback_nodes, packet_nodes, or bridge_fallback_nodes.
+// When packet dispatch is disabled, packet_matches and packet_nodes stay 0
+// and every node lands in lowered_nodes or fallback_nodes.
+//
+// QBRIDGE-specific breakdown:
+//   bridge_fallback_nodes  — gate_mm + up_mm ggml nodes run via CPU backend
+//                            as part of a QBRIDGE dispatch (2 per match)
+//   bridge_fallback_ns     — wall time for those CPU backend calls
+//   packet_nodes           — only the GLU trigger node (1 per QBRIDGE match)
+//   packet_dispatch_ns     — run_frozen_packet (SWIGLU only) wall time
+//
+// MLP_GLU_F32 (F32 weights, 3-step packet):
+//   packet_nodes           — 3 per match (gate_mm + up_mm + glu trigger)
+//   bridge_fallback_nodes  — 0 (gate_mm + up_mm execute inside the packet)
 struct ggml_hpx_selective_stats {
-    uint32_t lowered_nodes      = 0; // nodes through the fine-region path
-    uint32_t fallback_nodes     = 0; // nodes through the CPU-backend fallback
-    uint32_t packet_matches     = 0; // repeated sublayer patterns dispatched
-    uint32_t packet_nodes       = 0; // ggml nodes consumed by packet matches
-                                     //   (MLP gate/up: 4 per match; MLP GLU: 3 per match)
-    uint64_t lowered_ns         = 0; // wall time for all lowered dispatches
-    uint64_t fallback_ns        = 0; // wall time for all fallback dispatches
-    uint64_t packet_dispatch_ns = 0; // bind + run time across packet matches
-                                     //   (cache-miss compile cost is NOT included)
+    uint32_t lowered_nodes         = 0; // nodes through the fine-region path
+    uint32_t fallback_nodes        = 0; // nodes through the CPU-backend fallback
+    uint32_t packet_matches        = 0; // repeated sublayer patterns dispatched
+    uint32_t packet_nodes          = 0; // ggml nodes whose work ran inside a packet
+                                        //   (MLP gate/up: 4; MLP_GLU_F32: 3; QBRIDGE: 1)
+    uint32_t bridge_fallback_nodes = 0; // QBRIDGE: gate_mm + up_mm run via CPU backend
+                                        //   (2 per QBRIDGE match; 0 for all other paths)
+    uint64_t lowered_ns            = 0; // wall time for all lowered dispatches
+    uint64_t fallback_ns           = 0; // wall time for all fallback dispatches
+    uint64_t packet_dispatch_ns    = 0; // bind + run_frozen_packet time
+                                        //   (cache-miss compile cost is NOT included)
+    uint64_t bridge_fallback_ns    = 0; // QBRIDGE: wall time for the two CPU backend
+                                        //   MUL_MAT calls that precede the SWIGLU packet
 };
 
 // ---------------------------------------------------------------------------

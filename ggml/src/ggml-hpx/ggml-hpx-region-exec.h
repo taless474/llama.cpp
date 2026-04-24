@@ -100,6 +100,56 @@ void ggml_hpx_mul_mat_f32_run_range(
     int64_t                     end,
     ggml_hpx_region_resources * resources);
 
+// ── Q4_K decode pipeline: two-region serial-then-parallel decomposition ────
+//
+// Region 0 (REDUCTION — serial): ggml_hpx_quantize_q8_k_f32
+//   Quantizes the single F32 activation row to Q8_K scratch.
+//   Runs with ith=0, nth=1 enforced by REDUCTION semantics in
+//   launch_region_async.  Scratch pointer lives in the caller's
+//   ggml_hpx_lowering::scratch arena (see ggml-hpx-lower.h).
+//   Uses no resources (lane_scratch / reduction_buffer are unused).
+//
+// Region 1 (MATMUL — parallel): ggml_hpx_mul_mat_q4_k_q8_k
+//   For each output column j in [begin, end):
+//     y[j] = ggml_vec_dot_q4_K_q8_K(W_q4k[j], x_q8)
+//   Dep edge 0→1 ensures the quantize region completes before fan-out.
+//   Uses no resources.
+
+typedef struct ggml_hpx_quantize_q8_k_f32_ctx
+{
+    const float * x;     // F32 input row [cols]
+    void *        x_q8;  // Q8_K output; points into ggml_hpx_lowering::scratch
+    int64_t       cols;  // must be a multiple of QK_K (256)
+} ggml_hpx_quantize_q8_k_f32_ctx;
+
+void ggml_hpx_quantize_q8_k_f32_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
+typedef struct ggml_hpx_mul_mat_q4_k_q8_k_ctx
+{
+    const void * w_q4k;        // Q4_K weight data [out_cols × w_row_stride]
+    const void * x_q8;         // Q8_K quantized input; shared with region 0 scratch
+    float *      y;            // F32 output base pointer
+    int64_t      cols;         // shared dim; multiple of QK_K (256)
+    int64_t      out_cols;     // output columns; work range is [0, out_cols)
+    size_t       w_row_stride; // ggml_row_size(GGML_TYPE_Q4_K, cols)
+    size_t       q8k_row_bytes;// ggml_row_size(GGML_TYPE_Q8_K, cols); passed as by
+    size_t       y_nb0;        // output element byte stride (node->nb[0]); normally sizeof(float)
+} ggml_hpx_mul_mat_q4_k_q8_k_ctx;
+
+void ggml_hpx_mul_mat_q4_k_q8_k_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
 // ── F32 RMS_NORM kernels ─────────────────────────────────────────────────
 //
 // Three-region decomposition of one F32 RMS_NORM row:
