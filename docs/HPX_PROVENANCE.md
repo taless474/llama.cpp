@@ -5173,3 +5173,35 @@ Options:
 ### Big picture
 
 This is a systems bug (memory/lifetime), not math.
+
+### Root cause: CPU_REPACK changes Q4_K memory layout
+
+On Apple Silicon, the CPU backend may use `CPU_REPACK`. In that mode, ggml repacks Q4_K weight tensors from normal `block_q4_K[]` layout into an interleaved `block_q4_Kx8[]` layout for SIMD. The tensor still reports `type == GGML_TYPE_Q4_K`, but `tensor->extra` is non-null and points to tensor-specific traits for the repacked layout.
+
+Our Q4_K lowering only checked `w->type == GGML_TYPE_Q4_K`, so it incorrectly accepted repacked weights. The HPX kernel then called `ggml_vec_dot_q4_K_q8_K`, which expects normal `block_q4_K[]` bytes, on a `block_q4_Kx8[]` buffer. That produced huge incorrect values and eventually `<unk>` decode output.
+
+Fix:
+
+```cpp
+if (w->extra != nullptr)
+    return false;
+```
+This keeps repacked Q4_K tensors on the ggml CPU fallback path, which knows how to handle the `tensor_traits` / repacked layout correctly.
+
+Result:
+
+- HPX selective no longer corrupts TinyLlama Q4_K_M decode
+- CPU-only real-model output is coherent again
+- Q4_K lowering remains enabled only for non-repacked `block_q4_K` tensors
+
+### Verification: repacked Q4_K guard
+
+The Q4_K selective bug was traced to Apple Silicon `CPU_REPACK`: tensors still report `GGML_TYPE_Q4_K`, but `w->extra != nullptr` means the backing memory is a repacked `block_q4_Kx8` layout, not normal `block_q4_K[]`. The HPX Q4_K kernel expects the normal layout, so `lower_op` now rejects repacked tensors and falls back to ggml CPU.
+
+Verified:
+- Q4_K unit tests: 5/5 pass
+- all HPX tests: 27/27 pass
+- TinyLlama Q4_K_M CPU baseline and HPX selective both generate coherent identical-prefix output, no `<unk>` collapse
+- selective stats: `lowered=67`, `fallback=622`, `packet=0`
+
+This makes Q4_K lowering safe for non-repacked tensors. Supporting Apple Silicon repacked Q4_K tensors would require a separate `Q4_Kx8`-aware HPX path.

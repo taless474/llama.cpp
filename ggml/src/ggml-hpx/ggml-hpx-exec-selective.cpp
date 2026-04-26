@@ -26,6 +26,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <memory>

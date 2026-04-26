@@ -2297,7 +2297,6 @@ ggml_status llama_context::graph_compute(
             const bool is_cpu_only = (n_splits == 1)
                 && (gf->n_nodes > 0)
                 && (ggml_backend_sched_get_tensor_backend(sched.get(), gf->nodes[0]) == backend_cpu);
-
             if (!is_cpu_only) {
                 static bool warned = false;
                 if (!warned) {

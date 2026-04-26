@@ -243,6 +243,10 @@ bool ggml_hpx_lower_op(
         if (w->type == GGML_TYPE_Q4_K && x->type == GGML_TYPE_F32)
         {
             if (std::getenv("LLAMA_HPX_SELECTIVE_NO_Q4K")) return false;
+            // Repacked tensors have tensor->extra set to a tensor_traits pointer.
+            // Their data is in block_q4_Kx8 layout which ggml_vec_dot_q4_K_q8_K
+            // cannot read.  Let the CPU backend handle them instead.
+            if (w->extra != nullptr) return false;
             if (rows != 1) return false;
             if (cols % ggml_blck_size(GGML_TYPE_Q4_K) != 0) return false;
 

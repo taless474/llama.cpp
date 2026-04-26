@@ -162,4 +162,4 @@ build-*/
 
 /CLAUDE.local.md
 /compile_commands.json
-.DS_Store
+**/.DS_Store
