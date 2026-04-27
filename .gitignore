@@ -160,6 +160,6 @@ build.ninja
 build/
 build-*/
 
+.DS_Store
 /CLAUDE.local.md
 /compile_commands.json
-**/.DS_Store
