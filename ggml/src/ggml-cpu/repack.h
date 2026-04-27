@@ -137,6 +137,11 @@ static_assert(sizeof(block_mxfp4x8) == 8 + QK_MXFP4 * 4, "wrong mxfp4x8 block si
 extern "C" {
 #endif
 
+// Returns a static string identifying the repack tensor_traits installed in
+// op->src[0]->extra (e.g. "q4_K_8x8_q8_K"), or NULL if the tensor does not use
+// the CPU_REPACK extra path. Used by GGML_CPU_LOG_MULMAT_PATH instrumentation.
+const char * ggml_repack_extra_traits_name(const struct ggml_tensor * op);
+
 void ggml_quantize_mat_q8_0_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);

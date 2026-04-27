@@ -50,6 +50,19 @@
 #include "llamafile/sgemm.h"
 #endif
 
+// dladdr is used only by GGML_CPU_LOG_MULMAT_PATH instrumentation to resolve
+// vec_dot function pointers to symbol names. Guarded so static builds and
+// platforms without dlfcn.h still compile cleanly.
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <dlfcn.h>
+#define GGML_CPU_LOG_HAVE_DLADDR 1
+#else
+#define GGML_CPU_LOG_HAVE_DLADDR 0
+#endif
+
+// Defined in ggml-cpu/repack.cpp; declared here because repack.h is a C++ header.
+extern const char * ggml_repack_extra_traits_name(const struct ggml_tensor * op);
+
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
@@ -1663,11 +1676,104 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// Baseline-only instrumentation: log the actual ggml-cpu execution path for
+// each MUL_MAT / MUL_MAT_ID node, once per unique tensor pointer. Three
+// buckets are kept separate:
+//   logical   - what the tensor says it is (ggml_type_name(src0->type))
+//   physical  - the buffer-type and tensor_traits installed in src0->extra
+//   kernel    - the gemv/gemm or vec_dot family that will actually run
+// Enabled with GGML_CPU_LOG_MULMAT_PATH=1.
+static void ggml_cpu_log_mulmat_path_once(const struct ggml_tensor * tensor) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * v = getenv("GGML_CPU_LOG_MULMAT_PATH");
+        enabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (!enabled) {
+        return;
+    }
+    if (tensor->op != GGML_OP_MUL_MAT && tensor->op != GGML_OP_MUL_MAT_ID) {
+        return;
+    }
+
+    enum { CAP = 1024 };
+    static const struct ggml_tensor * seen[CAP];
+    static int n_seen = 0;
+    for (int i = 0; i < n_seen; i++) {
+        if (seen[i] == tensor) {
+            return;
+        }
+    }
+    if (n_seen < CAP) {
+        seen[n_seen++] = tensor;
+    }
+
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    if (src0 == NULL || src1 == NULL) {
+        return;
+    }
+
+    const char * buft_name = "NULL";
+    if (src0->buffer && src0->buffer->buft && src0->buffer->buft->iface.get_name) {
+        buft_name = src0->buffer->buft->iface.get_name(src0->buffer->buft);
+    }
+
+    const char * trait_name = ggml_repack_extra_traits_name(tensor);
+    const int    has_trait  = (trait_name != NULL);
+
+    char         kernel_buf[128];
+    const char * kernel_name;
+    if (has_trait) {
+        kernel_name = trait_name;
+    } else {
+        ggml_vec_dot_t fn = type_traits_cpu[src0->type].vec_dot;
+#if GGML_CPU_LOG_HAVE_DLADDR
+        Dl_info info;
+        if (fn != NULL && dladdr((const void *) fn, &info) && info.dli_sname) {
+            kernel_name = info.dli_sname;
+        } else {
+            snprintf(kernel_buf, sizeof(kernel_buf), "<vec_dot@%p>", (const void *) fn);
+            kernel_name = kernel_buf;
+        }
+#else
+        snprintf(kernel_buf, sizeof(kernel_buf), "<vec_dot@%p>", (const void *) fn);
+        kernel_name = kernel_buf;
+#endif
+    }
+
+    const int64_t cols     = src0->ne[0];
+    const int64_t out_cols = src0->ne[1];
+    const int64_t rows     = src1->ne[1];
+
+    fprintf(stderr,
+            "[mulmat-path] name=%s op=%s\n"
+            "              logical  = %s\n"
+            "              physical = extra=%p buft=%s trait=%s\n"
+            "              kernel   = %s\n"
+            "              shape    = cols=%" PRId64 " out_cols=%" PRId64 " rows=%" PRId64 "\n"
+            "              src1=%s dst=%s\n",
+            tensor->name,
+            ggml_op_name(tensor->op),
+            ggml_type_name(src0->type),
+            src0->extra,
+            buft_name,
+            has_trait ? trait_name : "NONE",
+            kernel_name,
+            cols, out_cols, rows,
+            ggml_type_name(src1->type),
+            ggml_type_name(tensor->type));
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
+    }
+
+    if (params->ith == 0) {
+        ggml_cpu_log_mulmat_path_once(tensor);
     }
 
     // extra_buffer op?

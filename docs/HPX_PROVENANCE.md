@@ -5205,3 +5205,500 @@ Verified:
 - selective stats: `lowered=67`, `fallback=622`, `packet=0`
 
 This makes Q4_K lowering safe for non-repacked tensors. Supporting Apple Silicon repacked Q4_K tensors would require a separate `Q4_Kx8`-aware HPX path.
+
+## B4.1: Selective graph-entry bailout
+
+### Problem
+
+On M4 Q4_K_M, all important Q4_K matmuls arrive repacked:
+
+```cpp
+w->type == GGML_TYPE_Q4_K
+w->extra != nullptr
+```
+
+The current HPX lowering correctly rejects those tensors, but the selective executor still entered and fragmented fallback execution:
+
+```text
+fallback node 1 → ggml_backend_graph_compute
+fallback node 2 → ggml_backend_graph_compute
+...
+fallback node 622 → ggml_backend_graph_compute
+```
+
+This caused the observed slowdown:
+
+```text
+HPX selective before guard: ~10.7 tok/s
+Plain CPU baseline:         ~100 tok/s
+```
+
+### Fix
+
+Added:
+
+```cpp
+bool ggml_hpx_selective_should_engage(const ggml_cgraph * gf);
+```
+
+The predicate performs a cheap graph prescan.
+
+It returns false when:
+
+```text
+graph has MUL_MAT nodes
+and none of those MUL_MAT nodes are lowerable by HPX
+```
+
+The engagement decision is intentionally based on lowerable `MUL_MAT`, not on any lowerable op. The small non-matmul lowered nodes are not worth fragmenting hundreds of fallback calls.
+
+### Files changed
+
+```text
+ggml/src/ggml-hpx/ggml-hpx-exec-selective.h
+ggml/src/ggml-hpx/ggml-hpx-exec-selective.cpp
+src/llama-context.cpp
+```
+
+### Validation
+
+Build succeeded.
+
+HPX tests:
+
+```text
+27/27 pass
+```
+
+TinyLlama Q4_K_M smoke and timing validation:
+
+```text
+Skip log fires once:
+[hpx-selective] disabled: no lowerable MUL_MAT in graph — falling back to scheduler
+
+Output:
+coherent, baseline prefix, no <unk> collapse
+
+Throughput:
+101.9 ± 2.5 tok/s
+```
+
+Comparison:
+
+```text
+Prior unguarded selective: 10.7 ± 0.8 tok/s
+Guarded selective:        101.9 ± 2.5 tok/s
+Plain CPU baseline:       100.2 ± 5.3 tok/s
+```
+
+Conclusion:
+
+```text
+The 9.5× regression was fallback fragmentation, not HPX Q4_K math.
+The graph-entry bailout restores baseline behavior when HPX owns no expensive matmul work.
+```
+
+Saved results:
+
+```text
+hpx-bench/results/2026-04-26-selective-guard/
+```
+
+Suggested commit:
+
+```text
+Skip HPX selective when no MUL_MAT will lower
+```
+
+---
+
+## B4.2: Fallback-bucket histogram
+
+### Goal
+
+Measure what the would-fallback graph contains before starting repacked Q4_Kx8 support.
+
+Question:
+
+```text
+Of the MUL_MAT nodes in real TinyLlama Q4_K_M decode,
+how many are repacked Q4_K versus other unsupported quantized matmuls?
+```
+
+### Implementation
+
+Added:
+
+```cpp
+void ggml_hpx_selective_log_node_histogram(const ggml_cgraph * gf);
+```
+
+Controlled by:
+
+```text
+LLAMA_HPX_SELECTIVE_HIST=1
+```
+
+Properties:
+
+```text
+warned-once per process
+no-op when disabled
+single graph walk
+no dispatch
+no lower_op calls
+```
+
+The call is placed before the selective skip/engage decision so the histogram still fires even when B4.1 skips the graph.
+
+### Histogram result
+
+TinyLlama Q4_K_M decode:
+
+```text
+n_nodes = 689
+
+MUL_MAT/Q4_K-repacked    = 134
+MUL_MAT/Q4_K-nonrepacked = 0
+MUL_MAT/F32xF32          = 0
+MUL_MAT/other-quant      = 21
+MUL_MAT/other            = 0
+```
+
+Non-MUL_MAT nodes:
+
+```text
+ADD            = 44
+MUL            = 45
+RMS_NORM       = 45
+CPY            = 1
+RESHAPE        = 88
+VIEW           = 110
+PERMUTE        = 66
+GET_ROWS       = 3
+SET_ROWS       = 44
+ROPE           = 44
+FLASH_ATTN_EXT = 22
+GLU            = 22
+```
+
+Interpretation:
+
+```text
+Total MUL_MAT nodes:         155
+Repacked Q4_K MUL_MAT nodes: 134
+Other quant MUL_MAT nodes:    21
+```
+
+By node count:
+
+```text
+Q4_K-repacked = 87% of MUL_MAT nodes
+```
+
+Saved results:
+
+```text
+hpx-bench/results/2026-04-26-fallback-histogram/
+```
+
+---
+
+## B4.2b: Shape-weighted histogram
+
+Node count can mislead, so the histogram was extended to include shapes.
+
+Shape convention:
+
+```text
+cols     = w->ne[0]
+out_cols = w->ne[1]
+rows     = x->ne[1]
+```
+
+Q4_K-repacked shapes:
+
+```text
+2048 × 2048 × 1   × 44   Wq + Wo
+2048 × 256  × 1   × 34   Wk on all 22 layers + Wv on 12 layers
+2048 × 5632 × 1   × 44   gate + up
+5632 × 2048 × 1   × 12   ffn_down on 12 layers
+```
+
+Other-quant shapes:
+
+```text
+2048 × 256   × 1  × 10   Wv on 10 layers, likely Q6_K
+5632 × 2048  × 1  × 10   ffn_down on 10 layers, likely Q6_K
+2048 × 32000 × 1  × 1    lm_head, likely Q6_K
+```
+
+FLOP-weighted estimate:
+
+```text
+Q4_K-repacked = ~82% of MUL_MAT FLOPs
+Other-quant   = ~18% of MUL_MAT FLOPs
+```
+
+Conclusion:
+
+```text
+B5A should target repacked Q4_Kx8 first.
+Q6_K is a follow-up, not part of B5A.
+```
+
+---
+
+## B5A study: repacked Q4_Kx8 path
+
+### What `w->extra` points to
+
+For repacked Q4_K tensors:
+
+```cpp
+w->extra
+```
+
+points to a:
+
+```cpp
+ggml::cpu::tensor_traits *
+```
+
+On M4 with NEON + `matmul_int8`, the relevant trait is:
+
+```text
+q4_K_8x8_q8_K
+```
+
+Important caveat:
+
+```text
+w->extra != nullptr means repacked.
+It does not always mean q4_K_8x8_q8_K on every platform.
+```
+
+Some systems may use a different repacked trait, such as `q4_K_8x4_q8_K`.
+
+### Dispatch path today
+
+Current ggml CPU flow:
+
+```text
+tensor_traits->compute_forward(params, op)
+    → forward_mul_mat
+        → quantize F32 activation
+        → ggml barrier/threadpool chunking
+        → forward_mul_mat_one_chunk
+            → ggml_gemv_* / ggml_gemm_*
+```
+
+### Recommended wrap level
+
+Do **not** wrap `compute_forward`. That would just reuse ggml’s whole threaded execution path and would not give HPX meaningful ownership.
+
+Instead, wrap the lower-level public kernels:
+
+```text
+ggml_gemv_q4_K_8x8_q8_K
+ggml_gemm_q4_K_8x8_q8_K
+```
+
+For decode-only B5A, the important path is:
+
+```text
+F32 activation → Q8_K row
+Q4_Kx8 weights × Q8_K activation → F32 output
+```
+
+Use:
+
+```text
+ggml_quantize_row_q8_K
+ggml_gemv_q4_K_8x8_q8_K
+```
+
+HPX should own:
+
+```text
+activation quantization
+output-column lane splitting
+calling ggml gemv on disjoint output ranges
+```
+
+This avoids writing new SIMD code while still giving HPX scheduling ownership.
+
+---
+
+## Recommended B5A scope
+
+Keep B5A narrow:
+
+```text
+B5A = decode-only repacked Q4_Kx8 support
+```
+
+Do not include Q6_K yet.
+
+Proposed lowering:
+
+```text
+R0: F32 activation → Q8_K scratch
+R1: Q4_Kx8 × Q8_K gemv → F32 output
+```
+
+Expected after B5A:
+
+```text
+Before:
+Q4_K-repacked fallback nodes = 134
+
+After:
+Q4_K-repacked lowered nodes ≈ 134
+```
+
+Residual unsupported matmuls:
+
+```text
+21 other-quant nodes
+```
+
+Likely Q6_K:
+
+```text
+Wv on 10 layers
+ffn_down on 10 layers
+lm_head
+```
+
+Those can be a later B5B/B5C target.
+
+---
+
+## Open questions before B5A coding
+
+### 1. Trait identity
+
+Need a clean way to confirm:
+
+```text
+w->extra is specifically q4_K_8x8_q8_K
+```
+
+Do not rely only on:
+
+```cpp
+w->extra != nullptr
+```
+
+Recommendation:
+
+```text
+Find or add a small ggml-cpu helper/probe for trait identity.
+```
+
+### 2. Link path
+
+Need to confirm:
+
+```text
+ggml-hpx can link against ggml_gemv_q4_K_8x8_q8_K
+```
+
+Check:
+
+```text
+symbol visibility
+ggml-cpu link dependency
+header/platform guards
+```
+
+### 3. Range alignment
+
+Need to confirm required alignment for output-column ranges.
+
+Expected:
+
+```text
+ranges should align to NB_COLS = 8
+```
+
+### 4. Decode-only first
+
+B5A should support:
+
+```text
+rows == 1
+```
+
+Do not implement prefill Q8_Kx4 packing in the first cut.
+
+---
+
+## Current status
+
+Completed:
+
+```text
+B4.1 graph-entry selective bailout
+B4.2 fallback-bucket histogram
+B4.2b shape-weighted histogram
+B5A read-only study
+```
+
+Validated:
+
+```text
+27/27 HPX tests pass
+TinyLlama Q4_K_M guarded selective path restored to ~102 tok/s
+Output coherent, no <unk> collapse
+```
+
+Main conclusion:
+
+```text
+The current HPX Q4_K lowering works only for normal block_q4_K.
+Real TinyLlama Q4_K_M on M4 mostly uses repacked Q4_Kx8.
+The selective executor now avoids catastrophic fallback fragmentation.
+The histogram shows repacked Q4_Kx8 support is worth doing next.
+```
+
+Recommended next task:
+
+```text
+B5A: implement decode-only repacked Q4_Kx8 support by wrapping ggml's existing gemv kernel at HPX lane granularity.
+```
+
+First B5A micro-step:
+
+```text
+Find or add a clean trait-identity helper so HPX can distinguish q4_K_8x8_q8_K from other repacked Q4_K traits.
+```
+
+---
+
+## Performance status
+
+There is still no positive HPX speedup result for real-model Q4_K matmul ownership.
+
+What we have is a performance-regression fix:
+
+```text
+Before B4.1:
+HPX selective all-fallback path: ~10.7 tok/s
+
+After B4.1:
+HPX selective guarded path: ~101.9 ± 2.5 tok/s
+
+Plain CPU baseline:
+~100.2 ± 5.3 tok/s
+```
+
+So the current performance result is:
+
+```text
+The selective executor no longer makes unsupported Q4_K_M graphs much slower.
+It now matches baseline when HPX cannot own the matmuls.
+```
+
+The next real speedup test should happen after B5A, when HPX can actually own the 134 repacked Q4_K matmuls in TinyLlama Q4_K_M decode.

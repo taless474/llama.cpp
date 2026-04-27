@@ -4525,51 +4525,91 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 }  // namespace ggml::cpu::repack
 
-static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
-    // instance for Q4
-    static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 4, GGML_TYPE_Q8_0> q4_0_4x4_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 4, GGML_TYPE_Q8_0> q4_0_4x8_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 8, GGML_TYPE_Q8_0> q4_0_8x8_q8_0;
+namespace {
+// Hoisted from ggml_repack_get_optimal_repack_type so that
+// ggml_repack_extra_traits_name can identify which trait is installed in
+// op->src[0]->extra by pointer comparison. Anonymous namespace gives internal
+// linkage and program-lifetime, matching the previous function-static
+// behavior. Names are kept identical so the existing `return &name;` lines
+// in the dispatcher resolve unchanged.
 
-    // instance for Q4_K
-    static const ggml::cpu::repack::tensor_traits<block_q4_K, 4, 8, GGML_TYPE_Q8_K> q4_K_8x4_q8_K;
-    static const ggml::cpu::repack::tensor_traits<block_q4_K, 8, 8, GGML_TYPE_Q8_K> q4_K_8x8_q8_K;
+// instance for Q4
+const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 4, GGML_TYPE_Q8_0> q4_0_4x4_q8_0;
+const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 4, GGML_TYPE_Q8_0> q4_0_4x8_q8_0;
+const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 8, GGML_TYPE_Q8_0> q4_0_8x8_q8_0;
 
-    // instance for Q5_K
-    static const ggml::cpu::repack::tensor_traits<block_q5_K, 4, 8, GGML_TYPE_Q8_K> q5_K_8x4_q8_K;
-    static const ggml::cpu::repack::tensor_traits<block_q5_K, 8, 8, GGML_TYPE_Q8_K> q5_K_8x8_q8_K;
+// instance for Q4_K
+const ggml::cpu::repack::tensor_traits<block_q4_K, 4, 8, GGML_TYPE_Q8_K> q4_K_8x4_q8_K;
+const ggml::cpu::repack::tensor_traits<block_q4_K, 8, 8, GGML_TYPE_Q8_K> q4_K_8x8_q8_K;
 
-    // instance for Q6_K
-    static const ggml::cpu::repack::tensor_traits<block_q6_K, 4, 8, GGML_TYPE_Q8_K> q6_K_8x4_q8_K;
-    static const ggml::cpu::repack::tensor_traits<block_q6_K, 8, 8, GGML_TYPE_Q8_K> q6_K_8x8_q8_K;
+// instance for Q5_K
+const ggml::cpu::repack::tensor_traits<block_q5_K, 4, 8, GGML_TYPE_Q8_K> q5_K_8x4_q8_K;
+const ggml::cpu::repack::tensor_traits<block_q5_K, 8, 8, GGML_TYPE_Q8_K> q5_K_8x8_q8_K;
 
-    // instance for Q2
-    static const ggml::cpu::repack::tensor_traits<block_q2_K, 8, 8, GGML_TYPE_Q8_K> q2_K_8x8_q8_K;
+// instance for Q6_K
+const ggml::cpu::repack::tensor_traits<block_q6_K, 4, 8, GGML_TYPE_Q8_K> q6_K_8x4_q8_K;
+const ggml::cpu::repack::tensor_traits<block_q6_K, 8, 8, GGML_TYPE_Q8_K> q6_K_8x8_q8_K;
 
-    // instance for IQ4
-    static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0> iq4_nl_4x4_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0> iq4_nl_8x8_q8_0;
+// instance for Q2
+const ggml::cpu::repack::tensor_traits<block_q2_K, 8, 8, GGML_TYPE_Q8_K> q2_K_8x8_q8_K;
 
-    // instance for MXFP4
-    static const ggml::cpu::repack::tensor_traits<block_mxfp4, 4, 4, GGML_TYPE_Q8_0> mxfp4_4x4_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_mxfp4, 8, 8, GGML_TYPE_Q8_0> mxfp4_8x8_q8_0;
+// instance for IQ4
+const ggml::cpu::repack::tensor_traits<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0> iq4_nl_4x4_q8_0;
+const ggml::cpu::repack::tensor_traits<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0> iq4_nl_8x8_q8_0;
 
-    // instance for Q8_0
-    static const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
+// instance for MXFP4
+const ggml::cpu::repack::tensor_traits<block_mxfp4, 4, 4, GGML_TYPE_Q8_0> mxfp4_4x4_q8_0;
+const ggml::cpu::repack::tensor_traits<block_mxfp4, 8, 8, GGML_TYPE_Q8_0> mxfp4_8x8_q8_0;
 
-    // instances for RISC-V
-    //
-    // These implement outer-product style matrix multiplication kernels with
-    // an interleave of 1.
+// instance for Q8_0
+const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
+const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
+
+// instances for RISC-V
+//
+// These implement outer-product style matrix multiplication kernels with
+// an interleave of 1.
 #if defined __riscv_zvfh
-    static const ggml::cpu::repack::tensor_traits<block_q4_0, 1, 16, GGML_TYPE_Q8_0> q4_0_16x1_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_q4_K, 1, 16, GGML_TYPE_Q8_K> q4_K_16x1_q8_K;
-    static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 1, 16, GGML_TYPE_Q8_0> iq4_nl_16x1_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_q8_0, 1, 16, GGML_TYPE_Q8_0> q8_0_16x1_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_q2_K, 1, 16, GGML_TYPE_Q8_K> q2_K_16x1_q8_K;
+const ggml::cpu::repack::tensor_traits<block_q4_0, 1, 16, GGML_TYPE_Q8_0> q4_0_16x1_q8_0;
+const ggml::cpu::repack::tensor_traits<block_q4_K, 1, 16, GGML_TYPE_Q8_K> q4_K_16x1_q8_K;
+const ggml::cpu::repack::tensor_traits<block_iq4_nl, 1, 16, GGML_TYPE_Q8_0> iq4_nl_16x1_q8_0;
+const ggml::cpu::repack::tensor_traits<block_q8_0, 1, 16, GGML_TYPE_Q8_0> q8_0_16x1_q8_0;
+const ggml::cpu::repack::tensor_traits<block_q2_K, 1, 16, GGML_TYPE_Q8_K> q2_K_16x1_q8_K;
 #endif
+}  // anonymous namespace
 
+extern "C" const char * ggml_repack_extra_traits_name(const struct ggml_tensor * op) {
+    if (!op || !op->src[0] || op->src[0]->extra == nullptr) {
+        return nullptr;
+    }
+    const void * t = op->src[0]->extra;
+    if (t == &q4_0_4x4_q8_0)    return "q4_0_4x4_q8_0";
+    if (t == &q4_0_4x8_q8_0)    return "q4_0_4x8_q8_0";
+    if (t == &q4_0_8x8_q8_0)    return "q4_0_8x8_q8_0";
+    if (t == &q4_K_8x4_q8_K)    return "q4_K_8x4_q8_K";
+    if (t == &q4_K_8x8_q8_K)    return "q4_K_8x8_q8_K";
+    if (t == &q5_K_8x4_q8_K)    return "q5_K_8x4_q8_K";
+    if (t == &q5_K_8x8_q8_K)    return "q5_K_8x8_q8_K";
+    if (t == &q6_K_8x4_q8_K)    return "q6_K_8x4_q8_K";
+    if (t == &q6_K_8x8_q8_K)    return "q6_K_8x8_q8_K";
+    if (t == &q2_K_8x8_q8_K)    return "q2_K_8x8_q8_K";
+    if (t == &iq4_nl_4x4_q8_0)  return "iq4_nl_4x4_q8_0";
+    if (t == &iq4_nl_8x8_q8_0)  return "iq4_nl_8x8_q8_0";
+    if (t == &mxfp4_4x4_q8_0)   return "mxfp4_4x4_q8_0";
+    if (t == &mxfp4_8x8_q8_0)   return "mxfp4_8x8_q8_0";
+    if (t == &q8_0_4x4_q8_0)    return "q8_0_4x4_q8_0";
+    if (t == &q8_0_4x8_q8_0)    return "q8_0_4x8_q8_0";
+#if defined __riscv_zvfh
+    if (t == &q4_0_16x1_q8_0)   return "q4_0_16x1_q8_0";
+    if (t == &q4_K_16x1_q8_K)   return "q4_K_16x1_q8_K";
+    if (t == &iq4_nl_16x1_q8_0) return "iq4_nl_16x1_q8_0";
+    if (t == &q8_0_16x1_q8_0)   return "q8_0_16x1_q8_0";
+    if (t == &q2_K_16x1_q8_K)   return "q2_K_16x1_q8_K";
+#endif
+    return "<unknown>";
+}
+
+static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
     if (cur->type == GGML_TYPE_Q4_0) {
         if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {
             if (cur->ne[1] % 8 == 0) {

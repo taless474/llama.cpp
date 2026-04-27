@@ -103,3 +103,94 @@ before using any ctx data.
 4. Add correctness tests in `tests/hpx/`.
 5. If multi-region: add a sublayer enum value in `ggml-hpx-packet.h` and a
    validator + compile path in `ggml-hpx-packet.cpp`.
+
+---
+
+## Appendix — what `ggml-cpu` actually does on Q4_K_M decode
+
+Before deciding what HPX should lower, we mapped what the baseline already
+runs. Strict baseline: `-DGGML_HPX=OFF -DGGML_HPX_REGION_DAG=OFF`, no
+`LLAMA_HPX_*` env vars, only `GGML_CPU_LOG_MULMAT_PATH=1` instrumentation
+in `ggml/src/ggml-cpu/ggml-cpu.c`. TinyLlama-1.1B Q4_K_M on Apple M4
+(NEON + matmul-int8 + dotprod). Full data:
+`hpx-bench/results/2026-04-26-baseline-execution-map/`.
+
+### Three buckets, separated
+
+For every `MUL_MAT` in the decode graph:
+
+| bucket | observation |
+|---|---|
+| **logical** (`src0->type`) | `q4_K` for Q/K/Out + FFN gate/up; `q6_K` for V, ffn_out, lm_head |
+| **physical** (`src0->extra`, buft) | every weight uses `buft = CPU_REPACK`, `extra != NULL`, with trait `q4_K_8x8_q8_K` or `q6_K_8x8_q8_K` |
+| **kernel** | the trait family — `ggml_gemv_q*_K_8x8_q8_K` on decode; `ggml_gemm_q*_K_8x8_q8_K` on prefill |
+
+### Why this matters
+
+The standard `ggml_compute_forward_mul_mat` switch
+(`ggml-cpu.c:1791-1794` → `ggml-cpu.c:1215`) — the path that uses
+`type_traits_cpu[Q4_K].vec_dot = ggml_vec_dot_q4_K_q8_K` — **never runs**
+for Q4_K_M weights on this hardware. `ggml_cpu_extra_compute_forward`
+(`traits.cpp:12`) short-circuits earlier in `ggml_compute_forward`
+(`ggml-cpu.c:1674`) because `CPU_REPACK`'s `init_tensor` populates
+`tensor->extra` for every weight.
+
+The repack trait's gemv-vs-gemm split is structural, not in the log:
+
+```
+ggml/src/ggml-cpu/repack.cpp:4241
+    if (nrows > 3) gemm<...>(...)
+    for (iter = nrows - (nrows % 4); iter < nrows; iter++)
+        gemv<...>(..., 1 /* nrows */, ...)
+```
+
+`nrows = src1_end - src1_start`, ultimately bounded by `src1->ne[1]`. For
+pure decode `ne11 = 1`, so `nrows = 1`, so only the gemv kernel fires.
+A per-chunk runtime hook to confirm gemv vs gemm was considered and
+deliberately skipped — the structural argument is sufficient.
+
+### What this changes for HPX
+
+Earlier reasoning sometimes treated the standard `vec_dot_q4_K_q8_K` as the
+baseline HPX would replace or compete with. That comparison is meaningless
+because the standard path doesn't run for Q4_K_M. The real baseline is:
+
+> Repacked Q4_K weights, F32 src1 quantized to Q8_K wdata in the existing
+> per-thread loop, then per-chunk `ggml_gemv_q4_K_8x8_q8_K` (or `_q6_K_`)
+> across `nchunk0 × nchunk1` tiles assigned by `ggml_threadpool_chunk_set` /
+> `atomic_fetch_add` (see `repack.cpp:4347-4406`).
+
+The kernels themselves are NEON-tuned and not HPX's business to rewrite.
+The chunking and barrier (`ggml_barrier(params->threadpool)` at
+`repack.cpp:4352`) are.
+
+### Reframed question for the next pass
+
+**Can HPX schedule around the existing CPU_REPACK gemv kernels better than
+`ggml-cpu` already does?** Concretely:
+
+- can we replace the `ggml_threadpool_chunk_set` + atomic-fetch-add chunk
+  hand-out with HPX work-stealing across the same tile grid, without
+  touching the gemv body?
+- can we overlap the F32→Q8_K quantization (`repack.cpp:4296-4309`) with
+  the next layer's K/V projection by lifting the global barrier into a
+  per-tile dependency edge?
+- can we batch multiple consecutive `MUL_MAT` nodes (`Qcur` + `Kcur` +
+  `Vcur` share `src1`; `ffn_gate` + `ffn_up` likewise share their input)
+  into a single HPX schedule that reuses the quantized wdata?
+
+These are scheduling questions on top of the existing kernels, not
+replacement-of-kernel questions. The packet/sublayer composer in
+`ggml-hpx-exec-selective.cpp` is the natural place if any of these turn
+out to be wins.
+
+### Open
+
+- We have not yet measured a baseline tok/s for this exact path on a
+  quiet machine (per the fair-comparison protocol in `CLAUDE.local.md`).
+  That number is the floor any HPX scheduling change has to beat.
+- The 4 nodes that show `rows=1` even during prefill (`ffn_gate-21`,
+  `ffn_up-21`, `ffn_out-21`, `result_output`) are last-position-only by
+  llama.cpp design — they're already gemv on prefill. If HPX is going to
+  help anywhere in the FFN chain, those last-layer nodes are atypical
+  and should not be the proxy.

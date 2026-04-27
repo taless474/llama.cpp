@@ -2293,6 +2293,14 @@ ggml_status llama_context::graph_compute(
         // through to the normal scheduler path below.
         // The PREFILL_MIN_TOKENS threshold below applies only to the coarse HPX path.
         if (hpx_selective_mul_mat && !batched) {
+            // Static node-histogram diagnostic. No-op unless
+            // LLAMA_HPX_SELECTIVE_HIST=1 is set in the environment. Placed
+            // before the gate arms so the histogram fires regardless of which
+            // arm wins (mixed-backend skip, no-lowerable-MUL_MAT skip, or
+            // engaged path). Warned-once per process: one decode produces one
+            // block of output, the rest of the run is silent.
+            ggml_hpx_selective_log_node_histogram(gf);
+
             const int  n_splits   = ggml_backend_sched_get_n_splits(sched.get());
             const bool is_cpu_only = (n_splits == 1)
                 && (gf->n_nodes > 0)
@@ -2310,6 +2318,30 @@ ggml_status llama_context::graph_compute(
                             "[hpx-selective] disabled: mixed backend graph"
                             " (splits=%d) — falling back to scheduler\n",
                             n_splits);
+                    }
+                }
+                // fall through to ggml_backend_sched_graph_compute_async below
+            } else if (!ggml_hpx_selective_should_engage(gf)) {
+                // Graph-entry policy guard: every MUL_MAT in this graph would
+                // fall back (e.g. all Q4_K weights are CPU_REPACK'd on Apple
+                // Silicon, so w->extra != nullptr disqualifies them). Engaging
+                // selective would dispatch each fallback node as a one-node
+                // graph_compute through the configured CPU threadpool — which
+                // is HPX for graphs above the work-size threshold — paying
+                // coarse-substrate per-call cost on fine-grained work. A
+                // single whole-graph compute on the same threadpool is far
+                // cheaper, so fall through to the scheduler path.
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    static const bool dbg = [] {
+                        const char * e = getenv("LLAMA_HPX_SELECTIVE_DEBUG");
+                        return e && atoi(e) != 0;
+                    }();
+                    if (dbg) {
+                        LLAMA_LOG_INFO(
+                            "[hpx-selective] disabled: no lowerable MUL_MAT in graph"
+                            " — falling back to scheduler\n");
                     }
                 }
                 // fall through to ggml_backend_sched_graph_compute_async below

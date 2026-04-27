@@ -676,6 +676,250 @@ void prescan_mlp_glu_matches(
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Graph-entry policy guard
+// ---------------------------------------------------------------------------
+//
+// Predicate is intentionally conservative: it considers only MUL_MAT
+// ownership. A graph whose MUL_MATs all fall back is 100% selective tax with
+// zero heavy-op win, regardless of how many small non-MUL_MAT ops would
+// lower (norms, activations).
+//
+// Mirrors ggml_hpx_lower_op's MUL_MAT acceptance gates, but with field reads
+// only (no contiguity / stride / scratch-budget checks). Any divergence is at
+// worst a false positive — we engage selective on a graph that ends up
+// all-fallback. It cannot be a false negative for the regression case the
+// guard targets, because that case has zero lowerable MUL_MATs by
+// construction (every Q4_K weight has w->extra != nullptr on M4).
+
+bool ggml_hpx_selective_should_engage(const ggml_cgraph * gf)
+{
+    if (!gf || gf->n_nodes == 0)
+    {
+        return true;
+    }
+
+    uint32_t n_mul_mat   = 0;
+    uint32_t n_lowerable = 0;
+
+    for (int i = 0; i < gf->n_nodes; ++i)
+    {
+        const ggml_tensor * node = gf->nodes[i];
+        if (!node || node->op != GGML_OP_MUL_MAT)
+        {
+            continue;
+        }
+        ++n_mul_mat;
+
+        if (node->type != GGML_TYPE_F32)
+        {
+            continue;
+        }
+        const ggml_tensor * w = node->src[0];
+        const ggml_tensor * x = node->src[1];
+        if (!w || !x)
+        {
+            continue;
+        }
+
+        const bool f32xf32 =
+            (w->type == GGML_TYPE_F32) && (x->type == GGML_TYPE_F32);
+
+        const bool q4k_decode_safe =
+            (w->type == GGML_TYPE_Q4_K)
+            && (w->extra == nullptr)
+            && (node->ne[1] == 1);
+
+        if (f32xf32 || q4k_decode_safe)
+        {
+            ++n_lowerable;
+        }
+    }
+
+    return (n_mul_mat == 0) || (n_lowerable > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Node-histogram diagnostic
+// ---------------------------------------------------------------------------
+//
+// Walks the graph once, buckets every node, emits a single block to stderr.
+// MUL_MAT is sub-classified; everything else is tallied per ggml_op into a
+// fixed-size array indexed by the op id. No heap allocation.
+
+void ggml_hpx_selective_log_node_histogram(const ggml_cgraph * gf)
+{
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_HPX_SELECTIVE_HIST");
+        return e && atoi(e) != 0;
+    }();
+    if (!enabled)
+    {
+        return;
+    }
+
+    static bool warned = false;
+    if (warned)
+    {
+        return;
+    }
+    warned = true;
+
+    if (!gf || gf->n_nodes == 0)
+    {
+        fprintf(stderr,
+            "[hpx-selective-hist] empty graph — nothing to bucket\n");
+        return;
+    }
+
+    uint32_t mm_q4k_repacked    = 0;
+    uint32_t mm_q4k_nonrepacked = 0;
+    uint32_t mm_f32xf32         = 0;
+    uint32_t mm_other_quant     = 0;
+    uint32_t mm_other           = 0;
+
+    uint32_t op_counts[GGML_OP_COUNT] = {};
+
+    // Shape-weighted view: per-bucket dedup'd list of (cols, out_cols, rows)
+    // tuples. Convention matches ggml-hpx-lower.cpp's MUL_MAT case:
+    //   cols = w->ne[0]   (shared / reduction dim)
+    //   out_cols = w->ne[1]   (output columns)
+    //   rows = x->ne[1]   (batch)
+    // 16 entries is enough for any single transformer graph (TinyLlama uses 4).
+    struct mm_shape { int64_t cols; int64_t out_cols; int64_t rows; uint32_t count; };
+    constexpr int kMaxShapes = 16;
+    mm_shape shapes_q4k_repacked   [kMaxShapes] = {};
+    mm_shape shapes_q4k_nonrepacked[kMaxShapes] = {};
+    mm_shape shapes_f32xf32        [kMaxShapes] = {};
+    mm_shape shapes_other_quant    [kMaxShapes] = {};
+    int n_shapes_q4k_repacked    = 0;
+    int n_shapes_q4k_nonrepacked = 0;
+    int n_shapes_f32xf32         = 0;
+    int n_shapes_other_quant     = 0;
+
+    auto record_shape = [](mm_shape * arr, int & n,
+                           int64_t cols, int64_t out_cols, int64_t rows) {
+        for (int j = 0; j < n; ++j)
+        {
+            if (arr[j].cols == cols && arr[j].out_cols == out_cols
+                && arr[j].rows == rows)
+            {
+                ++arr[j].count;
+                return;
+            }
+        }
+        if (n < kMaxShapes)
+        {
+            arr[n] = mm_shape{cols, out_cols, rows, 1};
+            ++n;
+        }
+    };
+
+    for (int i = 0; i < gf->n_nodes; ++i)
+    {
+        const ggml_tensor * node = gf->nodes[i];
+        if (!node)
+        {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT)
+        {
+            if (node->op >= 0 && node->op < GGML_OP_COUNT)
+            {
+                ++op_counts[node->op];
+            }
+            continue;
+        }
+
+        const ggml_tensor * w = node->src[0];
+        const ggml_tensor * x = node->src[1];
+        if (!w || !x)
+        {
+            ++mm_other;
+            continue;
+        }
+
+        const int64_t cols     = w->ne[0];
+        const int64_t out_cols = w->ne[1];
+        const int64_t rows     = x->ne[1];
+
+        if (w->type == GGML_TYPE_Q4_K)
+        {
+            if (w->extra != nullptr)
+            {
+                ++mm_q4k_repacked;
+                record_shape(shapes_q4k_repacked, n_shapes_q4k_repacked,
+                             cols, out_cols, rows);
+            }
+            else
+            {
+                ++mm_q4k_nonrepacked;
+                record_shape(shapes_q4k_nonrepacked, n_shapes_q4k_nonrepacked,
+                             cols, out_cols, rows);
+            }
+        }
+        else if (w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32)
+        {
+            ++mm_f32xf32;
+            record_shape(shapes_f32xf32, n_shapes_f32xf32,
+                         cols, out_cols, rows);
+        }
+        else if (ggml_is_quantized(w->type))
+        {
+            ++mm_other_quant;
+            record_shape(shapes_other_quant, n_shapes_other_quant,
+                         cols, out_cols, rows);
+        }
+        else
+        {
+            ++mm_other;
+        }
+    }
+
+    fprintf(stderr, "[hpx-selective-hist] n_nodes=%d\n", gf->n_nodes);
+
+    auto print_bucket = [](const char * label, uint32_t count,
+                           const mm_shape * arr, int n) {
+        fprintf(stderr, "[hpx-selective-hist]   %-24s = %u",
+                label, count);
+        if (n > 0)
+        {
+            fprintf(stderr, "  shapes(cols x out_cols x rows = count):");
+            for (int i = 0; i < n; ++i)
+            {
+                fprintf(stderr, " %lldx%lldx%lld=%u",
+                        (long long) arr[i].cols,
+                        (long long) arr[i].out_cols,
+                        (long long) arr[i].rows,
+                        arr[i].count);
+            }
+        }
+        fprintf(stderr, "\n");
+    };
+
+    print_bucket("MUL_MAT/Q4_K-repacked",    mm_q4k_repacked,
+                 shapes_q4k_repacked, n_shapes_q4k_repacked);
+    print_bucket("MUL_MAT/Q4_K-nonrepacked", mm_q4k_nonrepacked,
+                 shapes_q4k_nonrepacked, n_shapes_q4k_nonrepacked);
+    print_bucket("MUL_MAT/F32xF32",          mm_f32xf32,
+                 shapes_f32xf32, n_shapes_f32xf32);
+    print_bucket("MUL_MAT/other-quant",      mm_other_quant,
+                 shapes_other_quant, n_shapes_other_quant);
+    print_bucket("MUL_MAT/other",            mm_other, nullptr, 0);
+
+    for (int op = 0; op < GGML_OP_COUNT; ++op)
+    {
+        if (op_counts[op] == 0)
+        {
+            continue;
+        }
+        fprintf(stderr,
+            "[hpx-selective-hist]   %-24s = %u\n",
+            ggml_op_name(static_cast<ggml_op>(op)),
+            op_counts[op]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main selective entry point
 // ---------------------------------------------------------------------------
 

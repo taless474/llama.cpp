@@ -197,6 +197,63 @@ bool ggml_hpx_exec_graph_selective_mul_mat_arena(
     ggml_hpx_selective_stats * stats_out = nullptr);
 
 // ---------------------------------------------------------------------------
+// Graph-entry policy guard
+// ---------------------------------------------------------------------------
+//
+// Cheap pre-flight check: would engaging the selective executor on `gf`
+// actually own any heavy MUL_MAT, or would every matmul fall back?
+//
+// Selective dispatches each fallback node as its own one-node graph_view +
+// ggml_backend_graph_compute. When the configured CPU threadpool is HPX
+// (per the dual-substrate decision in llama_context::graph_compute), that
+// per-node dispatch is a coarse-grained substrate doing fine-grained work
+// — orders of magnitude slower than a single whole-graph compute. The
+// selective tax pays off only when at least one MUL_MAT is lowerable.
+//
+// Returns false when:
+//   - gf has at least one MUL_MAT, AND
+//   - none of those MUL_MATs satisfy the lowering predicate
+//     (output F32, and either F32×F32 or non-repacked Q4_K with rows == 1).
+//
+// Returns true otherwise — including the no-MUL_MAT case (degenerate graph,
+// no harm in engaging) and any case with at least one lowerable MUL_MAT.
+//
+// Cheap: a single linear pass over gf->nodes, field reads only, no calls
+// into ggml_hpx_lower_op and no allocation. Safe to call on every
+// graph_compute.
+bool ggml_hpx_selective_should_engage(const ggml_cgraph * gf);
+
+// ---------------------------------------------------------------------------
+// Node-histogram diagnostic
+// ---------------------------------------------------------------------------
+//
+// Static classifier: emits a per-op-type histogram of `gf` to stderr,
+// answering "what's actually in this graph and which fraction would lower."
+//
+// Buckets:
+//   MUL_MAT / Q4_K-repacked     -- src[0]->type == Q4_K && src[0]->extra != nullptr
+//   MUL_MAT / Q4_K-nonrepacked  -- src[0]->type == Q4_K && src[0]->extra == nullptr
+//   MUL_MAT / F32xF32           -- F32 weights and F32 activations
+//   MUL_MAT / other-quant       -- any other quantized weight type
+//   <op-name>                   -- for every non-MUL_MAT op present
+//
+// Sized for the TinyLlama Q4_K_M decode case: the discriminating bucket is
+// MUL_MAT/Q4_K-repacked. Its count tells us whether implementing repacked
+// Q4_Kx8 lowering would move most of the fallbacks to the lowered path, or
+// whether non-MUL_MAT lowering coverage also needs to expand.
+//
+// Gating: a no-op unless LLAMA_HPX_SELECTIVE_HIST=1 in the environment.
+// When enabled, the histogram fires warned-once per process so a single
+// decode produces exactly one block of output and the rest of the run is
+// silent. Safe to call on every graph_compute regardless of whether
+// selective itself engages — the classifier walks the graph statically,
+// it does not dispatch any work.
+//
+// Cheap: a single linear pass over gf->nodes, field reads only, no
+// allocation beyond a small fixed-size accumulator on the stack.
+void ggml_hpx_selective_log_node_histogram(const ggml_cgraph * gf);
+
+// ---------------------------------------------------------------------------
 // Test-only instrumentation — compiled in only when
 // GGML_HPX_EXEC_SELECTIVE_TESTING is defined.
 //
