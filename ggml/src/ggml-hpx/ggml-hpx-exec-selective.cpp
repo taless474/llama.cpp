@@ -724,10 +724,17 @@ bool ggml_hpx_selective_should_engage(const ggml_cgraph * gf)
         const bool f32xf32 =
             (w->type == GGML_TYPE_F32) && (x->type == GGML_TYPE_F32);
 
+        // Q4_K is lowerable if it is either:
+        //   - standard layout (extra == null)              → vec_dot path, or
+        //   - CPU_REPACK with the q4_K_8x8_q8_K trait      → gemv path.
+        // Other repacked traits (q4_K_8x4_q8_K, RISC-V 16x1) stay on the
+        // CPU fallback because the lowered path has no kernel for them.
+        // Must stay in lockstep with the Q4_K branch in
+        // ggml_hpx_lower_op (ggml-hpx-lower.cpp).
         const bool q4k_decode_safe =
             (w->type == GGML_TYPE_Q4_K)
-            && (w->extra == nullptr)
-            && (node->ne[1] == 1);
+            && (node->ne[1] == 1)
+            && (w->extra == nullptr || ggml_hpx_is_q4k_8x8_repacked(node));
 
         if (f32xf32 || q4k_decode_safe)
         {
@@ -982,6 +989,52 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
         return e && atoi(e) != 0;
     }();
 
+    // Forward-scan a contiguous run of fallback-eligible nodes starting at
+    // `start`, returning the first index that is NOT fallback-eligible (or
+    // gf->n_nodes). A node k is fallback-eligible iff:
+    //   - !consumed[k]                                     (not packet-owned)
+    //   - AND ( !ggml_hpx_lower_op(node[k], &lo_peek)      (lower_op rejected)
+    //           OR  any region in lo_peek.group is a REDUCTION with
+    //               uses_resources == 1 )                  (resource-rejected)
+    //
+    // Used to coalesce a run of fallback nodes into one
+    // ggml_backend_graph_compute(view) dispatch instead of one per node.
+    // Stops at the first lowerable-and-safe node (run boundary) and at the
+    // first packet-consumed node (graph order must be preserved across packet
+    // dispatches).
+    auto scan_fallback_run_end = [&](int start) -> int {
+        ggml_hpx_lowering lo_peek;
+        int j = start;
+        for (; j < gf->n_nodes; ++j)
+        {
+            if (consumed[j]) break;
+
+            ggml_hpx_lowering_init(&lo_peek);
+            if (!ggml_hpx_lower_op(gf->nodes[j], &lo_peek))
+            {
+                continue;  // lower_op rejected → fallback-eligible
+            }
+
+            bool has_resource_reduction = false;
+            for (int r = 0; r < lo_peek.group.n_regions; ++r)
+            {
+                if (lo_peek.group.regions[r].kind == GGML_HPX_CPU_REGION_KIND_REDUCTION
+                 && lo_peek.group.regions[r].uses_resources)
+                {
+                    has_resource_reduction = true;
+                    break;
+                }
+            }
+            if (has_resource_reduction)
+            {
+                continue;  // resource-rejected → fallback-eligible
+            }
+
+            break;  // would lower safely → end of fallback run
+        }
+        return j;
+    };
+
     for (int i = 0; i < gf->n_nodes && ok; ++i)
     {
         // Packet-consumed node: dispatch if this is the trigger of any match,
@@ -1174,16 +1227,19 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
             // Reject groups with resource-dependent REDUCTION regions.
             if (has_resource_reduction)
             {
-                ggml_cgraph view = ggml_graph_view(gf, i, i + 1);
+                const int j = scan_fallback_run_end(i + 1);
+                ggml_cgraph view = ggml_graph_view(gf, i, j);
                 const auto t0 = clock::now();
                 if (ggml_backend_graph_compute(cpu_be, &view) != GGML_STATUS_SUCCESS)
                 {
                     ok = false;
                 }
                 const auto t1 = clock::now();
-                ++stats.fallback_nodes;
-                stats.fallback_ns += static_cast<uint64_t>(
+                stats.fallback_nodes += static_cast<uint32_t>(j - i);
+                stats.fallback_runs  += 1;
+                stats.fallback_ns    += static_cast<uint64_t>(
                     std::chrono::duration_cast<nanosecs>(t1 - t0).count());
+                i = j - 1;  // for-loop's ++i lands on j
                 continue;
             }
 
@@ -1206,16 +1262,19 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
         }
         else
         {
+            const int j = scan_fallback_run_end(i + 1);
+            ggml_cgraph view = ggml_graph_view(gf, i, j);
             const auto t0 = clock::now();
-            ggml_cgraph view = ggml_graph_view(gf, i, i + 1);
             if (ggml_backend_graph_compute(cpu_be, &view) != GGML_STATUS_SUCCESS)
             {
                 ok = false;
             }
             const auto t1 = clock::now();
-            ++stats.fallback_nodes;
-            stats.fallback_ns += static_cast<uint64_t>(
+            stats.fallback_nodes += static_cast<uint32_t>(j - i);
+            stats.fallback_runs  += 1;
+            stats.fallback_ns    += static_cast<uint64_t>(
                 std::chrono::duration_cast<nanosecs>(t1 - t0).count());
+            i = j - 1;  // for-loop's ++i lands on j
         }
     }
 

@@ -35,10 +35,14 @@
 // Scratch arena shared across regions within one lowered op.
 // Currently used by the Q4_K two-region pipeline: region 0 writes a Q8_K
 // quantized activation row here; region 1 reads from it.
-// Size: 4096 bytes supports cols up to 3640 for Q8_K
-// (ggml_row_size(Q8_K, 3584) = 14 blocks × 292 bytes = 4088 bytes).
-// lower_op rejects Q4_K nodes whose Q8_K row exceeds this limit.
-#define GGML_HPX_LOWERING_SCRATCH_BYTES 4096
+// Size: 8192 bytes covers Q8_K rows up to cols=7168
+// (ggml_row_size(Q8_K, 7168) = 28 blocks × 292 bytes = 8176 bytes).
+// Bumped from 4096 to fit TinyLlama's MLP down-projection (cols=5632 →
+// 6424 bytes) and similar shapes; observed in
+// hpx-bench/results/2026-04-28-q4k-repack-real-tinyllama where the
+// 4096 limit silently dropped 12 nodes/step into the CPU fallback.
+// lower_op still rejects Q4_K nodes whose Q8_K row exceeds this limit.
+#define GGML_HPX_LOWERING_SCRATCH_BYTES 8192
 
 // ---------------------------------------------------------------------------
 // Output arena
@@ -118,6 +122,13 @@ extern "C" {
 bool ggml_hpx_lower_op(
     const struct ggml_tensor * node,
     ggml_hpx_lowering *        out);
+
+// Trait predicate: true iff op->src[0] is a CPU_REPACK Q4_K weight using
+// the q4_K_8x8_q8_K trait — the only repacked Q4_K trait the HPX lowered
+// path can drive (via ggml_gemv_q4_K_8x8_q8_K). False on null op,
+// null src[0], null src[0]->extra, any other trait name, or when the
+// repack-traits helper returns null.
+bool ggml_hpx_is_q4k_8x8_repacked(const struct ggml_tensor * op);
 
 #ifdef __cplusplus
 }    // extern "C"

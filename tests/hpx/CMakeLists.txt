@@ -227,6 +227,29 @@ if(GGML_HPX_REGION_DAG)
     add_test(NAME test_hpx_selective_mul_mat_q4_k
              COMMAND test_hpx_selective_mul_mat_q4_k)
 
+    # CPU_REPACK Q4_K (q4_K_8x8_q8_K trait) MUL_MAT through the HPX lowered
+    # path.  Companion to test_hpx_selective_mul_mat_q4_k; allocates the
+    # weight via the CPU_REPACK buffer type so init_tensor populates extra
+    # and set_tensor repacks the bytes into block_q4_Kx8 layout.  The
+    # selective executor must accept the node, run the new R0 (quantize)
+    # + R1 (gemv_q4_K_8x8_q8_K) group, and produce output bit-equal to
+    # the ggml CPU backend reference.
+    add_executable(test_hpx_selective_mul_mat_q4_k_repacked
+        test_hpx_selective_mul_mat_q4_k_repacked.cpp)
+    target_compile_definitions(test_hpx_selective_mul_mat_q4_k_repacked
+        PRIVATE GGML_HPX_REGION_DAG)
+    target_link_libraries(test_hpx_selective_mul_mat_q4_k_repacked
+        PRIVATE ggml-hpx ggml HPX::hpx GTest::gtest_main)
+    target_include_directories(test_hpx_selective_mul_mat_q4_k_repacked
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/include
+            ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-hpx
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    target_compile_features(test_hpx_selective_mul_mat_q4_k_repacked PRIVATE cxx_std_17)
+    add_test(NAME test_hpx_selective_mul_mat_q4_k_repacked
+             COMMAND test_hpx_selective_mul_mat_q4_k_repacked)
+
     # B.2 QBRIDGE: selective MLP GLU with quantized (F16) weights.
     # Proves the QBRIDGE prescan, 1-step packet compile, CPU-fallback gate/up,
     # SWIGLU packet dispatch, and cache-key separation from the F32 path.

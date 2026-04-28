@@ -297,6 +297,20 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build(export-graph-ops.cpp)
 target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+# Standalone baseline benchmark: CPU_REPACK + q4_K_8x8_q8_K gemv on one shape.
+# Not a ctest target. Built as a plain executable; run by hand from results dir.
+llama_build(bench-cpu-repack-q4k-gemv.cpp)
+target_link_libraries(bench-cpu-repack-q4k-gemv PRIVATE ggml-cpu)
+
+# Standalone HPX benchmark: drive the same q4_K_8x8_q8_K gemv kernel via a
+# custom HPX for_loop instead of ggml's CPU_REPACK threadpool. A/B partner of
+# bench-cpu-repack-q4k-gemv. Not a ctest target. Built only when HPX is on.
+if (GGML_HPX)
+    find_package(HPX REQUIRED)
+    llama_build(bench-hpx-route-q4k-gemv.cpp)
+    target_link_libraries(bench-hpx-route-q4k-gemv PRIVATE ggml-cpu HPX::hpx)
+endif()
+
 if (GGML_HPX)
     add_subdirectory(hpx)
 endif()

@@ -2417,11 +2417,12 @@ ggml_status llama_context::graph_compute(
                     packet_active ? &penv : nullptr);
                 if (hpx_selective_stats_print) {
                     LLAMA_LOG_INFO(
-                        "[hpx-selective] lowered=%u fallback=%u"
+                        "[hpx-selective] lowered=%u fallback=%u(%u runs)"
                         " packet=%u(%u nodes)"
                         " lowered_ms=%.3f fallback_ms=%.3f packet_ms=%.3f\n",
                         hpx_selective_last_stats.lowered_nodes,
                         hpx_selective_last_stats.fallback_nodes,
+                        hpx_selective_last_stats.fallback_runs,
                         hpx_selective_last_stats.packet_matches,
                         hpx_selective_last_stats.packet_nodes,
                         hpx_selective_last_stats.lowered_ns         * 1e-6,

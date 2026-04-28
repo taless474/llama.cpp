@@ -1,0 +1,7 @@
+ %CPU COMM
+  9.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 13.1 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/146.0.7680.165/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
+  6.7 claude
+Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+Note: No CPU power status has been recorded

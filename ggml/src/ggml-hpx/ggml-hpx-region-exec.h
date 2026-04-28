@@ -150,6 +150,34 @@ void ggml_hpx_mul_mat_q4_k_q8_k_run_range(
     int64_t                     end,
     ggml_hpx_region_resources * resources);
 
+// ── Repacked Q4_K (q4_K_8x8_q8_K trait) variant of the MATMUL region ─────
+//
+// Same R0 (quantize) as the non-repacked path; this region replaces R1.
+// The weight is in CPU_REPACK 8x8 layout (block_q4_Kx8); the only kernel
+// that can read it is ggml_gemv_q4_K_8x8_q8_K, which processes a chunk of
+// NB_COLS=8-aligned output columns at a time rather than one vec_dot per
+// column.  The run_range function snaps [begin, end) to multiples of 8
+// before invoking the kernel — same chunk-alignment math as
+// ggml/src/ggml-cpu/repack.cpp:4370-4372 and as the standalone bench.
+typedef struct ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx
+{
+    const void * w_q4k_8x8;    // CPU_REPACK block_q4_Kx8 weight data
+    const void * x_q8;         // Q8_K quantized input; shared with region 0 scratch
+    float *      y;            // F32 output base pointer
+    int64_t      cols;         // shared dim; multiple of QK_K (256)
+    int64_t      out_cols;     // output columns; work range is [0, out_cols)
+    size_t       w_row_stride; // w->nb[1] of the repacked weight
+    size_t       y_nb0;        // output element byte stride (node->nb[0]); normally sizeof(float)
+} ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx;
+
+void ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range(
+    void *                      ctx,
+    int                         ith,
+    int                         nth,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * resources);
+
 // ── F32 RMS_NORM kernels ─────────────────────────────────────────────────
 //
 // Three-region decomposition of one F32 RMS_NORM row:

@@ -2224,7 +2224,7 @@ Why `32K`:
 
 ## 8. HPX-native fine-region DAG redesign
 
-## Motivation
+### Motivation
 
 The bulk-region executor redesign improved the HPX substrate, but still relied on ggml’s worker-loop model:
 
@@ -4902,7 +4902,7 @@ against the baseline (packet=0) under the fair-comparison protocol defined in
 
 ---
 
-## B3: Can HPX run Q4_K MUL_MAT?
+## 12. Can HPX run Q4_K MUL_MAT?
 
 ### Question
 
@@ -5042,7 +5042,7 @@ HPX (falls back to ggml CPU); that integration is the remaining open item.
 - Benchmark the HPX Q4_K path against the QBRIDGE baseline once the selective
   path integration is done.
 
-## B4: Routing Q4_K through the selective executor (real-model integration)
+### B4: Routing Q4_K through the selective executor (real-model integration)
 
 ### Question
 
@@ -5206,7 +5206,7 @@ Verified:
 
 This makes Q4_K lowering safe for non-repacked tensors. Supporting Apple Silicon repacked Q4_K tensors would require a separate `Q4_Kx8`-aware HPX path.
 
-## B4.1: Selective graph-entry bailout
+### B4.1: Selective graph-entry bailout
 
 ### Problem
 
@@ -5312,7 +5312,7 @@ Skip HPX selective when no MUL_MAT will lower
 
 ---
 
-## B4.2: Fallback-bucket histogram
+### B4.2: Fallback-bucket histogram
 
 ### Goal
 
@@ -5404,7 +5404,7 @@ hpx-bench/results/2026-04-26-fallback-histogram/
 
 ---
 
-## B4.2b: Shape-weighted histogram
+### B4.2b: Shape-weighted histogram
 
 Node count can mislead, so the histogram was extended to include shapes.
 
@@ -5449,7 +5449,7 @@ Q6_K is a follow-up, not part of B5A.
 
 ---
 
-## B5A study: repacked Q4_Kx8 path
+### B5A study: repacked Q4_Kx8 path
 
 ### What `w->extra` points to
 
@@ -5530,7 +5530,7 @@ This avoids writing new SIMD code while still giving HPX scheduling ownership.
 
 ---
 
-## Recommended B5A scope
+### Recommended B5A scope
 
 Keep B5A narrow:
 
@@ -5575,7 +5575,7 @@ Those can be a later B5B/B5C target.
 
 ---
 
-## Open questions before B5A coding
+### Open questions before B5A coding
 
 ### 1. Trait identity
 
@@ -5635,7 +5635,7 @@ Do not implement prefill Q8_Kx4 packing in the first cut.
 
 ---
 
-## Current status
+### Current status
 
 Completed:
 
@@ -5677,7 +5677,7 @@ Find or add a clean trait-identity helper so HPX can distinguish q4_K_8x8_q8_K f
 
 ---
 
-## Performance status
+### Performance status
 
 There is still no positive HPX speedup result for real-model Q4_K matmul ownership.
 
@@ -5702,3 +5702,1110 @@ It now matches baseline when HPX cannot own the matmuls.
 ```
 
 The next real speedup test should happen after B5A, when HPX can actually own the 134 repacked Q4_K matmuls in TinyLlama Q4_K_M decode.
+
+## 13. CPU_REPACK Q4_Kx8 Lowering and Baseline-First Reset
+
+This phase started after we realized that the earlier Q4_K lowering work was aimed at the wrong physical execution path.
+
+The earlier HPX Q4_K lowering supported normal `block_q4_K` tensors. That path works in synthetic tests, but it is not the real TinyLlama Q4_K_M CPU path on Apple Silicon M4.
+
+On M4, ggml CPU_REPACK rewrites Q4_K weights into a repacked layout. The tensor still reports:
+
+```cpp
+tensor->type == GGML_TYPE_Q4_K
+```
+
+but the physical layout is different. The key runtime clue is:
+
+```cpp
+w->extra != nullptr
+```
+
+For real TinyLlama Q4_K_M on M4, the important Q4_K matmuls use:
+
+```text
+CPU_REPACK Q4_K weights
+→ q4_K_8x8_q8_K tensor trait
+→ F32 activation quantized to Q8_K
+→ ggml_gemv_q4_K_8x8_q8_K
+```
+
+This means the old `ggml_vec_dot_q4_K_q8_K` path is not the path to beat for this model on this host.
+
+### Baseline execution-map result
+
+We created a strict no-HPX baseline build:
+
+```text
+GGML_HPX=OFF
+GGML_HPX_REGION_DAG=OFF
+```
+
+The baseline logger showed the real three-bucket map for TinyLlama Q4_K_M CPU decode:
+
+```text
+logical:  Q4_K and Q6_K tensors
+physical: CPU_REPACK buffer type, tensor->extra populated
+kernel:   q4_K_8x8_q8_K / q6_K_8x8_q8_K trait path
+```
+
+Important conclusion:
+
+```text
+ggml_vec_dot_q4_K_q8_K is not the real Q4_K_M baseline path on this M4 host.
+```
+
+So future HPX comparisons must target the CPU_REPACK gemv path, not normal `block_q4_K`.
+
+### Baseline CPU_REPACK benchmark
+
+We added a standalone baseline benchmark for the real CPU_REPACK Q4_K path.
+
+The benchmark constructs a single Q4_K `MUL_MAT` with weights allocated through:
+
+```cpp
+ggml_backend_cpu_repack_buffer_type()
+```
+
+This ensures:
+
+```text
+W->extra != nullptr
+trait = q4_K_8x8_q8_K
+```
+
+The benchmark times the real ggml CPU_REPACK path:
+
+```text
+F32 activation → Q8_K
+ggml CPU_REPACK threadpool/chunk loop
+ggml_gemv_q4_K_8x8_q8_K
+```
+
+The harness was validated by:
+
+```text
+W->extra != nullptr
+trait == q4_K_8x8_q8_K
+bit-identical output across runs
+stable kernel floor
+```
+
+### Thread-scaling results
+
+We swept the baseline CPU_REPACK benchmark across thread counts.
+
+For shape `2048×5632×1`:
+
+```text
+best ggml baseline: 4 threads
+min ≈ 71 us
+```
+
+For shape `2048×2048×1`:
+
+```text
+best ggml baseline: 3 threads
+min ≈ 41 us
+```
+
+Summary:
+
+| Shape | Best ggml thread count | Best min time | Interpretation |
+|---|---:|---:|---|
+| 2048×5632×1 | 4 | ~71 us | gate/up shape |
+| 2048×2048×1 | 3 | ~41 us | Q/K/attn_out shape |
+
+Findings:
+
+```text
+Optimal thread count is shape-dependent.
+8 threads can regress badly on M4.
+A single graph-wide thread count is a compromise.
+```
+
+This suggested that there may be a scheduling opportunity around CPU_REPACK gemv chunk dispatch.
+
+### Standalone HPX same-kernel benchmark
+
+We then added a standalone HPX benchmark to answer a narrower and cleaner question:
+
+```text
+Can HPX drive the same q4_K_8x8_q8_K gemv chunks faster than ggml's CPU_REPACK threadpool/chunk loop?
+```
+
+This benchmark does not use the existing selective lowering path.
+
+Instead, it uses the same kernel body as ggml:
+
+```cpp
+ggml_gemv_q4_K_8x8_q8_K
+```
+
+It mirrors ggml’s chunk-grid logic:
+
+```text
+same shape
+same worker count
+same chunk boundaries
+same NB_COLS=8 alignment
+same Q8_K activation quantization
+same repacked Q4_K weights
+same output
+```
+
+Only the driver changes:
+
+```text
+ggml CPU_REPACK threadpool/chunk loop
+vs.
+HPX hpx::experimental::for_loop
+```
+
+### Standalone HPX benchmark results
+
+For `2048×5632×1`, 4 workers/threads:
+
+```text
+ggml CPU_REPACK 4t:  min ≈ 71.6 us
+HPX bridge mode 4w: min ≈ 54.4 us
+HPX in_hpx mode 4w: min ≈ 47.5 us
+```
+
+For `2048×2048×1`, 3 workers/threads:
+
+```text
+ggml CPU_REPACK 3t:  min ≈ 41.4 us
+HPX bridge mode 3w: min ≈ 25.9 us
+HPX in_hpx mode 3w: min ≈ 22.7 us
+```
+
+Summary:
+
+| Shape | Workers / threads | ggml min | HPX bridge min | HPX in_hpx min |
+|---|---:|---:|---:|---:|
+| 2048×5632×1 | 4 | ~71.6 us | ~54.4 us | ~47.5 us |
+| 2048×2048×1 | 3 | ~41.4 us | ~25.9 us | ~22.7 us |
+
+Correctness checks:
+
+```text
+same q4_K_8x8_q8_K trait
+same kernel body
+same chunk grid
+same inputs
+8/8 sentinel outputs bit-equal to ggml CPU reference
+```
+
+Conclusion:
+
+```text
+HPX wins in the standalone same-kernel CPU_REPACK q4_K_8x8_Q8_K scheduling benchmark.
+```
+
+Important limitation:
+
+```text
+This is not yet a live llama.cpp speedup.
+```
+
+### Bridge-cost ablation
+
+The HPX benchmark originally entered HPX through:
+
+```cpp
+hpx::async([&] { ... }).get()
+```
+
+We compared two modes:
+
+```text
+bridge mode:
+    each timed iteration crosses into HPX
+
+in_hpx mode:
+    warmup/timing loop already runs inside an HPX worker
+```
+
+Findings:
+
+```text
+The HPX bridge cost is real but not dominant.
+Most of the win comes from the HPX for_loop driver itself.
+```
+
+This supported the live-integration direction:
+
+```text
+Use HPX for_loop over the same q4_K_8x8_q8_K gemv chunks.
+Do not rewrite the kernel.
+Do not target the old block_q4_K vec_dot path.
+```
+
+### Live CPU_REPACK-aware lowering plan
+
+The live selective path still had this safety guard:
+
+```cpp
+if (w->extra != nullptr) {
+    return false;
+}
+```
+
+That guard was correct when the HPX Q4_K kernel could only read normal `block_q4_K`.
+
+The new plan is not to remove the guard blindly. Instead, the Q4_K path is forked:
+
+```text
+Q4_K + extra == nullptr:
+    existing normal block_q4_K lowering
+
+Q4_K + extra != nullptr + trait == q4_K_8x8_q8_K:
+    new CPU_REPACK-aware q4_K_8x8 lowering
+
+anything else:
+    fallback to ggml CPU
+```
+
+Locked first-cut decisions:
+
+```text
+1. Use 4 HPX workers for all Q4_Kx8 shapes.
+   Per-shape tuning is deferred.
+
+2. Keep one hpx::async(...).get() per lowered node.
+   Region batching is deferred.
+
+3. Use ggml CPU backend as the correctness reference.
+
+4. Start live performance testing with short decode first.
+```
+
+### Implementation completed so far
+
+### Step 1: Trait predicate
+
+Added:
+
+```cpp
+bool ggml_hpx_is_q4k_8x8_repacked(const ggml_tensor * op);
+```
+
+Files:
+
+```text
+ggml/src/ggml-hpx/ggml-hpx-lower.h
+ggml/src/ggml-hpx/ggml-hpx-lower.cpp
+```
+
+Purpose:
+
+```text
+Detect only the supported CPU_REPACK Q4_K trait:
+q4_K_8x8_q8_K
+```
+
+The predicate uses the public helper:
+
+```cpp
+ggml_repack_extra_traits_name(...)
+```
+
+but keeps `repack.h` out of the HPX layer with a forward declaration.
+
+This predicate is the shared source of truth for:
+
+```text
+lower.cpp
+selective prescan
+future skip/debug logic
+```
+
+### Step 2: New q4_K_8x8 gemv run_range
+
+Added:
+
+```cpp
+ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx
+ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range
+```
+
+Files:
+
+```text
+ggml/src/ggml-hpx/ggml-hpx-region-exec.h
+ggml/src/ggml-hpx/ggml-hpx-region-exec.cpp
+```
+
+This run_range calls:
+
+```cpp
+ggml_gemv_q4_K_8x8_q8_K
+```
+
+It mirrors ggml CPU_REPACK pointer math:
+
+```text
+NB_COLS = 8 alignment
+vx = W->data + aligned_start * W->nb[1]
+vy = Q8_K scratch
+s  = output + aligned_start
+nc = aligned_end - aligned_start
+```
+
+Important distinction from the old path:
+
+```text
+Old HPX Q4_K path:
+    one ggml_vec_dot_q4_K_q8_K per output column
+
+New CPU_REPACK path:
+    one ggml_gemv_q4_K_8x8_q8_K per output-column chunk
+```
+
+### Step 3: lower.cpp branch
+
+The Q4_K branch in `ggml-hpx-lower.cpp` was forked:
+
+```text
+extra == nullptr:
+    keep existing normal block_q4_K path
+
+extra != nullptr:
+    require q4_K_8x8_q8_K trait
+    require out_cols % 8 == 0
+    build new q4_K_8x8 R1 region
+```
+
+R0 is shared:
+
+```text
+R0: F32 activation → Q8_K scratch
+```
+
+New R1:
+
+```text
+R1: q4_K_8x8 × Q8_K gemv → F32 output
+```
+
+A matching `static_assert` was added for the new context type.
+
+### Step 4: Synthetic correctness test
+
+Added:
+
+```text
+tests/hpx/test_hpx_selective_mul_mat_q4_k_repacked.cpp
+```
+
+Wired into:
+
+```text
+tests/hpx/CMakeLists.txt
+```
+
+Test cells:
+
+```text
+256 × 8
+2048 × 2048
+2048 × 5632
+2048 × 64
+```
+
+Each cell:
+
+```text
+allocates W through CPU_REPACK buffer type
+asserts trait == q4_K_8x8_q8_K
+runs HPX selective executor
+expects lowered_nodes == 1
+expects fallback_nodes == 0
+compares F32 output against ggml CPU backend
+```
+
+Result:
+
+```text
+All synthetic cells pass.
+Output is bit-equal to ggml CPU backend.
+```
+
+This validates Steps 1–3 on synthetic CPU_REPACK tensors.
+
+### Step 5: Selective prescan widened
+
+Updated:
+
+```text
+ggml/src/ggml-hpx/ggml-hpx-exec-selective.cpp
+```
+
+The prescan now admits:
+
+```text
+normal Q4_K decode:
+    extra == nullptr
+
+or
+
+CPU_REPACK Q4_K decode:
+    ggml_hpx_is_q4k_8x8_repacked(node)
+```
+
+The file compiles cleanly.
+
+Important note:
+
+```text
+Step 5 is not yet real-model validated.
+The synthetic test bypasses ggml_hpx_can_lower_graph, so the prescan change
+will only be validated by the live TinyLlama path.
+```
+
+### Current modified files
+
+Uncommitted files:
+
+```text
+ggml/src/ggml-hpx/ggml-hpx-lower.h
+ggml/src/ggml-hpx/ggml-hpx-lower.cpp
+ggml/src/ggml-hpx/ggml-hpx-region-exec.h
+ggml/src/ggml-hpx/ggml-hpx-region-exec.cpp
+ggml/src/ggml-hpx/ggml-hpx-exec-selective.cpp
+tests/hpx/CMakeLists.txt
+tests/hpx/test_hpx_selective_mul_mat_q4_k_repacked.cpp
+```
+
+Build directory state:
+
+```text
+build-hpx-bench:
+    GGML_HPX=ON
+    GGML_HPX_REGION_DAG=ON
+
+build-baseline-no-hpx:
+    unchanged
+```
+
+### Current status
+
+Done:
+
+```text
+CPU_REPACK Q4_Kx8 predicate
+CPU_REPACK q4_K_8x8 gemv run_range
+lower.cpp branch for repacked Q4_K
+synthetic repacked Q4_K selective test
+selective prescan widened
+```
+
+Validated:
+
+```text
+synthetic CPU_REPACK Q4_K tensors lower successfully
+lowered_nodes == 1
+fallback_nodes == 0
+output bit-equal to ggml CPU backend
+```
+
+Not yet validated:
+
+```text
+real TinyLlama Q4_K_M correctness
+real selective stats
+real lowered/fallback histogram shift
+live decode performance
+live llama.cpp speedup
+```
+
+### Next step
+
+Run real TinyLlama Q4_K_M correctness/stats before any performance claim.
+
+Suggested command:
+
+```bash
+mkdir -p hpx-bench/results/2026-04-27-q4kx8-live-correctness
+
+LLAMA_USE_HPX=1 \
+LLAMA_HPX_SELECTIVE_MUL_MAT=1 \
+LLAMA_HPX_SELECTIVE_DEBUG=1 \
+LLAMA_HPX_SELECTIVE_STATS=1 \
+LLAMA_HPX_SELECTIVE_HIST=1 \
+./build-hpx-bench/bin/llama-simple \
+  -m models/tinyllama/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  -p "Hello, my name is" \
+  -n 32 \
+  -ngl 0 \
+  > hpx-bench/results/2026-04-27-q4kx8-live-correctness/stdout.txt \
+  2> hpx-bench/results/2026-04-27-q4kx8-live-correctness/stderr.txt
+```
+
+Inspect:
+
+```bash
+grep -i "hpx-selective\|lowered\|fallback\|packet\|mul_mat\|q4_k" \
+  hpx-bench/results/2026-04-27-q4kx8-live-correctness/stderr.txt | head -120
+```
+
+Expected:
+
+```text
+skip guard should not fire
+lowered count should jump substantially
+fallback count should drop substantially
+Q4_K-repacked nodes should be accepted/lowered
+output should remain coherent
+no <unk> collapse
+```
+
+Do not benchmark if correctness fails.
+
+### Performance status
+
+There is now a positive standalone same-kernel scheduling result:
+
+```text
+HPX for_loop beats ggml CPU_REPACK threadpool/chunk driver
+for q4_K_8x8_q8_K gemv on two TinyLlama Q4_K shapes.
+```
+
+But there is still no live llama.cpp speedup yet.
+
+The live speedup claim depends on the next validation step.
+
+## 13. CPU_REPACK Q4_Kx8 Lowering and Baseline-First Reset
+
+This phase started after we realized the earlier Q4_K lowering targeted the wrong physical path.
+
+The original HPX Q4_K lowering handled normal `block_q4_K` tensors. That works in synthetic tests, but real TinyLlama Q4_K_M decode on Apple Silicon M4 uses ggml CPU_REPACK. The tensor still reports:
+
+```cpp
+tensor->type == GGML_TYPE_Q4_K
+```
+
+but the physical layout is different. The key runtime clue is:
+
+```cpp
+w->extra != nullptr
+```
+
+For real TinyLlama Q4_K_M on M4, the important Q4_K path is:
+
+```text
+CPU_REPACK Q4_K weights
+→ q4_K_8x8_q8_K tensor trait
+→ F32 activation quantized to Q8_K
+→ ggml_gemv_q4_K_8x8_q8_K
+```
+
+So the old `ggml_vec_dot_q4_K_q8_K` path is not the baseline to beat on this host.
+
+---
+
+### Baseline-first finding
+
+A strict no-HPX baseline build:
+
+```text
+GGML_HPX=OFF
+GGML_HPX_REGION_DAG=OFF
+```
+
+confirmed the real execution map:
+
+```text
+logical:  Q4_K and Q6_K tensors
+physical: CPU_REPACK buffer type, tensor->extra populated
+kernel:   q4_K_8x8_q8_K / q6_K_8x8_q8_K trait path
+```
+
+Conclusion:
+
+```text
+HPX comparisons must target the CPU_REPACK gemv path, not normal block_q4_K.
+```
+
+---
+
+### Standalone CPU_REPACK benchmark
+
+A standalone benchmark was added for the real Q4_K CPU_REPACK path. It allocates Q4_K weights through:
+
+```cpp
+ggml_backend_cpu_repack_buffer_type()
+```
+
+This guarantees:
+
+```text
+W->extra != nullptr
+trait = q4_K_8x8_q8_K
+```
+
+The benchmark times:
+
+```text
+F32 activation → Q8_K
+ggml CPU_REPACK threadpool/chunk loop
+ggml_gemv_q4_K_8x8_q8_K
+```
+
+Baseline thread-scaling results:
+
+| Shape | Best ggml thread count | Best min time | Role |
+|---|---:|---:|---|
+| 2048×5632×1 | 4 | ~71 us | gate/up |
+| 2048×2048×1 | 3 | ~41 us | Q/K/attn_out |
+
+Findings:
+
+```text
+Optimal thread count is shape-dependent.
+8 threads can regress badly on M4.
+A single graph-wide thread count is a compromise.
+```
+
+---
+
+### Standalone HPX same-kernel benchmark
+
+A standalone HPX benchmark then asked a narrower question:
+
+```text
+Can HPX drive the same q4_K_8x8_q8_K gemv chunks faster than ggml's CPU_REPACK threadpool/chunk loop?
+```
+
+The benchmark uses the same:
+
+```text
+kernel body
+shape
+worker count
+chunk boundaries
+NB_COLS=8 alignment
+Q8_K activation quantization
+repacked Q4_K weights
+output comparison
+```
+
+Only the driver changes:
+
+```text
+ggml CPU_REPACK threadpool/chunk loop
+vs.
+HPX hpx::experimental::for_loop
+```
+
+Results:
+
+| Shape | Workers / threads | ggml min | HPX bridge min | HPX in_hpx min |
+|---|---:|---:|---:|---:|
+| 2048×5632×1 | 4 | ~71.6 us | ~54.4 us | ~47.5 us |
+| 2048×2048×1 | 3 | ~41.4 us | ~25.9 us | ~22.7 us |
+
+Correctness checks passed:
+
+```text
+same q4_K_8x8_q8_K trait
+same kernel body
+same chunk grid
+same inputs
+8/8 sentinel outputs bit-equal to ggml CPU reference
+```
+
+Conclusion:
+
+```text
+HPX wins in the standalone same-kernel CPU_REPACK q4_K_8x8 scheduling benchmark.
+```
+
+Important limitation:
+
+```text
+This was not yet a live llama.cpp speedup.
+```
+
+---
+
+### Live CPU_REPACK-aware lowering
+
+The old live selective path rejected repacked tensors:
+
+```cpp
+if (w->extra != nullptr) {
+    return false;
+}
+```
+
+That guard was correct when HPX only supported normal `block_q4_K`.
+
+The new path forks Q4_K handling:
+
+```text
+Q4_K + extra == nullptr:
+    existing normal block_q4_K lowering
+
+Q4_K + extra != nullptr + trait == q4_K_8x8_q8_K:
+    new CPU_REPACK-aware q4_K_8x8 lowering
+
+anything else:
+    fallback to ggml CPU
+```
+
+Implemented pieces:
+
+```text
+1. Trait predicate:
+   ggml_hpx_is_q4k_8x8_repacked(...)
+
+2. New run_range:
+   ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range
+
+3. New lower.cpp branch:
+   R0: F32 activation → Q8_K scratch
+   R1: q4_K_8x8 × Q8_K gemv → F32 output
+
+4. Synthetic test:
+   tests/hpx/test_hpx_selective_mul_mat_q4_k_repacked.cpp
+
+5. Selective prescan widened:
+   admits normal Q4_K and q4_K_8x8 CPU_REPACK decode nodes
+```
+
+The new run_range calls:
+
+```cpp
+ggml_gemv_q4_K_8x8_q8_K
+```
+
+and mirrors ggml CPU_REPACK pointer math:
+
+```text
+NB_COLS = 8 alignment
+vx = W->data + aligned_start * W->nb[1]
+vy = Q8_K scratch
+s  = output + aligned_start
+nc = aligned_end - aligned_start
+```
+
+Synthetic tests passed for:
+
+```text
+256×8
+2048×2048
+2048×5632
+2048×64
+```
+
+Each test asserts:
+
+```text
+trait == q4_K_8x8_q8_K
+lowered_nodes == 1
+fallback_nodes == 0
+output bit-equal to ggml CPU backend
+```
+
+---
+
+### Real TinyLlama Q4_K_M validation
+
+Real-model validation showed:
+
+```text
+selective-off and selective-on outputs are bit-identical
+134/134 Q4_K-repacked nodes accepted
+no [hpx-selective] disabled/skip warnings
+```
+
+The expected Q4_K-repacked shapes were:
+
+```text
+2048×2048×1 × 44
+2048×256×1  × 34
+2048×5632×1 × 44
+5632×2048×1 × 12
+```
+
+A coverage bug appeared for the `5632×2048×1` down-projection shape:
+
+```text
+Q8_K scratch for cols=5632 needs ~6.4 KiB
+old lowering scratch was 4 KiB
+```
+
+Fix:
+
+```text
+GGML_HPX_LOWERING_SCRATCH_BYTES: 4096 → 8192
+```
+
+A new synthetic test cell was added:
+
+```text
+MLPDownProjectionShape_5632x2048
+```
+
+After the fix:
+
+```text
+All 5 synthetic CPU_REPACK Q4_Kx8 cells pass.
+Real TinyLlama fallback histogram has zero Q4_K rows.
+Real TinyLlama output remains bit-identical to selective-off.
+```
+
+So Q4_Kx8 correctness is solved on the real model.
+
+---
+
+### Performance diagnosis after correctness
+
+Even with Q4_Kx8 correctness fixed, live selective decode was still slow:
+
+```text
+selective-on:  ~10–12 tok/s
+selective-off: ~99 tok/s
+```
+
+A temporary fallback timing histogram showed the Q6_K hypothesis was wrong:
+
+```text
+Q6_K fallback ≈ ~6 ms/token
+ROPE and ADD cost more than Q6_K
+Q6_K lowering would close less than 5% of the regression
+```
+
+Main conclusion:
+
+```text
+The remaining problem is selective executor structure, not missing Q4_K kernels.
+```
+
+---
+
+### HPX selective hot-path audit
+
+A code-only audit found:
+
+```text
+~689 native→HPX crossings per token
+~4,500 HPX scheduler entries per token
+```
+
+Compared with selective-off:
+
+```text
+~5 scheduler entries per token
+```
+
+Hot-path structure before coalescing:
+
+```text
+201 lowered nodes/token
+488 fallback nodes/token
+one hpx::async(...).get() bridge per lowered node
+one graph_compute call per fallback node
+```
+
+Audit conclusions:
+
+```text
+cache.cpp, plan.cpp, and adapter.cpp are not on the selective hot path.
+No application mutexes remain on the selective hot path.
+Stats/debug paths are cold when env vars are off.
+The Q4_Kx8 kernel itself is not the bottleneck.
+The bottleneck is dispatch structure.
+```
+
+The audit identified two interventions:
+
+```text
+1. Fallback-run coalescing — small/local.
+2. Lowered-node batching — larger architectural change.
+```
+
+---
+
+### Fallback-run coalescing
+
+We implemented the smaller intervention first.
+
+Before:
+
+```text
+fallback node i     → graph_compute(view i:i+1)
+fallback node i + 1 → graph_compute(view i+1:i+2)
+fallback node i + 2 → graph_compute(view i+2:i+3)
+```
+
+After:
+
+```text
+contiguous fallback run [i, j)
+→ graph_compute(view i:j)
+```
+
+The coalescer is conservative:
+
+```text
+only contiguous fallback nodes
+preserves graph order
+stops before consumed/packet-owned nodes
+stops before lowerable nodes
+does not change lowered Q4_Kx8 behavior
+```
+
+A new counter was added:
+
+```text
+fallback_runs
+```
+
+Validation:
+
+```text
+stdout text: bit-identical
+total nodes/step: 689
+lowered_nodes: 201
+fallback_nodes: 488
+fallback_runs: 102
+fallback dispatches: 488 → 102
+average fallback run length: ~4.8 nodes/run
+```
+
+Accounting closes:
+
+```text
+689 = 201 lowered + 488 fallback
+```
+
+The HPX-native reviewer result:
+
+```text
+PASS WITH WARNINGS
+No HIGH findings
+No MEDIUM findings
+Only LOW polish notes
+```
+
+LOW follow-ups:
+
+```text
+1. Add peek-only lowering init to avoid memset of full scratch arena.
+2. Extract dispatch_fallback_run helper.
+3. Check fallback_ns consumers before relying on ns-per-node semantics.
+```
+
+---
+
+### Decode stability after coalescing
+
+The coalesced selective path was tested with llama-simple at:
+
+```text
+n = 16, 32, 64, 128
+```
+
+All completed cleanly.
+
+Observed:
+
+```text
+output: correct and coherent
+stats: stable across token counts
+lowered=201 fallback=488(102 runs)
+decode speed: ~10–12 tok/s
+no token-count cliff
+```
+
+The earlier llama-bench `tg128` long run was most likely a benchmark protocol issue, not a code hang.
+
+---
+
+### End state
+
+Completed and validated:
+
+```text
+CPU_REPACK Q4_Kx8 trait predicate
+CPU_REPACK q4_K_8x8 gemv run_range
+lower.cpp branch for repacked Q4_K
+synthetic CPU_REPACK Q4_Kx8 tests
+scratch bump from 4 KiB to 8 KiB
+real TinyLlama Q4_K_M correctness
+zero Q4_K fallback rows
+fallback-run coalescing
+fallback_runs counter
+HPX-native review of coalescing
+decode stability through n=128
+```
+
+Still not solved:
+
+```text
+live llama.cpp speedup
+selective-on decode is still ~9× slower than selective-off
+one HPX bridge per lowered node remains
+lowered-node batching is not implemented
+```
+
+Current honest status:
+
+```text
+The project has found the right kernel target and proven correctness.
+The remaining blocker is the selective executor architecture.
+```
+
+---
+
+### Next step when resuming
+
+Start with checkpoint/commit hygiene:
+
+```text
+1. Commit CPU_REPACK Q4_Kx8 lowering and tests as one coherent commit.
+2. Commit fallback-run coalescing as a separate commit.
+3. Do not add Q6_K yet.
+4. Use llama-simple, not llama-bench, for the next performance measurements.
+```
+
+First technical question next time:
+
+```text
+After fallback coalescing, where does the remaining ~90 ms/token go?
+```
+
+Run one stats-only command and inspect:
+
+```text
+lowered_ns
+fallback_ns
+fallback_runs
+lowered_nodes
+fallback_nodes
+```
+
+Decision tree:
+
+```text
+If lowered_ns dominates:
+    next design = lowered-node batching / fewer hpx::async(...).get() entries.
+
+If fallback_ns still dominates:
+    next design = deeper fallback-run analysis.
+
+If both are small but total time is large:
+    inspect overhead outside the printed stats.
+```
+
+Most likely next architectural work:
+
+```text
+Batch lowered-node entry into HPX.
+Reduce one hpx::async(...).get() per lowered node.
+Preserve graph order and tensor lifetimes.
+Avoid stack-local lowering lifetime hazards before introducing async batching.
+```

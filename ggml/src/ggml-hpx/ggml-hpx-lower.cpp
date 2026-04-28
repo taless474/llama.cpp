@@ -24,6 +24,26 @@
 #include <cstring>
 #include <new>
 
+// Forward decl from ggml-cpu/repack.h.  Declared here with C++ linkage to
+// avoid pulling the full repack header (and its CPU-internal types) into
+// the HPX layer.  Public symbol; resolves against the ggml-cpu library
+// that ggml-hpx already links.
+extern "C" const char * ggml_repack_extra_traits_name(const struct ggml_tensor * op);
+
+// Trait predicate (declared in ggml-hpx-lower.h).  Single source of truth
+// shared by ggml_hpx_lower_op (the lowering site) and the prescan
+// classifier in ggml-hpx-exec-selective.cpp; both must agree, otherwise
+// graphs containing repacked Q4_K weights either skip the new path
+// silently or take it without the lowered code being built.
+extern "C" bool ggml_hpx_is_q4k_8x8_repacked(const struct ggml_tensor * op)
+{
+    if (op == nullptr || op->src[0] == nullptr) return false;
+    if (op->src[0]->extra == nullptr) return false;
+    const char * trait = ggml_repack_extra_traits_name(op);
+    if (trait == nullptr) return false;
+    return std::strcmp(trait, "q4_K_8x8_q8_K") == 0;
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time size guards — every emitted ctx must fit in one slot.
 // Bump GGML_HPX_LOWERING_CTX_BYTES_PER_REGION (and update HPX_LOWER_OP.md)
@@ -36,6 +56,8 @@ static_assert(sizeof(ggml_hpx_quantize_q8_k_f32_ctx)        <= GGML_HPX_LOWERING
     "ggml_hpx_quantize_q8_k_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_mul_mat_q4_k_q8_k_ctx)        <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
     "ggml_hpx_mul_mat_q4_k_q8_k_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
+static_assert(sizeof(ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx)    <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
+    "ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_silu_f32_ctx)             <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
     "ggml_hpx_silu_f32_ctx too large for lowering arena; bump CTX_BYTES_PER_REGION");
 static_assert(sizeof(ggml_hpx_mul_f32_ctx)              <= GGML_HPX_LOWERING_CTX_BYTES_PER_REGION,
@@ -236,25 +258,23 @@ bool ggml_hpx_lower_op(
 
         // ── Q4_K weight × F32 activation → F32 output, rows == 1 ─────────
         //
-        // Two-region pipeline:
+        // Two-region pipeline (both sub-paths share R0):
         //   R0 (REDUCTION, serial) : quantize F32 x → Q8_K scratch
         //   R1 (MATMUL, parallel)  : Q4_K × Q8_K dot products
         //   dep: 0 → 1
+        //
+        // Two sub-paths chosen by w->extra:
+        //   extra == null  : standard layout, R1 = vec_dot_q4_K_q8_K per col.
+        //   extra != null  : CPU_REPACK 8x8 layout (block_q4_Kx8). Only the
+        //                    q4_K_8x8_q8_K trait is supported here; other
+        //                    repacked traits (8x4, RISC-V 16x1) are rejected.
+        //                    R1 = ggml_gemv_q4_K_8x8_q8_K over an 8-aligned
+        //                    column range.
         if (w->type == GGML_TYPE_Q4_K && x->type == GGML_TYPE_F32)
         {
             if (std::getenv("LLAMA_HPX_SELECTIVE_NO_Q4K")) return false;
-            // Repacked tensors have tensor->extra set to a tensor_traits pointer.
-            // Their data is in block_q4_Kx8 layout which ggml_vec_dot_q4_K_q8_K
-            // cannot read.  Let the CPU backend handle them instead.
-            if (w->extra != nullptr) return false;
             if (rows != 1) return false;
             if (cols % ggml_blck_size(GGML_TYPE_Q4_K) != 0) return false;
-
-            // Weight contiguity: nb[0] is one block's byte size, nb[1] is one row.
-            const size_t blk_sz  = ggml_type_size(GGML_TYPE_Q4_K);
-            const size_t blk_cnt = static_cast<size_t>(
-                cols / ggml_blck_size(GGML_TYPE_Q4_K));
-            if (w->nb[0] != blk_sz || w->nb[1] != blk_cnt * blk_sz) return false;
 
             // Input x must be fully contiguous (both element and row strides).
             // Output y: nb[0]==sizeof(float) is sufficient for rows=1 because
@@ -267,10 +287,9 @@ bool ggml_hpx_lower_op(
             const size_t q8k_row = ggml_row_size(GGML_TYPE_Q8_K, cols);
             if (q8k_row > GGML_HPX_LOWERING_SCRATCH_BYTES) return false;
 
-            const size_t w_row_stride = blk_cnt * blk_sz;
             void * scratch = out->scratch;   // shared between the two regions
 
-            // R0: serial quantize
+            // R0 is identical for both sub-paths.
             ::new (out->ctx_buf[0]) ggml_hpx_quantize_q8_k_f32_ctx{
                 static_cast<const float *>(x->data),
                 scratch,
@@ -284,23 +303,75 @@ bool ggml_hpx_lower_op(
                 0,  // self-sufficient: writes only to ctx->x_q8 (lo.scratch), no external resources
             };
 
-            // R1: parallel dot products
-            ::new (out->ctx_buf[1]) ggml_hpx_mul_mat_q4_k_q8_k_ctx{
-                w->data,
-                scratch,
-                static_cast<float *>(node->data),
-                cols, out_cols,
-                w_row_stride,
-                q8k_row,
-                node->nb[0],
-            };
-            out->regions[1] = {
-                GGML_HPX_CPU_REGION_KIND_MATMUL,
-                0, out_cols, 0,
-                out->ctx_buf[1],
-                ggml_hpx_mul_mat_q4_k_q8_k_run_range,
-                0,
-            };
+            if (w->extra == nullptr)
+            {
+                // Standard (non-repacked) Q4_K layout.
+
+                // Weight contiguity: nb[0] is one block's byte size,
+                // nb[1] is one row's bytes (blk_cnt blocks).
+                const size_t blk_sz  = ggml_type_size(GGML_TYPE_Q4_K);
+                const size_t blk_cnt = static_cast<size_t>(
+                    cols / ggml_blck_size(GGML_TYPE_Q4_K));
+                if (w->nb[0] != blk_sz || w->nb[1] != blk_cnt * blk_sz)
+                {
+                    return false;
+                }
+
+                const size_t w_row_stride = blk_cnt * blk_sz;
+
+                // R1: parallel per-column vec_dot.
+                ::new (out->ctx_buf[1]) ggml_hpx_mul_mat_q4_k_q8_k_ctx{
+                    w->data,
+                    scratch,
+                    static_cast<float *>(node->data),
+                    cols, out_cols,
+                    w_row_stride,
+                    q8k_row,
+                    node->nb[0],
+                };
+                out->regions[1] = {
+                    GGML_HPX_CPU_REGION_KIND_MATMUL,
+                    0, out_cols, 0,
+                    out->ctx_buf[1],
+                    ggml_hpx_mul_mat_q4_k_q8_k_run_range,
+                    0,
+                };
+            }
+            else
+            {
+                // Repacked (CPU_REPACK).  Only the 8x8 trait is wired up.
+                if (!ggml_hpx_is_q4k_8x8_repacked(node)) return false;
+
+                // The 8x8 gemv kernel writes 8 contiguous output columns
+                // per inner step.  Reject shapes whose out_cols is not a
+                // multiple of NB_COLS=8 — the kernel's inner loops would
+                // overrun the dst buffer otherwise.
+                constexpr int64_t kNBCols = 8;
+                if (out_cols % kNBCols != 0) return false;
+
+                // Weight stride is whatever the repack buffer set up;
+                // the kernel reads (begin/8) tiles of stride w->nb[1].
+                // We do not re-derive nb[1] from the type's block size
+                // because the layout is block_q4_Kx8, not the standard
+                // Q4_K block layout.
+
+                // R1: parallel gemv chunks, NB_COLS=8 alignment.
+                ::new (out->ctx_buf[1]) ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx{
+                    w->data,
+                    scratch,
+                    static_cast<float *>(node->data),
+                    cols, out_cols,
+                    w->nb[1],
+                    node->nb[0],
+                };
+                out->regions[1] = {
+                    GGML_HPX_CPU_REGION_KIND_MATMUL,
+                    0, out_cols, 0,
+                    out->ctx_buf[1],
+                    ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range,
+                    0,
+                };
+            }
 
             out->deps[0] = {0, 1};
 

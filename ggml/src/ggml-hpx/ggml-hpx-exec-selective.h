@@ -66,6 +66,10 @@ struct ggml_hpx_mlp_glu_packet_cache;
 struct ggml_hpx_selective_stats {
     uint32_t lowered_nodes         = 0; // nodes through the fine-region path
     uint32_t fallback_nodes        = 0; // nodes through the CPU-backend fallback
+    uint32_t fallback_runs         = 0; // CPU-backend dispatches; a contiguous run
+                                        //   of fallback nodes coalesces into one
+                                        //   ggml_backend_graph_compute call, so
+                                        //   fallback_runs <= fallback_nodes.
     uint32_t packet_matches        = 0; // repeated sublayer patterns dispatched
     uint32_t packet_nodes          = 0; // ggml nodes whose work ran inside a packet
                                         //   (MLP gate/up: 4; MLP_GLU_F32: 3; QBRIDGE: 1)

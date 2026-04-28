@@ -77,6 +77,19 @@ extern "C"
         const void *  vx,  size_t bx,
         const void *  vy,  size_t by,
         int           nrc);
+    // CPU_REPACK NEON kernel; declared in ggml/src/ggml-cpu/repack.h:154.
+    // The 8x8 trait variant — `nc` columns of repacked weight × 1 row of
+    // Q8_K activation, written contiguously to `s`.  `bs` is element
+    // stride between consecutive output rows when nr > 1; with nr == 1 it
+    // is read but unused, and we pass `out_cols` to match the convention
+    // ggml's own forward_mul_mat_one_chunk uses (repack.cpp:4247-4249).
+    void ggml_gemv_q4_K_8x8_q8_K(
+        int           n,
+        float *       s,   size_t bs,
+        const void *  vx,
+        const void *  vy,
+        int           nr,
+        int           nc);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +474,56 @@ void ggml_hpx_mul_mat_q4_k_q8_k_run_range(
             c->x_q8,                                                  /* vy */ c->q8k_row_bytes,
             1);
     }
+}
+
+// Repacked variant.  Same R0/R1 pipeline shape as the non-repacked
+// kernel above — only the kernel call body differs.  The chunk
+// alignment (NB_COLS = 8) matches what the bench validates against the
+// ggml CPU backend; mismatched alignment would silently produce
+// out-of-band writes into the next chunk's output range.
+void ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range(
+    void *                      ctx_void,
+    int                         /*ith*/,
+    int                         /*nth*/,
+    int64_t                     begin,
+    int64_t                     end,
+    ggml_hpx_region_resources * /*resources*/)
+{
+    constexpr int64_t kNBCols = 8;
+
+    auto * c = static_cast<ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx *>(ctx_void);
+    assert(c->cols % 256 == 0);
+    assert(c->w_q4k_8x8 != nullptr);
+    assert(c->x_q8      != nullptr);
+    assert(c->y         != nullptr);
+    assert(begin >= 0 && end <= c->out_cols);
+
+    // Snap [begin, end) up to NB_COLS=8 boundaries so the kernel always
+    // sees an 8-aligned column range.  Mirrors repack.cpp:4370-4372 and
+    // bench-hpx-route-q4k-gemv.cpp's per-chunk math.  Out-of-range
+    // chunks (start aligns past the end) collapse to a no-op.
+    int64_t s = (begin % kNBCols)
+        ? begin + kNBCols - (begin % kNBCols)
+        : begin;
+    int64_t e = (end % kNBCols)
+        ? end + kNBCols - (end % kNBCols)
+        : end;
+    e = std::min(e, c->out_cols);
+    if (s >= e) return;
+
+    auto *       y_base = reinterpret_cast<char *>(c->y);
+    const auto * w_base = static_cast<const char *>(c->w_q4k_8x8);
+
+    auto * dst = reinterpret_cast<float *>(y_base + static_cast<size_t>(s) * c->y_nb0);
+
+    ggml_gemv_q4_K_8x8_q8_K(
+        static_cast<int>(c->cols),
+        dst,
+        static_cast<size_t>(c->out_cols),
+        w_base + static_cast<size_t>(s) * c->w_row_stride,
+        c->x_q8,
+        /*nr=*/1,
+        static_cast<int>(e - s));
 }
 
 // ---------------------------------------------------------------------------
