@@ -49,4 +49,6 @@ credentials/**
 # IDE noise
 .vscode/**
 .idea/**
-
+docs/HPX_LOWER_OP.md
+docs/HPX_BUILD.md
+docs/HPX_PROVENANCE.md

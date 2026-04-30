@@ -411,6 +411,10 @@ llama_context::llama_context(
                 const char * pkt_env = getenv("LLAMA_HPX_SELECTIVE_MLP_PACKET");
                 hpx_mlp_gate_up_packet =
                     hpx_selective_mul_mat && pkt_env && atoi(pkt_env) != 0;
+
+                const char * q4k8_env = getenv("LLAMA_HPX_PACKET_MLP_GATE_UP_GLU_Q4K8");
+                hpx_mlp_gate_up_glu_q4k8_packet =
+                    hpx_mlp_gate_up_packet && q4k8_env && atoi(q4k8_env) != 0;
 #endif
             }
         }
@@ -425,6 +429,10 @@ llama_context::~llama_context() {
     // Both null until the first eligible decode-side graph_compute; safe
     // to call destroy with null is not guaranteed by the packet API, so
     // guard explicitly.
+    if (hpx_mlp_gate_up_glu_q4k8_cache != nullptr) {
+        ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache_destroy(hpx_mlp_gate_up_glu_q4k8_cache);
+        hpx_mlp_gate_up_glu_q4k8_cache = nullptr;
+    }
     if (hpx_mlp_glu_cache != nullptr) {
         ggml_hpx_mlp_glu_packet_cache_destroy(hpx_mlp_glu_cache);
         hpx_mlp_glu_cache = nullptr;
@@ -2385,9 +2393,30 @@ ggml_status llama_context::graph_compute(
                         hpx_packet_runtime    = rt_new;
                         hpx_mlp_gate_up_cache = cache_new;
                         hpx_mlp_glu_cache     = glu_cache_new;
+
+                        // Q4_Kx8 cache is a soft add-on, gated independently of
+                        // the baseline atomic group. Attempted only when the
+                        // env flag asked for it; on failure it stays null and
+                        // the selective path runs without that packet.
+                        if (hpx_mlp_gate_up_glu_q4k8_packet) {
+                            ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache * q4k8_cache_new =
+                                ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache_create(
+                                    n_lanes, seq_regime, policy_version);
+                            if (q4k8_cache_new) {
+                                hpx_mlp_gate_up_glu_q4k8_cache = q4k8_cache_new;
+                            } else {
+                                LLAMA_LOG_WARN(
+                                    "%s: HPX Q4_Kx8 packet cache creation failed;"
+                                    " continuing without it\n", __func__);
+                            }
+                        }
+
                         LLAMA_LOG_INFO(
                             "%s: HPX MLP packet dispatch ready"
-                            " (gate/up + GLU, n_lanes=%u)\n", __func__, n_lanes);
+                            " (gate/up + GLU%s, n_lanes=%u)\n",
+                            __func__,
+                            hpx_mlp_gate_up_glu_q4k8_cache ? " + Q4_Kx8" : "",
+                            n_lanes);
                     } else {
                         if (glu_cache_new) {
                             ggml_hpx_mlp_glu_packet_cache_destroy(glu_cache_new);
@@ -2411,6 +2440,8 @@ ggml_status llama_context::graph_compute(
                 penv.rt            = packet_active ? hpx_packet_runtime    : nullptr;
                 penv.mlp_cache     = packet_active ? hpx_mlp_gate_up_cache : nullptr;
                 penv.mlp_glu_cache = packet_active ? hpx_mlp_glu_cache     : nullptr;
+                penv.mlp_gate_up_glu_q4k8_cache =
+                    packet_active ? hpx_mlp_gate_up_glu_q4k8_cache : nullptr;
 
                 const bool ok = ggml_hpx_exec_graph_selective_mul_mat(
                     gf, backend_cpu, 0, &hpx_selective_last_stats,

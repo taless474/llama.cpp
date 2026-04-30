@@ -6809,3 +6809,975 @@ Reduce one hpx::async(...).get() per lowered node.
 Preserve graph order and tensor lifetimes.
 Avoid stack-local lowering lifetime hazards before introducing async batching.
 ```
+
+### Selective packetization checkpoint
+
+#### Scope
+
+This section records the current state of the HPX selective-packet work after:
+
+- CPU_REPACK Q4_Kx8 correctness was fixed.
+- Fallback-run coalescing was implemented.
+- The `MLP_GATE_UP_GLU_Q4K8` packet was implemented and validated.
+- The attention-side `QKV_PROJ_Q4K8` packet design was completed.
+- `QKV_PROJ_Q4K8` File 1 was added to `ggml-hpx-packet.h`.
+
+This is a selective-executor checkpoint, not a claim of live speedup over the
+plain scheduler path.
+
+---
+
+### 13.1 CPU_REPACK Q4_Kx8 correctness
+
+#### What was wrong
+
+The first Q4_K lowering targeted normal `block_q4_K` tensors, but real
+TinyLlama Q4_K_M on Apple Silicon mostly uses the CPU_REPACK path:
+
+```text
+tensor->type == GGML_TYPE_Q4_K
+tensor->extra != nullptr
+trait = q4_K_8x8_q8_K
+```
+
+So the correct target was the repacked `q4_K_8x8_q8_K` gemv path, not the
+standard-layout Q4_K path.
+
+#### What was added
+
+The Q4_Kx8 path added:
+
+```text
+CPU_REPACK Q4_Kx8 trait predicate
+q4_K_8x8_q8_K run_range
+lower.cpp branch for repacked Q4_K
+synthetic CPU_REPACK Q4_Kx8 tests
+```
+
+A scratch-size bug appeared for the down-projection shape:
+
+```text
+cols = 5632
+Q8_K scratch needed ~6.4 KiB
+old lowering scratch = 4 KiB
+```
+
+Fix:
+
+```text
+GGML_HPX_LOWERING_SCRATCH_BYTES: 4096 -> 8192
+```
+
+#### Validation
+
+After the fix:
+
+```text
+All synthetic CPU_REPACK Q4_Kx8 tests pass.
+Real TinyLlama output is bit-identical to selective-off.
+Real TinyLlama fallback histogram has zero Q4_K rows.
+```
+
+Conclusion:
+
+```text
+Q4_Kx8 correctness is solved for real TinyLlama Q4_K_M.
+```
+
+---
+
+### 13.2 Performance diagnosis after correctness
+
+Correctness alone did not make selective decode fast.
+
+Observed:
+
+```text
+selective-off scheduler: ~99-103 tok/s
+selective-on:            ~10-13 tok/s
+```
+
+A hot-path audit showed the issue was structural:
+
+```text
+too many native-to-HPX crossings
+too many small scheduler entries
+one HPX bridge per lowered node
+one fallback graph_compute call per fallback node before coalescing
+```
+
+The audit also ruled out several false leads:
+
+```text
+Q4_Kx8 kernel itself is not the bottleneck.
+Q6_K alone is not the main missing piece.
+cache.cpp / plan.cpp / adapter.cpp are not on the selective hot path.
+No application mutex remains on the selective hot path.
+Stats/debug paths are cold when env vars are off.
+```
+
+Main conclusion:
+
+```text
+The blocker is selective executor dispatch structure, not Q4_Kx8 math.
+```
+
+---
+
+### 13.3 Fallback-run coalescing
+
+#### Change
+
+Before coalescing:
+
+```text
+fallback node i     -> graph_compute(view i:i+1)
+fallback node i + 1 -> graph_compute(view i+1:i+2)
+fallback node i + 2 -> graph_compute(view i+2:i+3)
+```
+
+After coalescing:
+
+```text
+contiguous fallback run [i, j)
+-> graph_compute(view i:j)
+```
+
+The coalescer is conservative:
+
+```text
+only contiguous fallback nodes
+preserves graph order
+stops before consumed/packet-owned nodes
+stops before lowerable nodes
+does not change Q4_Kx8 lowered behavior
+```
+
+#### Validation
+
+Observed per decode:
+
+```text
+total nodes:     689
+lowered nodes:   201
+fallback nodes:  488
+fallback runs:   102
+```
+
+So fallback dispatches dropped:
+
+```text
+488 -> 102
+```
+
+Accounting closes:
+
+```text
+689 = 201 lowered + 488 fallback
+```
+
+Decode stability after coalescing:
+
+```text
+n = 16, 32, 64, 128
+all completed cleanly
+stats stable
+output coherent
+```
+
+The HPX-native reviewer result:
+
+```text
+PASS WITH WARNINGS
+No HIGH findings
+No MEDIUM findings
+Only LOW polish notes
+```
+
+Conclusion:
+
+```text
+Fallback-run coalescing is correct and useful, but not enough.
+```
+
+---
+
+### 13.4 Why packetization became the next direction
+
+After fallback coalescing, the selective path still had many execution units:
+
+```text
+fallback: 488 nodes in 102 runs
+lowered:  135 nodes after Q4K8 packet validation
+packet:   22 matches / 66 nodes after Q4K8 packet validation
+```
+
+The selected direction was packetization:
+
+```text
+do not enter HPX once per small ggml node
+enter HPX once per repeated semantic sublayer
+```
+
+A packet is allowed only when it satisfies the packet rule:
+
+```text
+1. Pattern repeats in a real graph.
+2. It removes at least two dispatch units.
+3. It has stable dtype/layout/shape constraints.
+4. It has a clear exclusive-consumer or write-through correctness story.
+5. Its cache key captures structural assumptions.
+6. It has an A/B validation plan.
+7. It does not duplicate scheduler logic that belongs to HPX.
+```
+
+---
+
+### 13.5 Implemented packet — `MLP_GATE_UP_GLU_Q4K8`
+
+#### Target pattern
+
+The first quantized packet targets the repeated FFN pattern:
+
+```text
+gate = MUL_MAT(W_gate_q4k8, x)
+up   = MUL_MAT(W_up_q4k8,   x)
+out  = SWIGLU(gate, up)
+```
+
+Packet body:
+
+```text
+quantize x once -> Q8_K scratch
+gate q4_K_8x8_q8_K gemv
+up   q4_K_8x8_q8_K gemv
+SWIGLU(gate, up)
+```
+
+This avoids quantizing the same activation twice.
+
+#### First-cut constraints
+
+```text
+decode only
+rows == 1
+gate/up weights must be CPU_REPACK q4_K_8x8_q8_K
+gate/up/out are F32
+gate and up must have SWIGLU as their only graph consumer
+one HPX entry
+SERIAL first cut, no internal fan-out yet
+```
+
+#### Scratch model
+
+The Q8_K activation scratch is frame-owned:
+
+```text
+packet frame
+  frame header
+  quantize ctx
+  gate gemv ctx
+  up gemv ctx
+  SWIGLU ctx
+  frame-owned Q8_K scratch
+```
+
+`resources->shared_scratch` is unused for this sublayer.
+
+#### Cache key
+
+The Q4K8 packet key includes:
+
+```text
+out_cols
+cols
+rows
+w_row_stride
+```
+
+`w_row_stride` is part of the key because the repacked row stride is a
+structural layout assumption.
+
+---
+
+### 13.6 Q4K8 packet implementation summary
+
+#### File 1 — `ggml-hpx-packet.h`
+
+Added:
+
+```text
+GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_GLU_Q4K8
+ggml_hpx_mlp_gate_up_glu_q4k8_binding
+ggml_hpx_bind_mlp_gate_up_glu_q4k8_packet(...)
+```
+
+The header documents:
+
+```text
+CPU_REPACK Q4_Kx8 only
+SERIAL first cut
+frame-owned Q8_K scratch
+extra == 0
+shape/key convention with w_row_stride
+```
+
+#### File 2 — `ggml-hpx-compose.{h,cpp}`
+
+Added a composer for:
+
+```text
+R0 quantize F32 x -> Q8_K scratch
+R1 gate gemv
+R2 up gemv
+R3 SWIGLU
+```
+
+Dependencies:
+
+```text
+R0 -> R1
+R0 -> R2
+R1 -> R3
+R2 -> R3
+```
+
+The composer hand-builds the regions instead of calling `ggml_hpx_lower_op`
+twice, because two independent lowerings would quantize the same activation
+twice.
+
+#### File 3 — `ggml-hpx-packet.cpp`
+
+Added:
+
+```text
+arena layout
+4-region validator
+compile branch
+four SERIAL steps
+n_lanes == 1 enforcement
+bind function
+```
+
+Bind patches all live pointers and rewires all `x_q8` fields to the same
+frame-owned scratch.
+
+#### File 4 — `ggml-hpx-exec-selective.h`
+
+Added the Q4K8 packet cache declaration and the new packet-env field:
+
+```text
+mlp_gate_up_glu_q4k8_cache
+```
+
+#### File 5 — `ggml-hpx-exec-selective.cpp`
+
+Added in substeps:
+
+```text
+5A cache type / key / create / destroy
+5B lookup-or-compile helper
+5C prescan matcher
+5D dispatch branch
+```
+
+The dispatch branch runs before older gate/up and GLU packet branches.
+
+Failure behavior:
+
+```text
+nodes are marked consumed only after lookup/compile succeeds
+if packet construction fails, the graph falls through to existing lowered/fallback paths
+```
+
+#### File 6 — `src/llama-context.{h,cpp}`
+
+Added lifecycle wiring:
+
+```text
+env flag: LLAMA_HPX_PACKET_MLP_GATE_UP_GLU_Q4K8
+cache member
+create/destroy
+packet-env assignment
+```
+
+Required runtime gates for validation:
+
+```bash
+LLAMA_USE_HPX=1
+LLAMA_HPX_SELECTIVE_MUL_MAT=1
+LLAMA_HPX_SELECTIVE_MLP_PACKET=1
+LLAMA_HPX_PACKET_MLP_GATE_UP_GLU_Q4K8=1
+LLAMA_HPX_SELECTIVE_STATS=1
+```
+
+---
+
+### 13.7 Q4K8 packet validation
+
+Validation directory:
+
+```text
+local/results/q4k8-edit5-validate/
+```
+
+Important logs:
+
+```text
+A-q4k8-off.log
+B-q4k8-on.log
+C-baseline-no-selective.log
+D-stability-n64.log
+E-stability-n128.log
+F-hist-attention-shapes.log
+```
+
+#### A/B comparison
+
+| config | packet matches(nodes) | eval ms / 15 | tok/s |
+|---|---:|---:|---:|
+| C: scheduler, no selective | n/a | 145.94 | 102.78 |
+| A: selective + packet, Q4K8 off | 22 (22) | 2247.99 | 6.67 |
+| B: selective + packet, Q4K8 on | 22 (66) | 1533.34 | 9.78 |
+
+Token output was bit-identical across all three configurations:
+
+```text
+<s> Hello, my name is John Smith. I am a software engineer at XYZ Company. I have
+```
+
+MD5:
+
+```text
+239988b2f1ef09a88af084e37e473632
+```
+
+#### Interpretation
+
+The Q4K8 packet is correct and load-bearing:
+
+```text
+22/22 FFN sites matched
+packet nodes increased from 22 to 66
+output bit-identical
+selective-regime throughput improved from 6.67 to 9.78 tok/s
+```
+
+The node increase means:
+
+```text
+22 matches * 2 additional nodes per match = 44 additional packet nodes per decode
+```
+
+This is about a 47% improvement inside the selective regime.
+
+It is not a speedup over the plain scheduler path.
+
+#### Stability
+
+Longer runs with Q4K8 packet enabled:
+
+```text
+n=64:
+  63/63 decode stat lines: packet=22(66 nodes)
+  exit=0
+  coherent output
+  13.07 tok/s
+
+n=128:
+  127/127 decode stat lines: packet=22(66 nodes)
+  exit=0
+  coherent output
+  12.95 tok/s
+```
+
+No late-token failure was observed.
+
+---
+
+### 13.8 Current honest status
+
+Correctness:
+
+```text
+CPU_REPACK Q4_Kx8 lowering is correct.
+Q4K8 FFN packet is correct.
+Q4K8 FFN packet is stable through n=128.
+```
+
+Selective-regime performance:
+
+```text
+improved by packetization
+Q4K8 packet: 6.67 -> 9.78 tok/s in A/B selective comparison
+```
+
+Live speedup over scheduler:
+
+```text
+not solved
+scheduler path remains ~99-103 tok/s
+selective + Q4K8 packet remains ~10-13 tok/s
+```
+
+Remaining blocker:
+
+```text
+selective executor dispatch granularity
+```
+
+---
+
+### 13.9 Attention/QKV packet design
+
+A histogram run showed the decode graph is highly regular:
+
+```text
+most op counts divide cleanly by 22
+attention sequence is stable per layer
+QKV projection pattern appears once per layer
+```
+
+Three attention-side candidates were considered:
+
+```text
+A. Full attention block
+B. QKV projection packet
+C. Output projection + residual
+```
+
+Verdict:
+
+```text
+Full attention block: too risky next because of KV-cache writes, cache views, aliasing, FLASH_ATTN_EXT.
+Output projection + residual: too small to justify a packet.
+QKV projection packet: best next candidate.
+```
+
+#### QKV packet scope
+
+The designed QKV packet covers:
+
+```text
+RMS_NORM(x_in)
+MUL(norm_out, w_norm)
+MUL_MAT Q
+MUL_MAT K
+MUL_MAT V
+```
+
+Downstream nodes stay outside the packet:
+
+```text
+RESHAPE
+ROPE
+SET_ROWS
+KV-cache views
+FLASH_ATTN_EXT
+attention output projection
+residual ADD
+```
+
+This avoids KV-cache aliasing and attention-state semantics.
+
+#### First cut
+
+The first cut is all-Q4_Kx8 only.
+
+TinyLlama Q4_K_M projection traits:
+
+```text
+Q projection: Q4_Kx8 in all 22 layers
+K projection: Q4_Kx8 in all 22 layers
+V projection: Q4_Kx8 in 12 layers, Q6_Kx8 in 10 layers
+```
+
+Expected first-cut effect:
+
+```text
+12 matches
+5 nodes per match
+60 packet nodes per decode
+48 dispatch boundaries removed
+```
+
+Q6 support is deferred.
+
+#### Trigger
+
+The chosen trigger is the V projection MUL_MAT because it is the last node in
+the packet pattern:
+
+```text
+RMS_NORM
+MUL
+Q
+K
+V  <-- trigger and dispatch point
+```
+
+This avoids rollback complexity because consumed nodes are strictly before the
+trigger.
+
+#### Scratch
+
+The QKV packet uses frame-owned scratch for:
+
+```text
+norm_out
+normed_x
+q8_x
+```
+
+No `resources->shared_scratch` is required in the first cut.
+
+---
+
+### 13.10 QKV File 1 checkpoint
+
+QKV File 1 is complete.
+
+Touched file:
+
+```text
+ggml/src/ggml-hpx/ggml-hpx-packet.h
+```
+
+Build status:
+
+```text
+ggml-hpx builds cleanly
+llama builds cleanly
+new enum/struct/declaration are syntactically valid
+no path is activated yet
+```
+
+#### Added enum
+
+New sublayer:
+
+```text
+GGML_HPX_PACKET_SUBLAYER_QKV_PROJ_Q4K8 = 6
+```
+
+The comment documents the six-step packet shape:
+
+```text
+RMS_NORM
+MUL norm scale
+quantize normed_x
+gemv Q
+gemv K
+gemv V
+```
+
+#### Added plan-key documentation
+
+The `plan_key` documentation now has a `QKV_PROJ_Q4K8` entry:
+
+```text
+extra bits [0:31]  = w_q_row_stride
+extra bits [32:63] = w_kv_row_stride
+shape[3]           = eps_bits
+```
+
+K and V are required to share the same row stride in the first cut.
+
+#### Added typed binding
+
+New binding declaration:
+
+```text
+ggml_hpx_qkv_proj_q4k8_binding
+ggml_hpx_bind_qkv_proj_q4k8_packet(...)
+```
+
+The binding section documents:
+
+```text
+RMS_NORM -> MUL -> quantize -> 3x gemv
+all-Q4_Kx8 first cut
+mixed Q4/Q6 rejected at prescan
+SERIAL first cut
+rows == 1
+frame-owned scratch
+data-pointer-only fields
+structural dimensions in plan_key
+```
+
+Out of scope for File 1:
+
+```text
+compose helper
+compile/bind body
+selective cache/prescan/dispatch
+env gate
+llama_context wiring
+```
+
+---
+
+### 13.11 Next step
+
+If continuing QKV packet work, the next step is File 2:
+
+```text
+ggml-hpx-compose.{h,cpp}
+```
+
+Goal:
+
+```text
+compose the 6-region QKV_PROJ_Q4K8 group
+```
+
+Expected logical regions:
+
+```text
+R0 RMS_NORM
+R1 MUL norm scale
+R2 quantize normed_x -> Q8_K
+R3 Q gemv
+R4 K gemv
+R5 V gemv
+```
+
+Keep File 2 structural only:
+
+```text
+no packet compile/bind
+no selective prescan
+no dispatch
+no llama_context wiring
+```
+
+---
+
+### 13.12 Bottom line
+
+The Q4K8 FFN packet is a successful packetization result. It proves that a
+matched semantic sublayer can be compiled once, bound repeatedly, executed as a
+single HPX unit, preserve output bit-identically, and reduce selective-regime
+dispatch overhead.
+
+The result remains inside the selective regime only. The plain scheduler path
+is still much faster.
+
+The QKV packet is the next disciplined packet candidate because it is repeated,
+semantic, avoids KV-cache internals, and has a safe all-Q4_Kx8 first cut.
+
+
+# Provenance — Prefill HPX benchmark closure
+
+## Context
+
+This phase tested whether HPX has a better chance on larger prefill / prompt-processing work units than on single-token decode.
+
+The motivation was that previous decode experiments showed:
+
+- selective decode execution was correct,
+- semantic packetization reduced some selective-dispatch overhead,
+- Q4_Kx8 / MLP packet paths could engage correctly,
+- but the plain llama.cpp scheduler path was still much faster.
+
+So the remaining question was whether prefill, with larger token batches and larger work units, exposed a better target for HPX.
+
+## What was tested
+
+Two CPU-only Q4_K_M models were benchmarked:
+
+- TinyLlama Q4_K_M
+- Meta-Llama-3.1-8B-Instruct Q4_K_M
+
+The tested path was the current HPX prefill region executor:
+
+```text
+ggml_hpx_exec_run_prefill
+```
+
+This is the coarse region orchestration layer. It builds a region plan over the llama.cpp / ggml graph and runs the planned CPU / BLAS regions through the HPX prefill execution path.
+
+The benchmark compared:
+
+```text
+A. no HPX / plain scheduler
+B. HPX serial prefill
+C. HPX parallel-proj prefill
+```
+
+All runs were CPU-only with:
+
+```text
+-ngl 0
+```
+
+Prompt lengths were approximately:
+
+```text
+~512 tokens
+~1024 tokens
+```
+
+Each important case was repeated 3 times.
+
+## What was not tested
+
+This benchmark did not test the selective lowering, fine-region DAG lowering, or frozen packet path.
+
+The logs and code confirmed that the selective path is structurally unreachable for prefill:
+
+```cpp
+if (hpx_selective_mul_mat && !batched)
+```
+
+For prefill, `n_tokens > 1`, so the run is batched. Therefore the selective block is skipped.
+
+Consequences:
+
+- `ggml_hpx_exec_graph_selective_mul_mat` was not entered.
+- No lowered nodes were reported.
+- No fallback-node selective stats were reported.
+- No `packet_matches` were reported.
+- No `packet_dispatch_ns` stats appeared.
+- Zero `[hpx-selective]` lines appeared in the stderr files.
+- MLP / GLU / Q4_Kx8 packet paths were not created or dispatched.
+- Existing packet paths require decode-shaped `rows == 1` work, while prefill has `rows > 1`.
+
+Therefore, this benchmark evaluates only the current HPX prefill region executor. It says nothing directly about whether the selective decode lowering / packetization work is correct or useful.
+
+## TinyLlama result
+
+TinyLlama Q4_K_M showed no useful prefill speedup.
+
+For ~512 prompt tokens:
+
+```text
+A no-HPX:       mean 1646 ms, 344 tok/s
+B HPX serial:   mean 1676 ms, 338 tok/s, +1.8% slower
+C HPX parallel: mean 2312 ms, 245 tok/s, +40% slower
+```
+
+For ~1024 prompt tokens:
+
+```text
+A no-HPX:       mean 3396 ms, 333 tok/s
+B HPX serial:   mean 3438 ms, 329 tok/s, +1.2% slower
+C HPX parallel: mean 4782 ms, 236 tok/s, +41% slower
+```
+
+Topology dump:
+
+```text
+n_nodes = 689
+n_regions = 45
+sched_splits = 1
+dependency chain = fully linear
+```
+
+The prefill graph alternated CPU and BLAS regions, but every region depended on the previous region. There were no independent coarse regions for HPX to schedule.
+
+## Llama 3.1 8B result
+
+The same benchmark was repeated on Meta-Llama-3.1-8B-Instruct-Q4_K_M to check whether the TinyLlama result was model-size-specific.
+
+For 472 prompt tokens:
+
+```text
+A no-HPX:       mean 9322 ms,  50.6 tok/s
+B HPX serial:   mean 9872 ms,  47.8 tok/s, +5.9% slower
+C HPX parallel: mean 13742 ms, 34.3 tok/s, +47% slower
+```
+
+For 942 prompt tokens:
+
+```text
+A no-HPX:       mean 20805 ms, 45.3 tok/s
+B HPX serial:   mean 21041 ms, 44.8 tok/s, +1.1% slower
+C HPX parallel: mean 28701 ms, 32.8 tok/s, +38% slower
+```
+
+Topology dump:
+
+```text
+n_nodes = 999
+n_regions = 65
+sched_splits = 1
+dependency chain = fully linear
+```
+
+The larger model increased the number of graph nodes and regions, but did not create independent region-level work. The region chain remained fully linear.
+
+Selective / packet engagement was again zero across all run logs.
+
+## Interpretation
+
+The TinyLlama result was not just a small-model artifact.
+
+Under the current single-sequence, CPU-only llama.cpp graph/planning path, larger model size increases the amount of work per forward pass and increases the number of planned regions, but it does not create exploitable coarse region parallelism.
+
+The current HPX prefill region executor has no useful independent region-level work to schedule.
+
+The HPX serial path is roughly equal to or slower than the plain scheduler path. The HPX parallel-proj path is consistently much slower.
+
+The parallel-proj result is especially negative:
+
+- TinyLlama: roughly 40-41% slower.
+- Llama 3.1 8B: roughly 38-47% slower.
+
+The attempted Q/K/V projection parallelism does not overcome the critical path and HPX task dispatch overhead. Even with the larger 8B model and less extreme GQA asymmetry than TinyLlama, the parallel path remains clearly worse.
+
+## Conclusion
+
+The current HPX prefill region executor is not worth continuing.
+
+This conclusion applies to the current coarse region-chain prefill design:
+
+```text
+ggml_hpx_exec_run_prefill
+```
+
+It does not invalidate the separate selective decode / lowering / packetization work, because that path was not exercised by prefill.
+
+## Decision
+
+Stop current prefill executor work.
+
+Stop QKV packetizing for now.
+
+Write up the decode/selective/packetization findings separately from the prefill executor findings.
+
+The clean boundary is:
+
+```text
+Decode selective / packet path:
+  engaged, correct, improved over selective-off, but still slower than scheduler.
+
+Current prefill region executor:
+  engaged, benchmarked on TinyLlama and Llama 3.1 8B, no useful speedup.
+
+Selective / fine-region / packet path in prefill:
+  not tested, structurally unreachable under the current !batched guard.
+```
+
+## Future direction if HPX is revisited
+
+Do not continue the current linear region-chain prefill executor.
+
+If HPX is revisited for llama.cpp, it should be at a different granularity that creates independent work, for example:
+
+- request-level batching,
+- multi-sequence scheduling,
+- server-level orchestration,
+- concurrent independent llama contexts,
+- or a redesigned batched selective/fusion path that explicitly supports `rows > 1`.
+
+Do not claim that HPX can never help prefill.
+
+The narrower and supported conclusion is:
+
+```text
+Under the current CPU-only, single-sequence llama.cpp integration, HPX prefill
+region orchestration does not provide useful speedup on either TinyLlama Q4_K_M
+or Llama 3.1 8B Q4_K_M. The planned region topology is fully linear, so the
+current executor has no coarse-grained parallelism to exploit.
+```

@@ -1,65 +1,92 @@
-## Claude Guidance for HPX / ggml Integration
+# Claude Guidance for HPX / ggml Integration
 
-### Read in this order
+## Readings
 
-1. README_HPX.md
-2. docs/HPX_EXECUTOR_CONTRACT.md
-3. docs/HPX_PROVENANCE.md (optional, historical only, only read if needed and start from the last section)
+Read @local/HANDOFF.md first. Use it only as current handoff context, not as historical truth.
 
-### Core principles
+Do not read project docs by default.
 
-- Prefer current architecture over historical designs
-- Follow explicit contracts, not inferred behavior
-- Keep changes minimal and localized
-- Preserve separation of concerns
+If the task needs project context, skim:
 
-### Critical invariants
+- `README_HPX.md`
 
-- Two execution substrates:
-  - pthread → small work / decode
-  - HPX → large work / prefill
+Only when needed, read:
 
-- Selection is based on:
-  cplan->work_size
+- `docs/HPX_EXECUTOR_CONTRACT.md` for durable execution rules and review criteria
+- latest relevant `local/results/*` or `hpx-bench/results/*`, only if the user names or asks about a result
 
-- Scheduler logic ONLY in:
-  ggml-hpx-adapter.cpp
+When explicitly asked, read:
 
-- Plans must be structural only
+- `docs/HPX_NATIVE_REVIEWER.md`
+- `docs/HPX_DECODE_BENCH_PROTOCOL.md`
 
-- BLAS is opaque and not decomposed
+Do not use old provenance as design truth. Use current code and current results first.
 
-### Forbidden
+Do not read these historical/helper docs unless the user explicitly asks for them:
 
-- Do not merge pthread and HPX into one executor
-- Do not route decode work to HPX casually
-- Do not leak scheduler outside adapter
-- Do not store runtime pointers in plans
-- Do not use provenance as design truth
+- `docs/HPX_LOWER_OP.md`
+- `docs/HPX_BUILD.md`
+- `docs/HPX_PROVENANCE.md`
 
-### Preferred direction
+## Active area
 
-- Move toward run_range(...)
-- Use fine-grained region DAG
-- Reduce thread-centric execution
+The main active area is HPX selective execution: lowering, region execution, packet/runtime experiments, and `graph_compute` integration.
 
-### One-line model
+Important files:
 
-Small work → pthread
-Large work → HPX
-Future → region DAG
+- `ggml/src/ggml-hpx/ggml-hpx-exec-selective.cpp`
+- `ggml/src/ggml-hpx/ggml-hpx-lower.cpp`
+- `ggml/src/ggml-hpx/ggml-hpx-region-exec.cpp`
+- `src/llama-context.cpp`
+- `tests/hpx/**`
+- `hpx-bench/**`
 
-### Saving results
+Older coarse-path files such as `cache.cpp`, `plan.cpp`, and `adapter.cpp` may be irrelevant to the selective hot path unless the current change explicitly touches that path.
 
-Never write any output to `/tmp`.  All results stay inside the repo.
+## Hard invariants
 
-- `hpx-bench/results/<date>-<slug>/` — benchmark CSVs and logs
-- `local/results/` — experiment summaries, environment notes, anything not suitable for git
+- HPX runtime startup must remain process-wide and one-shot.
+- Selective execution must remain CPU-only and single-split guarded.
+- Fail closed to normal ggml scheduler execution.
+- Preserve ggml graph order, backend assignment, tensor lifetimes, and scratch ownership.
+- Do not compute Metal/CUDA/offloaded nodes on CPU by mistake.
+- BLAS remains opaque.
+- Do not use historical provenance as design truth.
 
-Each run gets its own directory.  Minimum contents:
-- `bench_<name>.csv` — raw CSV (stdout)
-- `bench.log` — stderr (legend, done marker, any errors)
-- `README.md` — short markdown summary: what was measured, key numbers, findings, open questions
+## Backend-layout rule
 
-Redirect output at the invocation step, not with a post-run `cp`.
-Include the git commit hash and binary path in the summary so results are reproducible.
+Do not assume `tensor->type` fully describes the physical layout.
+
+Always check the actual backend path and metadata before lowering quantized tensors. Repacked tensors may have:
+
+```cpp
+tensor->extra != nullptr
+```
+
+A lowering branch must be explicit about which physical layout/trait it supports. Unsupported layouts must fall back.
+
+## Preferred direction
+
+- Baseline first: inspect the real ggml/backend path before lowering.
+- Use physical backend paths, not only logical ggml op types.
+- Reduce dispatch fragmentation.
+- Prefer packets, lowered runs, or other larger execution units over per-node HPX entry.
+- Keep diagnostics env-gated and cold when disabled.
+- Do not add more kernels before understanding the selective graph structure, unless explicitly requested.
+
+## Saving results
+
+Never write outputs to `/tmp` or any temporary directory. Write run artifacts directly into the repo.
+
+Use:
+
+- `hpx-bench/results/<date>-<slug>/` for benchmark outputs, logs, and captures
+- `local/results/` for local notes, summaries, environment notes, and non-git artifacts
+
+## Decode benchmark protocol
+
+For PACKET=0 vs PACKET=1, packet-vs-baseline, or HPX decode-speed A/B benchmarks, read:
+
+- `docs/HPX_DECODE_BENCH_PROTOCOL.md`
+
+Do not run or interpret decode A/B results unless that protocol is followed.

@@ -1,427 +1,338 @@
 # HPX Executor Contract for ggml/llama.cpp
-**Tightened rulebook version**
 
-## Scope
+## Purpose
 
-This document defines the current execution contract for the HPX-related CPU
-execution paths in this `llama.cpp` fork.
+This is a compact rulebook for HPX-related CPU execution code in this fork.
+It is not a provenance log, benchmark report, or milestone tracker.
 
-This file is a **rulebook**, not a provenance document.
-
-Use it for:
-- execution invariants
-- dependency boundaries
-- allowed and forbidden design moves
-- current substrate-selection rules
-
-Do **not** use it for:
-- chronological history
-- superseded HPX designs
-- benchmark storytelling
+Use:
+- `README_HPX.md` for the project map and flags.
+- `docs/HPX_PROVENANCE.md` for history and measurements.
+- this file for durable execution rules and review criteria.
 
 ---
 
-## 1. Execution model (current)
+## Scope
 
-The system supports **two execution substrates**:
+Do not apply rules from one HPX path blindly to another.
 
-- **pthread substrate**
-  - used for small work
-  - optimized for low overhead and stable latency
+The active paths are:
 
-- **HPX substrate**
-  - used for large work
-  - optimized for throughput and structured CPU parallelism
+1. **ggml-cpu substrate path**  
+   HPX-backed threadpool/substrate integration under the ggml CPU executor seam.
 
-### Selection rule
+2. **Fine-region path**  
+   Explicit CPU work regions using `run_range(...)`, dependency edges, and resource bundles.
 
-Execution is selected **per dispatch** using:
+3. **Selective executor path**  
+   Real llama graphs are routed to lowered HPX regions, packetized sublayers, or CPU backend fallback.
+
+4. **Packet path**  
+   Repeated sublayers are matched, compiled once, bound per invocation, and dispatched as larger execution units.
+
+The project direction is not “replace pthread with HPX everywhere.” It is:
+
+```text
+Use HPX where the execution unit is large and structured enough to justify it.
+Avoid HPX per tiny decode node.
+```
+
+---
+
+## 1. Substrate selection
+
+For the **ggml-cpu substrate path**, substrate selection is based on:
 
 ```cpp
 cplan->work_size
 ```
 
-Policy:
+Default policy:
 
 ```text
-small work   → pthread
-large work   → HPX
+small work -> pthread substrate
+large work -> HPX substrate
 ```
 
-This rule is fundamental and must not be bypassed casually.
+This protects small decode-like work from accidental HPX overhead.
+
+Do not generalize this to “HPX is never allowed in decode.” Packetized decode work may use HPX when it reduces dispatch granularity and is validated by measurement.
 
 ---
 
-## 2. Decode vs prefill (operational meaning)
+## 2. Decode and prefill
 
-| mode    | meaning                         | preferred substrate |
-|---------|----------------------------------|---------------------|
-| decode  | small, latency-sensitive work    | pthread             |
-| prefill | large, throughput-oriented work  | HPX                 |
+Decode and prefill are operational regimes, not reliable graph-shape labels.
 
-Important:
-- graph topology does **not** reliably distinguish decode from prefill
-- `work_size` does
+Guidance:
+
+```text
+whole-graph decode-sized substrate work -> avoid HPX unless proven beneficial
+large prefill-like substrate work        -> HPX may be appropriate
+matched packetized decode work           -> HPX may be appropriate
+```
+
+Forbidden hot-path shape:
+
+```text
+native llama thread
+  -> one tiny node
+  -> hpx::async(...).get()
+  -> next tiny node
+  -> hpx::async(...).get()
+```
+
+Use HPX around meaningful regions, fallback runs, or packetized sublayers.
 
 ---
 
 ## 3. Execution units
 
-### 3.1 Coarse regions (current production-oriented path)
+### Coarse substrate dispatch
 
-The primary execution unit is a **coarse region**, such as:
-- a scheduler split
-- a contiguous CPU-only graph region
-- a delegated BLAS-supported region
-- another planner-defined unit with one synchronization boundary
+Used by the ggml-cpu substrate path. Examples: whole CPU graph job, scheduler split, large backend work unit. This path may use pthread or HPX depending on `work_size`.
 
-The planner creates coarse regions.  
-The executor consumes coarse regions.
+### Fine CPU regions
 
-### 3.2 Fine CPU regions (HPX-native path)
-
-An optional finer execution unit may be used inside CPU regions.
-
-Fine regions represent:
-- explicit CPU work ranges
-- explicit dependency edges
-- explicit resource ownership
-
-They are expressed by:
-- `ggml_hpx_cpu_region`
-- `ggml_hpx_cpu_region_group`
-- `ggml_hpx_run_range_fn`
-
-Fine-region execution is the preferred direction for HPX-native CPU work.
-
----
-
-## 4. Fine-region DAG rule
-
-The fine-region model is the HPX-native direction.
-
-A fine region is executed through:
+Used by the HPX-native direct execution layer:
 
 ```cpp
 run_range(ctx, ith, nth, begin, end, resources)
 ```
 
-Properties:
-- explicit work range
-- no graph re-entry
-- no dependence on ggml worker identity
-- no direct use of ggml’s barrier model
+Fine-region code must operate on explicit ranges and explicit resources.
 
-A region group defines:
-- region array
-- dependency edges
-- per-dispatch resources
+### Selective fallback runs
 
-The preferred executor for this layer is:
+The selective executor may fall back to the live CPU backend for unsupported nodes or node runs. Fallback re-entry is allowed only in the selective fallback path. Adjacent fallback nodes should be coalesced when correctness allows.
 
-- `hpx::execution::experimental::block_fork_join_executor`
+### Packets
 
-Reason:
-- lower overhead on short fork/join CPU work
-- better fit than the earlier scheduler-queue-based path
+Packets are for repeated model sublayers with known op pattern, tensor types, shape/layout key, and scratch/resource ownership. They should reduce dispatch granularity and must not become thin wrappers around one tiny node.
 
 ---
 
-## 5. BLAS rule
+## 4. Structural plans and packet keys
 
-BLAS remains:
-- opaque
-- coarse
-- delegated
+Reusable plans and packet keys must be structural.
 
-HPX may:
-- schedule before BLAS regions
-- schedule after BLAS regions
-- attach dependencies around BLAS regions
+Allowed key material:
+- operation pattern / sublayer kind
+- shape
+- dtype / trait class
+- row stride or layout stride when baked into compiled ctx
+- lane count or execution policy when it affects code shape
+- policy version
 
-HPX must not:
-- decompose BLAS internally
-- plan inside BLAS
-- assume control of BLAS worker behavior
-
----
-
-## 6. Abort rule
-
-Abort is **cooperative**, not preemptive.
-
-Abort means:
-- no new region starts after abort is observed
-- running CPU work stops only at safe checkpoints
-- in-flight BLAS or delegated backend work is not forcibly interrupted
-
-Abort checks must exist:
-- before starting each region
-- at safe checkpoints inside long CPU work
-- before launching dependent follow-on work
-
----
-
-## 7. Plan and cache invariants
-
-Plans are:
-- structural only
-- reusable across compatible runs
-
-Plans may include:
-- mode
-- structural topology
-- dependency graph
-- workspace requirement
-- planner policy version
-- execution policy metadata
-
-Plans must not include:
-- ephemeral addresses
-- raw tensor pointers
-- live backend instances
+Forbidden key material:
+- raw tensor addresses
+- live backend pointers
 - scheduler-owned objects
 - allocation-pass-owned transient state
+- temporary lowering arenas
+- per-invocation data pointers
+
+If a compiled packet ctx bakes a stride or layout value, that value must be represented in the key or validated on every bind.
 
 ---
 
-## 8. Scheduler isolation rule (critical)
+## 5. Compile vs bind
 
-Scheduler coupling is isolated mechanically.
+Compilation and binding are separate.
 
-### Allowed
-Only this translation unit may include scheduler-facing backend details:
+Compile-time responsibilities:
+- validate structural shape
+- build region/step layout
+- allocate frame/template metadata
+- store stable constants such as shape, stride, and work ranges
+
+Bind-time responsibilities:
+- patch live tensor pointers
+- patch frame-local scratch pointers
+- patch output pointers
+- ensure no ctx points to a temporary compose/lowering arena
+
+A packet must not retain stale pointers into `ggml_hpx_lowering::scratch`, temporary composer structs, stack-local lowering state, or a previous invocation’s frame.
+
+---
+
+## 6. Fine-region and packet internals
+
+Fine-region kernels and packet internals must not re-enter full graph execution.
+
+Forbidden inside `run_range(...)` kernels and packet execution steps:
+- `ggml_graph_compute_thread_run(...)`
+- `ggml_graph_compute(...)`
+- `ggml_backend_graph_compute(...)`
+- reliance on ggml barrier participation
+- reliance on implicit ggml worker identity
+
+Allowed:
+- direct CPU kernel calls
+- explicit range partitioning
+- explicit resources
+- direct dependency edges
+- local scratch/reduction buffers
+
+The selective fallback path is the exception. It may call the CPU backend, but fallback runs should be coalesced when possible.
+
+---
+
+## 7. Scheduler isolation
+
+Scheduler/backend coupling must remain mechanically isolated.
+
+For the coarse planning path, scheduler-facing translation belongs in:
 
 ```text
 ggml-hpx-adapter.cpp
 ```
 
-### Forbidden
-Scheduler/backend internals must not appear in:
-- `ggml-hpx-plan.cpp`
-- `ggml-hpx-exec.cpp`
-- cache headers
-- abort headers
-- topology headers
-- fine-region headers
-- fine-region executor code
+Do not leak scheduler internals into plan/cache code, region definitions, fine-region execution, packet code, abort code, or general runtime ownership code.
 
-This rule must not be violated.
+Selective execution may inspect the real llama graph and tensor metadata, but unstable scheduler dependencies should still be isolated behind a small boundary.
 
 ---
 
-## 9. Topology acquisition rule
+## 8. Backend safety
 
-The adapter may use two strategies.
+Selective lowering and packet dispatch are valid only when backend ownership is known to be safe.
 
-### Decode
-Default strategy:
-- independent graph walk
+Do not run HPX-lowered CPU code on nodes intended for another backend. Mixed-backend graphs must be rejected or fall back safely.
 
-Reason:
-- lower overhead
-- avoids scheduler-state dependency on the fast path
-
-### Prefill
-Default strategy:
-- scheduler-driven split translation
-
-Flow:
-1. adapter asks scheduler for split structure
-2. adapter translates it to immutable HPX-owned topology
-3. planner consumes only that immutable snapshot
-
-Fallback:
-- if decode stops being simple or becomes mixed-backend, decode may also use scheduler-driven topology through the adapter
+Unified memory is not proof of CPU ownership.
 
 ---
 
-## 10. Execution substrate rules
+## 9. BLAS and delegated work
 
-### 10.1 Substrate ownership
+BLAS and delegated backend work remain opaque.
 
-Each threadpool owns exactly one substrate:
+HPX may schedule before or after delegated regions and represent dependencies around them.
 
-- pthread threadpool → pthread executor
-- HPX threadpool → HPX executor
-
-There is no mixed substrate inside one threadpool.
-
-### 10.2 No hybrid execution inside one pool
-
-This is forbidden:
-
-```text
-one threadpool object that actively contains and runs both:
-- pthread workers
-- HPX workers
-```
-
-Reason:
-- causes contention
-- breaks decode behavior
-- obscures ownership
-
-### 10.3 Routing must happen before execution
-
-Correct:
-
-```text
-decide substrate → run_job(...)
-```
-
-Incorrect:
-
-```text
-run_job(...)
-  → branch internally between unrelated substrates
-```
-
-Substrate selection must happen before the execution call.
-
-### 10.4 Small-work fallback constraint
-
-If execution uses fewer than the published thread count, then the active
-participant count must be updated consistently.
-
-In particular, if only one worker will run, then barrier participation must
-also reflect one worker.
-
-Otherwise:
-- ggml barrier logic will deadlock
-
-### 10.5 HPX must not own decode-sized work accidentally
-
-HPX must not be used for decode-sized work by mistake.
-
-Decode-like work and very small prefill must stay off the HPX substrate unless
-a new design proves that choice beneficial.
+HPX must not decompose BLAS internals, assume BLAS worker behavior, or plan inside a delegated backend kernel.
 
 ---
 
-## 11. Repo structure rules
+## 10. Abort
 
-### Root entry points
+Abort is cooperative, not preemptive.
 
-- `README_HPX.md`
-  - current architecture and current results
+Abort means:
+- no new region starts after abort is observed
+- dependent follow-on work is not launched after abort
+- running CPU work stops only at safe checkpoints
+- in-flight BLAS/delegated work is not forcibly interrupted
 
-- `docs/HPX_EXECUTOR_CONTRACT.md`
-  - strict design and dependency rules
+Check abort before starting a region, before launching dependent work, and inside long CPU loops at safe checkpoints.
 
-- `docs/HPX_PROVENANCE.md`
-  - full chronological history
-  - not a rulebook
+---
 
-### Main code areas
+## 11. HPX usage
 
-- `ggml/src/ggml-hpx/`
-  - HPX-specific execution code
+Use HPX for structured work.
 
-- `ggml/src/ggml-cpu/`
-  - CPU executor seam and substrate ownership
+Preferred:
+- packet-level dispatch
+- region groups with meaningful work
+- coarse prefill-like substrate work
+- dependency-aware execution where dependencies matter
+- stable executor/runtime ownership
 
-- `hpx-bench/`
-  - standalone benchmark executables
+Avoid:
+- HPX per cheap node
+- repeated native-to-HPX crossings inside a node loop
+- `hpx::async(...).get()` as a per-node bridge
+- nested HPX fan-out before the outer unit is proven useful
+- executor/runtime creation on the hot path
+
+`.get()` and `wait_all` are not automatically wrong. They are wrong when they turn the hot path into repeated hard synchronization around tiny work. A final terminal wait after a batched dispatch may be acceptable.
+
+Executor choice may evolve. Do not hard-code a preferred HPX executor in this contract unless current code and benchmark evidence agree.
 
 ---
 
 ## 12. File responsibilities
 
-### `ggml-hpx-region.h`
-Defines coarse execution regions.
+### Docs
 
-### `ggml-hpx-region-dag.h`
-Defines fine CPU regions, dependency edges, resources, and `run_range`.
+- `README_HPX.md` — project map, flags, and how to run.
+- `docs/HPX_EXECUTOR_CONTRACT.md` — durable rules and boundaries.
+- `docs/HPX_PROVENANCE.md` — history, experiments, dead ends, and measurements.
 
-### `ggml-hpx-region-exec.h/.cpp`
-Implements fine-region validation and direct fine-region execution helpers.
+### Code
 
-### `ggml-hpx-adapter.cpp`
-Only allowed scheduler/backend translation unit.
-
-### `ggml-hpx-plan.h/.cpp`
-Structural plan creation and plan validity logic.
-
-### `ggml-hpx-cache.h/.cpp`
-Structural plan cache only.
-
-### `ggml-hpx-runtime.h/.cpp`
-HPX runtime ownership and substrate-level runtime support.
-
-### `ggml-hpx-exec.h/.cpp`
-Coarse-region orchestration path only.
-Must not read scheduler internals directly.
+- `ggml-hpx-runtime.*` — HPX runtime ownership and executor support.
+- `ggml-hpx-tpool.*` — HPX-backed ggml threadpool/substrate integration.
+- `ggml-hpx-adapter.*` — scheduler/backend topology translation for the coarse path.
+- `ggml-hpx-plan.*` — structural planning for the coarse path.
+- `ggml-hpx-cache.*` — structural cache for the coarse path.
+- `ggml-hpx-exec.*` — coarse-region orchestration path.
+- `ggml-hpx-region-dag.*` — fine-region, dependency, and resource data structures.
+- `ggml-hpx-region-exec.*` — fine-region validation and direct `run_range(...)` kernels.
+- `ggml-hpx-lower.*` — lowering from supported ggml ops to fine-region groups.
+- `ggml-hpx-compose.*` — composition of matched sublayers into reusable region groups.
+- `ggml-hpx-packet.*` — frozen packet compile/bind/dispatch surface.
+- `ggml-hpx-exec-selective.*` — selective execution, fallback routing, packet matching, and packet cache integration.
 
 ---
 
-## 13. Dependency rules
+## 13. Experiments and flags
 
-### Allowed
-- adapter → scheduler/backend translation
-- planner → immutable topology
-- executor → adapter + plan + cache + runtime
-- fine-region executor → fine-region structs + HPX executor headers
+Experimental paths must be:
+- env-gated or compile-gated
+- off-safe
+- measurable
+- reversible
+- explicit in stats
 
-### Forbidden
-- scheduler details outside adapter
-- backend instances inside plans
-- runtime ownership inside planner
-- cache keys using ephemeral addresses
-- fine-region code calling back into full graph execution
-
----
-
-## 14. Fine-region execution rules
-
-When using `run_range(...)`, code must:
-
-- operate on explicit ranges
-- be reentrant for distinct range tuples
-- use only explicit resources passed in
-- avoid graph re-entry
-
-It must not:
-- call `ggml_graph_compute_thread_run(...)`
-- call `ggml_graph_compute(...)`
-- call `ggml_backend_graph_compute(...)`
-- depend on implicit worker identity semantics
-- assume persistent worker participation or a ggml barrier contract
+A new packet/lowering path must document:
+- exact match conditions
+- fallback behavior when conditions fail
+- stats/accounting
+- correctness validation against baseline
+- no regression when disabled
 
 ---
 
-## 15. What Claude or future code should not change
+## 14. Do not do this
 
 Do not:
-- merge pthread and HPX into one active substrate in one pool
-- remove work-size routing without replacement evidence
-- leak scheduler dependency outside the adapter
-- reintroduce decode-sized HPX ownership casually
-- treat provenance as a design contract
-- replace fine-region execution with graph re-entry
+- merge pthread and HPX workers into one active mixed substrate
+- remove `work_size` routing for the substrate path without replacement evidence
+- leak scheduler internals outside the adapter boundary
+- reintroduce HPX per tiny decode node
+- treat provenance notes as current design contracts
+- use ephemeral pointers in reusable keys
+- leave packet ctx pointers bound to temporary composer/lowering scratch
+- call backend graph compute from fine-region kernels or packet internals
+- claim live speedup without direct measurement
 
 ---
 
-## 16. What may evolve
+## 15. May evolve
 
-These are allowed to evolve:
-- threshold tuning for work-size routing
-- region partitioning policy
-- new direct `run_range` kernels
-- fine-region DAG scheduling policy
-- HPX executor configuration
-- resource ownership details for reductions and scratch
+These may evolve:
+- work-size thresholds
+- packet matchers
+- packet key layout
+- direct `run_range` kernel coverage
+- fine-region scheduling policy
+- HPX executor choice
+- resource ownership details
+- fallback coalescing policy
 
-These must evolve without violating earlier rules.
+They must evolve without violating the durable rules above.
 
 ---
 
-## 17. Short summary
+## Short summary
 
-- use pthread for small work
-- use HPX for large work
-- keep scheduler coupling isolated to the adapter
-- keep plans structural
-- keep BLAS opaque
-- move HPX toward explicit fine-grained CPU work execution instead of
-  thread-centric execution
+- Use pthread for small whole-graph substrate work.
+- Use HPX for large or structured work.
+- Do not use HPX per tiny decode node.
+- Keep scheduler coupling isolated.
+- Keep plans and packet keys structural.
+- Keep BLAS/delegated work opaque.
+- Keep fine-region and packet internals out of full graph re-entry.
+- Use packets for repeated sublayers large enough to justify HPX dispatch.

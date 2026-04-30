@@ -201,7 +201,30 @@ typedef enum ggml_hpx_packet_sublayer
                                                         //   gate/up MUL_MAT execute via CPU backend before
                                                         //   this packet fires; weight dtype is quantized.
                                                         //   key.extra encodes weight types (see plan_key docs).
-    // future: ATTENTION_QKV, ...
+    GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_GLU_Q4K8 = 5, // 4-region: quantize / gate gemv / up gemv / SWIGLU.
+                                                        //   weights are CPU_REPACK q4_K_8x8_q8_K (both gate
+                                                        //   and up); activation is quantized once into the
+                                                        //   frame-owned Q8_K scratch and reused by both
+                                                        //   gemvs (the scratch lives in the packet frame,
+                                                        //   not in resources->shared_scratch).
+                                                        //   First cut: all four steps SERIAL on one lane,
+                                                        //   no fan-out. key.extra must be 0; weight dtype
+                                                        //   is fixed by the sublayer.
+    GGML_HPX_PACKET_SUBLAYER_QKV_PROJ_Q4K8        = 6, // 6-region: rms_norm / mul / quantize / gemv Q /
+                                                        //   gemv K / gemv V. Weights are CPU_REPACK
+                                                        //   q4_K_8x8_q8_K for all three projections
+                                                        //   (first cut all-Q4_Kx8 only; mixed-trait sites
+                                                        //   are rejected at pre-scan). The pre-norm
+                                                        //   activation is normed once into a frame-owned
+                                                        //   F32 scratch and quantized once into a
+                                                        //   frame-owned Q8_K scratch shared by all three
+                                                        //   gemvs (the scratch lives in the packet frame,
+                                                        //   not in resources->shared_scratch). First cut:
+                                                        //   all six steps SERIAL on one lane, no fan-out,
+                                                        //   rows == 1. RMS_NORM eps and weight strides
+                                                        //   participate in structural identity — see the
+                                                        //   typed-binding doc below.
+    // future: ATTENTION_FULL_BLOCK (QKV + RoPE + KV-write + FlashAttn + output), ...
 
     GGML_HPX_PACKET_SUBLAYER_CUSTOM_BASE     = 1 << 16,
 } ggml_hpx_packet_sublayer;
@@ -232,6 +255,22 @@ typedef enum ggml_hpx_packet_sublayer
 //                      bits  [0: 7] = w_gate ggml_type (0 = F32)
 //                      bits  [8:15] = w_up   ggml_type (0 = F32)
 //                      bits [16:63] = reserved, must be 0
+//
+//                    MLP_GATE_UP_GLU_Q4K8:
+//                      extra must be 0; weight dtype is fixed by the
+//                      sublayer (q4_K_8x8_q8_K for both gate and up),
+//                      so no encoding is needed.
+//
+//                    QKV_PROJ_Q4K8:
+//                      bits  [0:31] = w_q_row_stride  (bytes; Q weight repack stride)
+//                      bits [32:63] = w_kv_row_stride (bytes; K and V share stride
+//                                     because they share (cols, out_cols, trait);
+//                                     enforced at pre-scan)
+//                      Weight dtype is fixed by the sublayer (q4_K_8x8_q8_K for
+//                      w_q, w_k, w_v); no encoding needed for trait. RMS_NORM
+//                      eps is carried in key.shape[3] (raw IEEE-754 binary32 bit
+//                      pattern, zero-extended into int64) — see the typed-binding
+//                      doc for the full shape[] convention.
 //
 //                    All other sublayers: must be 0.
 //
@@ -648,6 +687,251 @@ typedef struct ggml_hpx_mlp_glu_qbridge_binding
 void ggml_hpx_bind_mlp_glu_qbridge_packet(
     struct ggml_hpx_packet_frame *              frame,
     const ggml_hpx_mlp_glu_qbridge_binding *    binding);
+
+// ---------------------------------------------------------------------------
+// Typed binding — MLP_GATE_UP_GLU_Q4K8
+// ---------------------------------------------------------------------------
+//
+// Binds one packet invocation for:
+//
+//   gate = gemv_q4_K_8x8_q8_K(W_gate, quantize_q8_K(x))
+//   up   = gemv_q4_K_8x8_q8_K(W_up,   same quantized x)
+//   out  = swiglu(gate, up)
+//
+// `w_gate` and `w_up` must be the repacked q4_K_8x8_q8_K weight pointers
+// expected by ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range. They must be
+// bound using the same source pointer convention as the existing Q4_Kx8
+// lowering path: pass gate_node->src[0]->data (and up_node->src[0]->data)
+// exactly as the lowered MUL_MAT region's ctx does. The packet does not
+// re-derive these from any tensor metadata.
+//
+// `gate` and `up` write through to ggml-side tensor storage in the first
+// cut. This keeps intermediate tensors addressable for debugging and
+// matches the existing packet behavior, even though the prescan requires
+// SWIGLU to be their only graph consumer.
+//
+// First-cut execution model
+// -------------------------
+// The compiled packet runs as four straight-line SERIAL steps inside one
+// packet dispatch:
+//
+//   step 0  SERIAL  quantize x → frame-owned Q8_K scratch
+//   step 1  SERIAL  gate gemv (reads quantized x, writes gate)
+//   step 2  SERIAL  up   gemv (reads quantized x, writes up)
+//   step 3  SERIAL  swiglu  (reads gate + up, writes out)
+//
+// There is no LANE_FANOUT in the first cut, no nested hpx::async, and no
+// dataflow / shared_future inside the packet. The compiled program only
+// emits SERIAL steps; no LANE_FANOUT step metadata is produced for this
+// sublayer. Parallel gate/up fan-out and per-step lane partitioning are
+// explicit follow-ups; see PACKET_DESIGN.md "Region-DAG variant" for the
+// path forward.
+//
+// Shape convention (must match key.shape[] used at compile time):
+//   shape[0] = out_cols      — output columns (gate, up, out width);
+//                              must be a multiple of NB_COLS = 8
+//   shape[1] = cols          — shared (reduction) dimension; multiple of QK_K = 256
+//   shape[2] = rows          — batch dimension; first cut accepts rows == 1 only
+//   shape[3] = w_row_stride  — repacked weight row stride in bytes
+//                              (== gate->src[0]->nb[1]; gate and up must agree).
+//                              This is structural identity: it is baked into
+//                              the compiled gemv ctx and cannot be patched at
+//                              bind time. Two tensors with the same
+//                              (out_cols, cols) but different repacked
+//                              layouts must NOT share a cached packet, so
+//                              w_row_stride participates in the cache key
+//                              and a packet compiled with one stride must
+//                              never be dispatched against a weight with a
+//                              different stride.
+//
+// Resource requirements (queried via
+// ggml_hpx_packet_get_resource_requirements):
+//   n_lanes                     == 1   (SERIAL only; no fan-out)
+//   lane_scratch_bytes_per_lane == 0
+//   reduction_buffer_bytes      == 0
+//   shared_scratch_bytes        == 0   (frame-owned scratch; see below)
+//
+// Frame-owned scratch, first cut:
+//   The once-quantized Q8_K activation row lives in the mutable packet
+//   frame, immediately after the fixed ctx arena. Bind rewires the
+//   quantize, gate gemv, and up gemv ctxs so all three point at this
+//   frame-owned Q8_K slab. This sublayer does not request
+//   resources->shared_scratch; the resources struct's shared_scratch
+//   pointer is unused for MLP_GATE_UP_GLU_Q4K8.
+//
+// Fields (per-invocation data pointers only — dimensions are structural,
+// baked into the packet at compile time, and must NOT be re-patched per call):
+//
+//   w_gate : repacked q4_K_8x8_q8_K weight; CPU_REPACK layout
+//            (block_q4_Kx8). Pass gate_node->src[0]->data verbatim.
+//   w_up   : repacked q4_K_8x8_q8_K weight; pass up_node->src[0]->data verbatim.
+//   x      : [cols] F32 input activations; shared between gate and up
+//            via a single quantize step into the frame-owned Q8_K scratch.
+//   gate   : [out_cols] F32 gate gemv output; written through to gate_node->data.
+//   up     : [out_cols] F32 up   gemv output; written through to up_node->data.
+//   out    : [out_cols] F32 fused SWIGLU output; written to glu_node->data.
+//
+// Hard preconditions (debug-asserted; undefined behaviour if violated):
+//   - frame must have been frame_init'd against a packet with
+//     key.sublayer == MLP_GATE_UP_GLU_Q4K8.
+//   - All six pointers must be non-null and validly sized.
+//   - gate and up must not alias each other (the two gemv steps write
+//     them independently and SWIGLU reads both).
+//   - cols and out_cols must equal packet->key.shape[1] / shape[0].
+
+typedef struct ggml_hpx_mlp_gate_up_glu_q4k8_binding
+{
+    const void *  w_gate;    // repacked q4_K_8x8_q8_K weight
+    const void *  w_up;      // repacked q4_K_8x8_q8_K weight
+    const float * x;         // F32 activation row    [cols]
+    float *       gate;      // gate gemv output      [out_cols]
+    float *       up;        // up   gemv output      [out_cols]
+    float *       out;       // fused SWIGLU output   [out_cols]
+} ggml_hpx_mlp_gate_up_glu_q4k8_binding;
+
+void ggml_hpx_bind_mlp_gate_up_glu_q4k8_packet(
+    struct ggml_hpx_packet_frame *                       frame,
+    const ggml_hpx_mlp_gate_up_glu_q4k8_binding *        binding);
+
+// ---------------------------------------------------------------------------
+// Typed binding — QKV_PROJ_Q4K8
+// ---------------------------------------------------------------------------
+//
+// Binds one packet invocation for the attention-side QKV projection trio
+// preceded by RMS_NORM and the per-element norm-scale MUL:
+//
+//   norm_out = rms_norm(x, eps)
+//   normed_x = norm_out * w_norm                              (per-element)
+//   q8_x     = quantize_q8_K(normed_x)
+//   q        = gemv_q4_K_8x8_q8_K(W_Q, q8_x)                  // [out_cols_q]
+//   k        = gemv_q4_K_8x8_q8_K(W_K, q8_x)                  // [out_cols_kv]
+//   v        = gemv_q4_K_8x8_q8_K(W_V, q8_x)                  // [out_cols_kv]
+//
+// `w_q`, `w_k`, `w_v` must all be repacked q4_K_8x8_q8_K weight pointers,
+// passed verbatim from each MUL_MAT's src[0]->data — same convention as the
+// existing Q4_Kx8 lowered path and the MLP_GATE_UP_GLU_Q4K8 binding. The
+// packet does not re-derive these from any tensor metadata.
+//
+// `q`, `k`, and `v` write through to ggml-side tensor storage in the first
+// cut. This keeps the projection outputs addressable for downstream nodes
+// (RESHAPE → ROPE → SET_ROWS → FLASH_ATTN_EXT → output projection), all of
+// which run as normal per-node ops outside the packet. The selective-side
+// pre-scan requires that the pattern's downstream consumer of normed_x is
+// exactly Q, K, V (and nothing else), so `normed_x` itself never needs to
+// be addressable from outside the packet.
+//
+// First-cut all-Q4_Kx8 constraint
+// -------------------------------
+// All three of w_q, w_k, w_v MUST be CPU_REPACK with the q4_K_8x8_q8_K
+// trait. Mixed Q4/Q6 sites are rejected at pre-scan (in TinyLlama Q4_K_M
+// this excludes the 10 layers whose attn_v is Q6_Kx8). Adding Q6_Kx8
+// support is a separate ggml-hpx region/lower/packet expansion — see
+// `local/results/q4k8-edit5-validate/QKV-packet-design.md` §7-§8.
+//
+// First-cut execution model
+// -------------------------
+// The compiled packet runs as six straight-line SERIAL steps inside one
+// packet dispatch:
+//
+//   step 0  SERIAL  rms_norm:    x → frame-owned norm_out
+//   step 1  SERIAL  mul:         norm_out * w_norm → frame-owned normed_x
+//   step 2  SERIAL  quantize:    normed_x → frame-owned q8_x  (Q8_K)
+//   step 3  SERIAL  Q gemv:      gemv_q4_K_8x8_q8_K(w_q, q8_x) → q
+//   step 4  SERIAL  K gemv:      gemv_q4_K_8x8_q8_K(w_k, q8_x) → k
+//   step 5  SERIAL  V gemv:      gemv_q4_K_8x8_q8_K(w_v, q8_x) → v
+//
+// There is no LANE_FANOUT in the first cut, no nested hpx::async, and no
+// dataflow / shared_future inside the packet. The compiled program only
+// emits SERIAL steps; no LANE_FANOUT step metadata is produced for this
+// sublayer.
+//
+// Shape convention (must match key.shape[] used at compile time):
+//   shape[0] = out_cols_q    — Q output columns; multiple of NB_COLS = 8
+//   shape[1] = out_cols_kv   — K and V output columns (equal); multiple of NB_COLS
+//   shape[2] = cols          — shared (reduction) dim; multiple of QK_K = 256
+//   shape[3] = eps_bits      — RMS_NORM epsilon as the raw IEEE-754 binary32
+//                              bit pattern, zero-extended into int64. Two
+//                              graphs with the same shapes/strides but
+//                              different eps must NOT share a cached packet,
+//                              so eps participates in structural identity.
+//
+// rows is constrained to 1 by the first-cut single-token decode contract
+// (`node->ne[1] == 1`). It is enforced at pre-scan and is NOT carried in
+// shape[]; widening to rows > 1 is a future variant.
+//
+// Stride encoding (key.extra):
+//   bits  [0:31] = w_q_row_stride  (bytes; gate MUL_MAT's src[0]->nb[1] for Q)
+//   bits [32:63] = w_kv_row_stride (bytes; K and V must share this stride,
+//                                   enforced at pre-scan)
+// A packet compiled with one stride must NEVER be dispatched against a
+// weight with a different stride; this is structural identity.
+//
+// Resource requirements (queried via
+// ggml_hpx_packet_get_resource_requirements):
+//   n_lanes                     == 1   (SERIAL only; no fan-out)
+//   lane_scratch_bytes_per_lane == 0
+//   reduction_buffer_bytes      == 0
+//   shared_scratch_bytes        == 0   (frame-owned scratch; see below)
+//
+// Frame-owned scratch, first cut:
+//   Three slabs live in the mutable packet frame, immediately after the
+//   fixed ctx arena. Bind rewires the rms_norm, mul, quantize, and three
+//   gemv ctxs so all stages read/write these frame-owned slabs:
+//
+//     norm_out  : F32  [cols]                — RMS_NORM output
+//     normed_x  : F32  [cols]                — output of MUL(norm_out, w_norm);
+//                                              shared input to the three gemvs
+//                                              (after quantization)
+//     q8_x      : Q8_K [cols / QK_K blocks]  — once-quantized normed_x;
+//                                              shared by Q, K, V gemvs
+//
+//   This sublayer does not request resources->shared_scratch; the resources
+//   struct's shared_scratch pointer is unused for QKV_PROJ_Q4K8.
+//
+// Fields (per-invocation data pointers only — dimensions are structural,
+// baked into the packet at compile time, and must NOT be re-patched per call):
+//
+//   w_norm : F32 [cols] — RMS_NORM scale weight (ggml's `weight` tensor for
+//                         the per-element MUL after RMS_NORM); pass
+//                         mul_node->src[1]->data verbatim.
+//   w_q    : repacked q4_K_8x8_q8_K weight; CPU_REPACK layout (block_q4_Kx8).
+//            Pass q_node->src[0]->data verbatim.
+//   w_k    : repacked q4_K_8x8_q8_K weight; pass k_node->src[0]->data verbatim.
+//   w_v    : repacked q4_K_8x8_q8_K weight; pass v_node->src[0]->data verbatim.
+//   x      : [cols] F32 input activations (pre-norm). Read once by RMS_NORM;
+//            not aliased by any output.
+//   q      : [out_cols_q] F32 Q gemv output; written through to q_node->data.
+//   k      : [out_cols_kv] F32 K gemv output; written through to k_node->data.
+//   v      : [out_cols_kv] F32 V gemv output; written through to v_node->data.
+//
+// Hard preconditions (debug-asserted; undefined behaviour if violated):
+//   - frame must have been frame_init'd against a packet with
+//     key.sublayer == QKV_PROJ_Q4K8.
+//   - All eight pointers must be non-null and validly sized.
+//   - q, k, v must not alias each other or `x` (the three gemv steps and
+//     RMS_NORM read/write them independently).
+//   - w_k and w_v must have identical row strides (matches the structural
+//     assumption that K and V share (cols, out_cols, trait) and therefore
+//     stride; pre-scan rejects matches that violate this).
+//   - cols, out_cols_q, out_cols_kv must equal packet->key.shape[2],
+//     shape[0], shape[1] respectively.
+//   - rows == 1 (single-token decode; widening is a future variant).
+
+typedef struct ggml_hpx_qkv_proj_q4k8_binding
+{
+    const float * w_norm;    // F32 RMS_NORM scale weight             [cols]
+    const void *  w_q;       // repacked q4_K_8x8_q8_K Q weight
+    const void *  w_k;       // repacked q4_K_8x8_q8_K K weight
+    const void *  w_v;       // repacked q4_K_8x8_q8_K V weight
+    const float * x;         // F32 pre-norm activation row           [cols]
+    float *       q;         // Q gemv output, written through        [out_cols_q]
+    float *       k;         // K gemv output, written through        [out_cols_kv]
+    float *       v;         // V gemv output, written through        [out_cols_kv]
+} ggml_hpx_qkv_proj_q4k8_binding;
+
+void ggml_hpx_bind_qkv_proj_q4k8_packet(
+    struct ggml_hpx_packet_frame *                frame,
+    const ggml_hpx_qkv_proj_q4k8_binding *        binding);
 
 #ifdef __cplusplus
 }    // extern "C"

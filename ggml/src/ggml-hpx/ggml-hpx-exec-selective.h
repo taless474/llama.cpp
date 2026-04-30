@@ -37,12 +37,14 @@
 #include <cstdint>
 
 // Opaque forward-declarations. Full definitions live in:
-//   ggml_hpx_packet_runtime           — ggml-hpx-packet.h
-//   ggml_hpx_mlp_gate_up_packet_cache — this TU's .cpp (internal)
-//   ggml_hpx_mlp_glu_packet_cache     — this TU's .cpp (internal)
+//   ggml_hpx_packet_runtime                    — ggml-hpx-packet.h
+//   ggml_hpx_mlp_gate_up_packet_cache          — this TU's .cpp (internal)
+//   ggml_hpx_mlp_glu_packet_cache              — this TU's .cpp (internal)
+//   ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache — this TU's .cpp (internal)
 struct ggml_hpx_packet_runtime;
 struct ggml_hpx_mlp_gate_up_packet_cache;
 struct ggml_hpx_mlp_glu_packet_cache;
+struct ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache;
 
 // Per-call counters filled by ggml_hpx_exec_graph_selective_mul_mat.
 // Times are in nanoseconds.
@@ -134,6 +136,26 @@ void ggml_hpx_mlp_glu_packet_cache_destroy(
     ggml_hpx_mlp_glu_packet_cache * cache);
 
 // ---------------------------------------------------------------------------
+// MLP gate/up/GLU Q4_Kx8 packet cache
+// ---------------------------------------------------------------------------
+//
+// Plan store for compiled GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_GLU_Q4K8
+// packets. Ownership, layering, and seq_regime / policy_version semantics
+// match the gate/up and GLU caches above.
+//
+// First-cut compile policy is SERIAL-only: passing n_lanes != 1 is
+// rejected at compile time. The parameter is kept for signature parity
+// with the other caches and for the lane-fanout follow-up.
+ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache *
+ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache_create(
+    uint32_t n_lanes,
+    uint32_t seq_regime,
+    uint32_t policy_version);
+
+void ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache_destroy(
+    ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache * cache);
+
+// ---------------------------------------------------------------------------
 // Packet env — bundles runtime + all sublayer caches
 // ---------------------------------------------------------------------------
 //
@@ -147,9 +169,10 @@ void ggml_hpx_mlp_glu_packet_cache_destroy(
 // receives this env.
 struct ggml_hpx_selective_packet_env
 {
-    ggml_hpx_packet_runtime *             rt;           // shared execution substrate
-    ggml_hpx_mlp_gate_up_packet_cache *   mlp_cache;    // null → gate/up path disabled
-    ggml_hpx_mlp_glu_packet_cache *       mlp_glu_cache; // null → GLU path disabled
+    ggml_hpx_packet_runtime *                    rt;
+    ggml_hpx_mlp_gate_up_packet_cache *          mlp_cache;
+    ggml_hpx_mlp_glu_packet_cache *              mlp_glu_cache;
+    ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache * mlp_gate_up_glu_q4k8_cache;
 };
 
 // ---------------------------------------------------------------------------

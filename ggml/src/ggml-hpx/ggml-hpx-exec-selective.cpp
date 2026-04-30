@@ -676,6 +676,349 @@ void prescan_mlp_glu_matches(
 } // namespace
 
 // ---------------------------------------------------------------------------
+// MLP gate/up/GLU Q4_Kx8 cache — internal types
+// ---------------------------------------------------------------------------
+//
+// TU-private, mirrors the gate/up and GLU types above. The file-scope cache
+// struct below references them; anonymous-namespace members are visible
+// throughout the same TU.
+
+namespace {
+
+struct mlp_gate_up_glu_q4k8_cache_key
+{
+    int64_t out_cols;
+    int64_t cols;
+    int64_t rows;
+    int64_t w_row_stride;
+
+    bool operator==(const mlp_gate_up_glu_q4k8_cache_key & o) const noexcept
+    {
+        return out_cols     == o.out_cols
+            && cols         == o.cols
+            && rows         == o.rows
+            && w_row_stride == o.w_row_stride;
+    }
+};
+
+struct mlp_gate_up_glu_q4k8_cache_key_hash
+{
+    std::size_t operator()(const mlp_gate_up_glu_q4k8_cache_key & k) const noexcept
+    {
+        std::size_t h = std::hash<int64_t>{}(k.out_cols);
+        h ^= std::hash<int64_t>{}(k.cols)         + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.rows)         + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.w_row_stride) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct mlp_gate_up_glu_q4k8_packet_entry
+{
+    ggml_hpx_frozen_packet *  packet      = nullptr;
+    ggml_hpx_packet_frame *   frame       = nullptr;
+    void *                    frame_raw   = nullptr;
+    std::size_t               frame_align = 0;
+
+    mlp_gate_up_glu_q4k8_packet_entry() noexcept = default;
+
+    ~mlp_gate_up_glu_q4k8_packet_entry() noexcept
+    {
+        if (frame_raw)
+        {
+            ::operator delete(frame_raw, std::align_val_t{frame_align});
+        }
+        if (packet)
+        {
+            ggml_hpx_free_packet(packet);
+        }
+    }
+
+    mlp_gate_up_glu_q4k8_packet_entry(const mlp_gate_up_glu_q4k8_packet_entry &)             = delete;
+    mlp_gate_up_glu_q4k8_packet_entry & operator=(const mlp_gate_up_glu_q4k8_packet_entry &) = delete;
+};
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// MLP gate/up/GLU Q4_Kx8 packet cache — full definition and lifecycle
+// ---------------------------------------------------------------------------
+
+struct ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache
+{
+    uint32_t n_lanes        = 0;
+    uint32_t seq_regime     = 0;
+    uint32_t policy_version = 0;
+
+    std::unordered_map<mlp_gate_up_glu_q4k8_cache_key,
+                       std::unique_ptr<mlp_gate_up_glu_q4k8_packet_entry>,
+                       mlp_gate_up_glu_q4k8_cache_key_hash> entries;
+};
+
+ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache *
+ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache_create(
+    uint32_t n_lanes,
+    uint32_t seq_regime,
+    uint32_t policy_version)
+{
+    auto * c = new ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache;
+    c->n_lanes        = n_lanes;
+    c->seq_regime     = seq_regime;
+    c->policy_version = policy_version;
+    return c;
+}
+
+void ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache_destroy(
+    ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache * cache)
+{
+    delete cache;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: lookup-or-compile and prescan for MLP_GATE_UP_GLU_Q4K8
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const mlp_gate_up_glu_q4k8_packet_entry * lookup_or_compile_mlp_gate_up_glu_q4k8(
+    ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache * cache,
+    const ggml_tensor *                          node_gate,
+    const ggml_tensor *                          node_up,
+    const ggml_tensor *                          node_glu)
+{
+    // First-cut packet policy: SERIAL only (n_lanes == 1). Reject other
+    // lane counts before composing so the cache never holds an entry
+    // compiled under a stale rule.
+    if (cache->n_lanes != 1)
+    {
+        return nullptr;
+    }
+
+    // Structural key from the gate MUL_MAT output tensor and weight stride.
+    //   gate->ne[0]         == out_cols
+    //   gate->src[1]->ne[0] == cols
+    //   gate->src[0]->nb[1] == repacked-weight row stride in bytes
+    // rows is fixed at 1 (sublayer is decode-only).
+    mlp_gate_up_glu_q4k8_cache_key key{};
+    key.out_cols     = node_gate->ne[0];
+    key.cols         = node_gate->src[1]->ne[0];
+    key.rows         = 1;
+    key.w_row_stride = node_gate->src[0]->nb[1];
+    if (key.out_cols <= 0 || key.cols <= 0 || key.w_row_stride <= 0)
+    {
+        return nullptr;
+    }
+
+    auto it = cache->entries.find(key);
+    if (it != cache->entries.end())
+    {
+        return it->second.get();
+    }
+
+    // Cache miss: compose 4-region group → compile → allocate frame.
+    ggml_hpx_mlp_gate_up_glu_q4k8_group grp;
+    ggml_hpx_mlp_gate_up_glu_q4k8_group_init(&grp);
+    if (!ggml_hpx_compose_mlp_gate_up_glu_q4k8_group(
+            node_gate, node_up, node_glu, &grp))
+    {
+        return nullptr;
+    }
+
+    ggml_hpx_packet_plan_key pkey{};
+    pkey.sublayer       = GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_GLU_Q4K8;
+    pkey.team           = GGML_HPX_PACKET_TEAM_DECODE;
+    pkey.n_lanes        = cache->n_lanes;
+    pkey.dtype          = GGML_TYPE_F32;
+    pkey.seq_regime     = cache->seq_regime;
+    pkey.policy_version = cache->policy_version;
+    pkey.shape[0]       = key.out_cols;
+    pkey.shape[1]       = key.cols;
+    pkey.shape[2]       = 1;
+    pkey.shape[3]       = key.w_row_stride;
+    pkey.extra          = 0;
+
+    const char *             err    = nullptr;
+    ggml_hpx_frozen_packet * packet = ggml_hpx_compile_packet(&grp.group, &pkey, &err);
+    if (!packet)
+    {
+        return nullptr;
+    }
+
+    if (packet_compile_log_enabled())
+    {
+        fprintf(stderr,
+            "[hpx-packet-compile] matcher=gate_up_glu_q4k8"
+            " out_cols=%lld cols=%lld rows=1 w_row_stride=%lld\n",
+            (long long) key.out_cols, (long long) key.cols,
+            (long long) key.w_row_stride);
+    }
+
+    const std::size_t sz    = ggml_hpx_packet_frame_size (packet);
+    const std::size_t al    = ggml_hpx_packet_frame_align(packet);
+    void *            raw   = ::operator new(sz, std::align_val_t{al});
+    auto *            frame = static_cast<ggml_hpx_packet_frame *>(raw);
+    ggml_hpx_packet_frame_init(frame, packet);
+
+    auto entry         = std::make_unique<mlp_gate_up_glu_q4k8_packet_entry>();
+    entry->packet      = packet;
+    entry->frame       = frame;
+    entry->frame_raw   = raw;
+    entry->frame_align = al;
+
+    mlp_gate_up_glu_q4k8_packet_entry * ret = entry.get();
+    cache->entries.emplace(key, std::move(entry));
+
+    return ret;
+}
+
+// Per-match record: gate, up, GLU trigger node indices plus the cached entry.
+struct mlp_gate_up_glu_q4k8_match
+{
+    int                                          nodes[3];   // [0]=gate, [1]=up, [2]=glu (trigger)
+    const mlp_gate_up_glu_q4k8_packet_entry *    entry;
+};
+
+// One pre-scan pass over gf->nodes. For each GGML_OP_GLU[SWIGLU] node whose
+// gate and up MUL_MATs use repacked CPU_REPACK q4_K_8x8_q8_K weights, share
+// the same activation, satisfy the first-cut shape constraints, and have no
+// other graph consumers, record a match and mark all three node indices in
+// `consumed`.
+//
+// Ordering rule: trigger (GLU node) is at index i; gate and up MUL_MATs must
+// appear strictly before i in gf->nodes. Only mark consumed[] after a
+// successful lookup_or_compile.
+//
+// The exclusive-consumer check guards the in-frame quantize/gemv path: the
+// packet writes through to gate->data and up->data, which is only safe if
+// SWIGLU is the only graph consumer of those tensors.
+void prescan_mlp_gate_up_glu_q4k8_matches(
+    ggml_cgraph *                                       gf,
+    ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache *        cache,
+    std::vector<bool> &                                  consumed,
+    std::vector<int>  &                                  q4k8_match_at_final,
+    std::vector<mlp_gate_up_glu_q4k8_match> &            matches)
+{
+    auto find_index = [&](const ggml_tensor * t) -> int
+    {
+        for (int i = 0; i < gf->n_nodes; ++i)
+        {
+            if (gf->nodes[i] == t)
+            {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    auto exclusive_consumer = [&](const ggml_tensor * producer, int trigger_idx) -> bool
+    {
+        for (int j = 0; j < gf->n_nodes; ++j)
+        {
+            if (j == trigger_idx)
+            {
+                continue;
+            }
+            const ggml_tensor * n = gf->nodes[j];
+            if (!n)
+            {
+                continue;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s)
+            {
+                if (n->src[s] == producer)
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    const int64_t qk_k_block = ggml_blck_size(GGML_TYPE_Q4_K);
+
+    for (int i = 0; i < gf->n_nodes; ++i)
+    {
+        const ggml_tensor * glu_t = gf->nodes[i];
+        if (!glu_t)                                              continue;
+        if (glu_t->op != GGML_OP_GLU)                            continue;
+        if (ggml_get_glu_op(glu_t) != GGML_GLU_OP_SWIGLU)        continue;
+        if (!glu_t->src[0] || !glu_t->src[1])                    continue;
+
+        const ggml_tensor * gate_t = glu_t->src[0];
+        const ggml_tensor * up_t   = glu_t->src[1];
+        if (gate_t->op != GGML_OP_MUL_MAT)                       continue;
+        if (up_t->op   != GGML_OP_MUL_MAT)                       continue;
+
+        // Output and intermediate types must be F32 with sizeof(float) row stride.
+        if (gate_t->type != GGML_TYPE_F32)                       continue;
+        if (up_t->type   != GGML_TYPE_F32)                       continue;
+        if (glu_t->type  != GGML_TYPE_F32)                       continue;
+        if (gate_t->nb[0] != sizeof(float))                      continue;
+        if (up_t->nb[0]   != sizeof(float))                      continue;
+        if (glu_t->nb[0]  != sizeof(float))                      continue;
+
+        // Decode-only first cut.
+        if (gate_t->ne[1] != 1)                                  continue;
+        if (up_t->ne[1]   != 1)                                  continue;
+
+        // Shared activation: gate and up must consume the same x.
+        if (gate_t->src[1] != up_t->src[1])                      continue;
+
+        // Shape parity for gate and up.
+        if (gate_t->ne[0] != up_t->ne[0])                        continue;
+
+        const int64_t out_cols = gate_t->ne[0];
+        const int64_t cols     = gate_t->src[1]->ne[0];
+        if (cols % qk_k_block != 0)                              continue;
+        if (out_cols % 8 != 0)                                   continue;
+
+        // Q4_K weights, both repacked CPU_REPACK with q4_K_8x8_q8_K trait.
+        const ggml_tensor * w_gate = gate_t->src[0];
+        const ggml_tensor * w_up   = up_t->src[0];
+        if (!w_gate || !w_up)                                    continue;
+        if (w_gate->type != GGML_TYPE_Q4_K)                      continue;
+        if (w_up->type   != GGML_TYPE_Q4_K)                      continue;
+        if (w_gate->extra == nullptr || w_up->extra == nullptr)  continue;
+        if (!ggml_hpx_is_q4k_8x8_repacked(gate_t))               continue;
+        if (!ggml_hpx_is_q4k_8x8_repacked(up_t))                 continue;
+
+        // Repacked-weight row stride must agree (structural identity).
+        if (w_gate->nb[1] != w_up->nb[1])                        continue;
+
+        // Topology: gate and up must precede the trigger.
+        const int i_gate = find_index(gate_t);
+        const int i_up   = find_index(up_t);
+        if (i_gate < 0 || i_up < 0)                              continue;
+        if (i_gate >= i || i_up >= i)                            continue;
+
+        // Don't steal nodes already claimed by an earlier match.
+        if (consumed[i_gate] || consumed[i_up] || consumed[i])   continue;
+
+        // Exclusive consumer: nothing else in the graph reads gate or up.
+        if (!exclusive_consumer(gate_t, i))                      continue;
+        if (!exclusive_consumer(up_t,   i))                      continue;
+
+        const mlp_gate_up_glu_q4k8_packet_entry * entry =
+            lookup_or_compile_mlp_gate_up_glu_q4k8(cache, gate_t, up_t, glu_t);
+        if (!entry)                                              continue;
+
+        mlp_gate_up_glu_q4k8_match m{};
+        m.nodes[0] = i_gate;
+        m.nodes[1] = i_up;
+        m.nodes[2] = i;
+        m.entry    = entry;
+
+        q4k8_match_at_final[i] = static_cast<int>(matches.size());
+        matches.push_back(m);
+        consumed[i_gate] = true;
+        consumed[i_up  ] = true;
+        consumed[i     ] = true;
+    }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // Graph-entry policy guard
 // ---------------------------------------------------------------------------
 //
@@ -927,6 +1270,130 @@ void ggml_hpx_selective_log_node_histogram(const ggml_cgraph * gf)
 }
 
 // ---------------------------------------------------------------------------
+// Graph-map diagnostic helpers (LLAMA_HPX_SELECTIVE_GRAPH_MAP=1)
+// ---------------------------------------------------------------------------
+//
+// Read-only classifier and shape/trait formatters used only by the once-per-
+// process map dump emitted from the selective entry point. Mirror the main
+// loop's routing decision so the printed category reflects what would actually
+// run; no graph state is mutated.
+
+namespace {
+
+enum class map_cat : char { L = 'L', F = 'F', P = 'P' };
+
+struct map_entry
+{
+    map_cat      cat    = map_cat::F;
+    const char * reason = nullptr;
+};
+
+// Format ne[] as "[ne0,ne1,ne2,ne3]" with trailing 1's collapsed.
+void map_fmt_shape(char * buf, std::size_t bufsz, const ggml_tensor * t) noexcept
+{
+    if (!t)
+    {
+        snprintf(buf, bufsz, "[]");
+        return;
+    }
+    int last = 3;
+    while (last > 0 && t->ne[last] == 1) --last;
+    switch (last)
+    {
+    case 0:
+        snprintf(buf, bufsz, "[%lld]",
+                 (long long) t->ne[0]);
+        break;
+    case 1:
+        snprintf(buf, bufsz, "[%lld,%lld]",
+                 (long long) t->ne[0], (long long) t->ne[1]);
+        break;
+    case 2:
+        snprintf(buf, bufsz, "[%lld,%lld,%lld]",
+                 (long long) t->ne[0], (long long) t->ne[1],
+                 (long long) t->ne[2]);
+        break;
+    default:
+        snprintf(buf, bufsz, "[%lld,%lld,%lld,%lld]",
+                 (long long) t->ne[0], (long long) t->ne[1],
+                 (long long) t->ne[2], (long long) t->ne[3]);
+        break;
+    }
+}
+
+const char * map_src0_type(const ggml_tensor * node) noexcept
+{
+    if (!node || !node->src[0]) return "-";
+    return ggml_type_name(node->src[0]->type);
+}
+
+// Trait label for src[0]. Only meaningful for MUL_MAT with quantized weights;
+// "-" elsewhere. Q4_K is split by repacked vs standard, with the 8x8 trait
+// distinguished because it is the only repacked Q4_K trait the lowered path
+// can drive.
+const char * map_src0_trait(const ggml_tensor * node) noexcept
+{
+    if (!node || node->op != GGML_OP_MUL_MAT) return "-";
+    const ggml_tensor * w = node->src[0];
+    if (!w) return "-";
+    if (w->type == GGML_TYPE_Q4_K)
+    {
+        if (w->extra == nullptr) return "standard";
+        return ggml_hpx_is_q4k_8x8_repacked(node)
+                   ? "q4_K_8x8_q8_K"
+                   : "q4_K_repacked_other";
+    }
+    if (ggml_is_quantized(w->type))
+    {
+        return w->extra ? "repacked" : "standard";
+    }
+    return "-";
+}
+
+// Mirrors the main loop's routing decision exactly:
+//   consumed[i]                        -> P
+//   !lower_op                          -> F (not_lowerable)
+//   lower_op + resource-REDUCTION      -> F (resource_reduction)
+//   otherwise                          -> L (lowered)
+map_entry map_classify(
+    int                       i,
+    const ggml_tensor *       node,
+    const std::vector<bool> & consumed,
+    const std::vector<int>  & match_at_final,
+    const std::vector<int>  & glu_match_at_final,
+    const std::vector<int>  & q4k8_match_at_final)
+{
+    if (!node)
+    {
+        return {map_cat::F, "null_node"};
+    }
+    if (consumed[i])
+    {
+        if (q4k8_match_at_final[i] >= 0) return {map_cat::P, "packet_q4k8"};
+        if (match_at_final[i] >= 0)      return {map_cat::P, "packet_gate_up"};
+        if (glu_match_at_final[i] >= 0)  return {map_cat::P, "packet_glu"};
+        return {map_cat::P, "packet_member"};
+    }
+    ggml_hpx_lowering lo;
+    ggml_hpx_lowering_init(&lo);
+    if (!ggml_hpx_lower_op(node, &lo))
+    {
+        return {map_cat::F, "not_lowerable"};
+    }
+    for (int r = 0; r < lo.group.n_regions; ++r)
+    {
+        if (lo.group.regions[r].kind == GGML_HPX_CPU_REGION_KIND_REDUCTION
+         && lo.group.regions[r].uses_resources)
+        {
+            return {map_cat::F, "resource_reduction"};
+        }
+    }
+    return {map_cat::L, "lowered"};
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // Main selective entry point
 // ---------------------------------------------------------------------------
 
@@ -942,6 +1409,18 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
         return true;
     }
 
+    // LLAMA_HPX_PACKET_MLP_GATE_UP_GLU_Q4K8=1 gates the Q4_Kx8 sublayer
+    // packet path. Read once per process to keep the hot path cold when
+    // disabled.
+    static const bool q4k8_packet_env_flag = [] {
+        const char * e = getenv("LLAMA_HPX_PACKET_MLP_GATE_UP_GLU_Q4K8");
+        return e && atoi(e) != 0;
+    }();
+
+    const bool q4k8_enabled = q4k8_packet_env_flag
+        && packet_env
+        && packet_env->rt
+        && packet_env->mlp_gate_up_glu_q4k8_cache;
     const bool gate_up_enabled = packet_env
         && packet_env->rt
         && packet_env->mlp_cache;
@@ -962,17 +1441,27 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
     using clock    = std::chrono::steady_clock;
     using nanosecs = std::chrono::nanoseconds;
 
-    // Pre-scan. Both scans share consumed[] so a node claimed by gate/up
-    // cannot be re-claimed by GLU and vice versa.
-    // Gate/up runs first (preserves the older path), GLU second.
-    // When both paths are disabled, all vectors stay at their default values
-    // and the main loop behaves exactly as it did before the packet path.
-    std::vector<bool>          consumed          (gf->n_nodes, false);
-    std::vector<int>           match_at_final    (gf->n_nodes, -1);
-    std::vector<int>           glu_match_at_final(gf->n_nodes, -1);
-    std::vector<mlp_match>     matches;
-    std::vector<mlp_glu_match> glu_matches;
+    // Pre-scan. All scans share consumed[] so a node claimed by one matcher
+    // cannot be re-claimed by another. Q4_Kx8 runs first because its trigger
+    // (GGML_OP_GLU/SWIGLU) overlaps with the older GLU matcher's trigger:
+    // claiming the larger 3-node packet up-front keeps the older GLU path
+    // from absorbing the trigger and shrinking the match. When all paths are
+    // disabled, the vectors stay at their default values and the main loop
+    // behaves exactly as it did before the packet path.
+    std::vector<bool>                        consumed              (gf->n_nodes, false);
+    std::vector<int>                         match_at_final        (gf->n_nodes, -1);
+    std::vector<int>                         glu_match_at_final    (gf->n_nodes, -1);
+    std::vector<int>                         q4k8_match_at_final   (gf->n_nodes, -1);
+    std::vector<mlp_match>                   matches;
+    std::vector<mlp_glu_match>               glu_matches;
+    std::vector<mlp_gate_up_glu_q4k8_match>  q4k8_matches;
 
+    if (q4k8_enabled)
+    {
+        prescan_mlp_gate_up_glu_q4k8_matches(
+            gf, packet_env->mlp_gate_up_glu_q4k8_cache,
+            consumed, q4k8_match_at_final, q4k8_matches);
+    }
     if (gate_up_enabled)
     {
         prescan_mlp_matches(gf, packet_env->mlp_cache,
@@ -982,6 +1471,107 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
     {
         prescan_mlp_glu_matches(gf, packet_env->mlp_glu_cache,
                                 consumed, glu_match_at_final, glu_matches);
+    }
+
+    // LLAMA_HPX_SELECTIVE_GRAPH_MAP=1 emits a one-shot per-node map of the
+    // first decode graph this function sees: [hpx-map] / [hpx-map-run] /
+    // [hpx-map-summary]. Diagnostic only — no graph state is touched.
+    {
+        static const bool map_enabled = [] {
+            const char * e = getenv("LLAMA_HPX_SELECTIVE_GRAPH_MAP");
+            return e && atoi(e) != 0;
+        }();
+        static bool map_printed = false;
+        if (map_enabled && !map_printed)
+        {
+            map_printed = true;
+
+            std::vector<map_cat>      cats   (gf->n_nodes, map_cat::F);
+            std::vector<const char *> reasons(gf->n_nodes, "-");
+            for (int i = 0; i < gf->n_nodes; ++i)
+            {
+                const map_entry me = map_classify(
+                    i, gf->nodes[i], consumed, match_at_final, glu_match_at_final,
+                    q4k8_match_at_final);
+                cats[i]    = me.cat;
+                reasons[i] = me.reason;
+            }
+
+            uint32_t lowered_nodes = 0, fallback_nodes = 0, packet_nodes = 0;
+            uint32_t lowered_runs  = 0, fallback_runs  = 0, packet_runs  = 0;
+            int run_id = 0;
+
+            for (int i = 0; i < gf->n_nodes; )
+            {
+                int j = i + 1;
+                while (j < gf->n_nodes && cats[j] == cats[i]) ++j;
+                const int len = j - i;
+
+                for (int k = i; k < j; ++k)
+                {
+                    const ggml_tensor * node = gf->nodes[k];
+                    char shape_buf[64];
+                    map_fmt_shape(shape_buf, sizeof(shape_buf), node);
+                    fprintf(stderr,
+                        "[hpx-map] idx=%d cat=%c run=%d op=%s name=%s "
+                        "shape=%s src0=%s trait=%s reason=%s\n",
+                        k,
+                        static_cast<char>(cats[k]),
+                        run_id,
+                        node ? ggml_op_name(node->op) : "(null)",
+                        (node && node->name[0]) ? node->name : "-",
+                        shape_buf,
+                        map_src0_type(node),
+                        map_src0_trait(node),
+                        reasons[k]);
+                }
+
+                switch (cats[i])
+                {
+                case map_cat::L: lowered_nodes  += len; ++lowered_runs;  break;
+                case map_cat::F: fallback_nodes += len; ++fallback_runs; break;
+                case map_cat::P: packet_nodes   += len; ++packet_runs;   break;
+                }
+
+                char ops_buf[256];
+                int  ops_pos  = 0;
+                ops_buf[0]    = '\0';
+                const int ops_show = len < 8 ? len : 8;
+                for (int k = 0; k < ops_show; ++k)
+                {
+                    const ggml_tensor * n2 = gf->nodes[i + k];
+                    const char *        op = n2 ? ggml_op_name(n2->op) : "(null)";
+                    const int written = snprintf(
+                        ops_buf + ops_pos,
+                        sizeof(ops_buf) - static_cast<std::size_t>(ops_pos),
+                        "%s%s", k ? "," : "", op);
+                    if (written < 0) break;
+                    ops_pos += written;
+                    if (static_cast<std::size_t>(ops_pos) >= sizeof(ops_buf)) break;
+                }
+                if (len > ops_show
+                 && static_cast<std::size_t>(ops_pos) + 5 < sizeof(ops_buf))
+                {
+                    snprintf(ops_buf + ops_pos,
+                             sizeof(ops_buf) - static_cast<std::size_t>(ops_pos),
+                             ",...");
+                }
+
+                fprintf(stderr,
+                    "[hpx-map-run] run=%d cat=%c start=%d end=%d len=%d ops=%s\n",
+                    run_id, static_cast<char>(cats[i]), i, j, len, ops_buf);
+                ++run_id;
+                i = j;
+            }
+
+            fprintf(stderr,
+                "[hpx-map-summary] nodes=%d "
+                "lowered_nodes=%u fallback_nodes=%u packet_nodes=%u "
+                "lowered_runs=%u fallback_runs=%u packet_runs=%u\n",
+                gf->n_nodes,
+                lowered_nodes, fallback_nodes, packet_nodes,
+                lowered_runs, fallback_runs, packet_runs);
+        }
     }
 
     static const bool dbg = [] {
@@ -1043,10 +1633,58 @@ bool ggml_hpx_exec_graph_selective_mul_mat(
         // and a GLU match — that is a pre-scan bug.
         if (consumed[i])
         {
-            assert(!((match_at_final[i] >= 0) && (glu_match_at_final[i] >= 0))
-                && "node is trigger for both gate/up and GLU match — pre-scan overlap bug");
+            const int n_trigger_tables =
+                  (q4k8_match_at_final[i] >= 0 ? 1 : 0)
+                + (match_at_final[i]      >= 0 ? 1 : 0)
+                + (glu_match_at_final[i]  >= 0 ? 1 : 0);
+            assert(n_trigger_tables <= 1
+                && "node is trigger for multiple match tables — pre-scan overlap bug");
+            (void) n_trigger_tables;
 
-            if (match_at_final[i] >= 0)
+            if (q4k8_match_at_final[i] >= 0)
+            {
+                // MLP_GATE_UP_GLU_Q4K8 dispatch. Trigger is the GGML_OP_GLU node.
+                // The prescan only marked consumed after lookup_or_compile
+                // succeeded, so m.entry is ready to bind and run.
+                const mlp_gate_up_glu_q4k8_match & m = q4k8_matches[q4k8_match_at_final[i]];
+                const ggml_tensor * gate_t = gf->nodes[m.nodes[0]];
+                const ggml_tensor * up_t   = gf->nodes[m.nodes[1]];
+                ggml_tensor *       glu_t  = gf->nodes[m.nodes[2]];
+
+                ggml_hpx_mlp_gate_up_glu_q4k8_binding b{};
+                b.w_gate = gate_t->src[0]->data;
+                b.w_up   = up_t  ->src[0]->data;
+                b.x      = static_cast<const float *>(gate_t->src[1]->data);
+                b.gate   = static_cast<float *>(gate_t->data);
+                b.up     = static_cast<float *>(up_t  ->data);
+                b.out    = static_cast<float *>(glu_t ->data);
+                ggml_hpx_bind_mlp_gate_up_glu_q4k8_packet(m.entry->frame, &b);
+
+                // First-cut packet: SERIAL only, no REDUCTION regions. The
+                // once-quantized activation lives in the frame, not in
+                // resources->shared_scratch, so all resource buffers are null.
+                ggml_hpx_packet_resource_requirements req{};
+                ggml_hpx_packet_get_resource_requirements(m.entry->packet, &req);
+                std::vector<void *> lane_ptrs(req.n_lanes, nullptr);
+                ggml_hpx_region_resources pkt_res{};
+                pkt_res.n_lanes          = static_cast<int>(req.n_lanes);
+                pkt_res.lane_scratch     = lane_ptrs.empty() ? nullptr : lane_ptrs.data();
+                pkt_res.reduction_buffer = nullptr;
+                pkt_res.shared_scratch   = nullptr;
+
+                const auto t0 = clock::now();
+                hpx::async([&]() {
+                    ggml_hpx_run_frozen_packet(
+                        packet_env->rt, m.entry->packet, m.entry->frame, &pkt_res);
+                }).get();
+                const auto t1 = clock::now();
+
+                stats.packet_matches     += 1;
+                stats.packet_nodes       += 3;
+                stats.packet_dispatch_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<nanosecs>(t1 - t0).count());
+            }
+            else if (match_at_final[i] >= 0)
             {
                 // Gate/up packet dispatch. Trigger is the final MUL node.
                 const mlp_match &   m      = matches[match_at_final[i]];

@@ -380,6 +380,11 @@ private:
     // path, not to widen packet execution.
     bool hpx_mlp_gate_up_packet = false;
 
+    // env: LLAMA_HPX_PACKET_MLP_GATE_UP_GLU_Q4K8=1 (additionally requires
+    // LLAMA_HPX_SELECTIVE_MLP_PACKET=1) — opts in to the Q4_Kx8 fused
+    // gate/up gemv + SWIGLU packet path. Off by default.
+    bool hpx_mlp_gate_up_glu_q4k8_packet = false;
+
     // Lazily constructed on the first decode-side graph_compute that is
     // eligible for packet dispatch (selective CPU-only path, !batched) when
     // hpx_mlp_gate_up_packet is true.  The current smoke model (TinyLlama
@@ -389,18 +394,26 @@ private:
     // able pattern.
     //
     // Lifecycle:
-    //   hpx_packet_runtime    — pinned decode Exec for packet lane fan-out
-    //                           (n_lanes = 1 in v1)
-    //   hpx_mlp_gate_up_cache — gate/up (MUL_MAT×2 + SiLU + MUL) packets
-    //                           keyed on (out_cols, cols, rows)
-    //   hpx_mlp_glu_cache     — GLU/SwiGLU (MUL_MAT×2 + GGML_OP_GLU) packets
-    //                           keyed on (out_cols, cols, rows)
+    //   hpx_packet_runtime              — pinned decode Exec for packet lane fan-out
+    //                                     (n_lanes = 1 in v1)
+    //   hpx_mlp_gate_up_cache           — gate/up (MUL_MAT×2 + SiLU + MUL) packets
+    //                                     keyed on (out_cols, cols, rows)
+    //   hpx_mlp_glu_cache               — GLU/SwiGLU (MUL_MAT×2 + GGML_OP_GLU) packets
+    //                                     keyed on (out_cols, cols, rows)
+    //   hpx_mlp_gate_up_glu_q4k8_cache  — Q4_Kx8 fused gate/up gemv + SWIGLU packets
+    //                                     keyed on (out_cols, cols, w_row_stride);
+    //                                     opt-in via hpx_mlp_gate_up_glu_q4k8_packet
     //
-    // All three are created atomically on the first eligible decode graph and
-    // destroyed in the llama_context dtor (caches first, then runtime).
-    ggml_hpx_packet_runtime *           hpx_packet_runtime    = nullptr;
-    ggml_hpx_mlp_gate_up_packet_cache * hpx_mlp_gate_up_cache = nullptr;
-    ggml_hpx_mlp_glu_packet_cache *     hpx_mlp_glu_cache     = nullptr;
+    // The runtime + the two baseline caches are created atomically on the
+    // first eligible decode graph and destroyed in the llama_context dtor
+    // (caches first, then runtime). The Q4_Kx8 cache is a soft add-on:
+    // attempted only after the baseline commits and only when its env flag
+    // is on; if creation fails, it is left null and the selective path runs
+    // without that packet (fail closed).
+    ggml_hpx_packet_runtime *                       hpx_packet_runtime              = nullptr;
+    ggml_hpx_mlp_gate_up_packet_cache *             hpx_mlp_gate_up_cache           = nullptr;
+    ggml_hpx_mlp_glu_packet_cache *                 hpx_mlp_glu_cache               = nullptr;
+    ggml_hpx_mlp_gate_up_glu_q4k8_packet_cache *    hpx_mlp_gate_up_glu_q4k8_cache  = nullptr;
 #endif
 
     // GGML_HPX_TPOOL_ONLY=1: HPX threadpool for large graphs (work_size >= threshold).

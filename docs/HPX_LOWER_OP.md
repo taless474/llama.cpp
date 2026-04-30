@@ -194,3 +194,19 @@ out to be wins.
   llama.cpp design — they're already gemv on prefill. If HPX is going to
   help anywhere in the FFN chain, those last-layer nodes are atypical
   and should not be the proxy.
+
+## Packet rule
+A new packet is allowed only if:
+
+1. The pattern appears repeatedly in a real model graph.
+2. It removes at least two existing dispatch units.
+3. It has stable dtype/layout/shape constraints.
+4. It has a clear exclusive-consumer or write-through correctness story.
+5. It has a cache key that captures all structural layout assumptions.
+6. It has an A/B validation plan:
+   - packet off vs packet on
+   - bit-identical output
+   - dispatch count
+   - packet_nodes
+   - tok/s
+7. It does not duplicate general scheduling logic that should belong to HPX.

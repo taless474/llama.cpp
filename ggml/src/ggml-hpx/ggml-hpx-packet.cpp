@@ -26,6 +26,7 @@
 #include "ggml-hpx-packet.h"
 #include "ggml-hpx-region-dag.h"
 #include "ggml-hpx-region-exec.h"
+#include "ggml.h"                   // ggml_row_size, GGML_TYPE_Q8_K
 
 #include <hpx/algorithm.hpp>
 #include <hpx/execution.hpp>
@@ -207,6 +208,69 @@ constexpr size_t kGluFrameAlign   = 8;
 constexpr size_t kGluSwigluGateOff = offsetof(ggml_hpx_swiglu_f32_ctx, gate);
 constexpr size_t kGluSwigluUpOff   = offsetof(ggml_hpx_swiglu_f32_ctx, up);
 constexpr size_t kGluSwigluDstOff  = offsetof(ggml_hpx_swiglu_f32_ctx, dst);
+
+// ---------------------------------------------------------------------------
+// MLP_GATE_UP_GLU_Q4K8 arena layout
+// ---------------------------------------------------------------------------
+//
+// Four ctx structs laid out sequentially after the frame header, followed by
+// a frame-owned Q8_K shared scratch slab whose size is determined at compile
+// time from key.shape[1] (cols):
+//
+//   frame base + 0    : ggml_hpx_packet_frame header (back-pointer, 8 B)
+//   frame base + 8    : quantize ctx   { x*; x_q8*; cols }                       (24 B)
+//   frame base + 32   : gate gemv ctx  { w*; x_q8*; y*; cols; out_cols;
+//                                        w_row_stride; y_nb0 }                   (56 B)
+//   frame base + 88   : up   gemv ctx  { same shape }                            (56 B)
+//   frame base + 144  : SWIGLU ctx     { gate*; up*; dst*; n }                   (32 B)
+//   frame base + 176  : Q8_K shared scratch slab
+//                       (ggml_row_size(GGML_TYPE_Q8_K, cols) bytes)
+//   total frame size  : 176 + ggml_row_size(Q8_K, cols), 8-byte aligned.
+//
+// Design C1 (frame-owned scratch): the once-quantized x lives inside the
+// frame, NOT in resources->shared_scratch. Bind patches all three x_q8
+// fields (R0, R1, R2) to point at frame_base + kQ4K8ScratchOff; resources
+// is unused for shared_scratch in this sublayer, and
+// resource_requirements.shared_scratch_bytes is reported as 0.
+//
+// Dimensions and structural fields are baked at compile time by deep-copying
+// the compose-time ctxs into the template and then nulling out every runtime
+// pointer (x, x_q8, w_q4k_8x8, y, gate, up, dst). Bind patches them per call.
+
+constexpr size_t kQ4K8FrameHeaderSize = 8;
+
+constexpr size_t kQ4K8QuantizeCtxSize =
+    sizeof(ggml_hpx_quantize_q8_k_f32_ctx);             // 24
+constexpr size_t kQ4K8GateCtxSize =
+    sizeof(ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx);         // 56
+constexpr size_t kQ4K8UpCtxSize =
+    sizeof(ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx);         // 56
+constexpr size_t kQ4K8SwigluCtxSize =
+    sizeof(ggml_hpx_swiglu_f32_ctx);                    // 32
+
+constexpr size_t kQ4K8QuantizeCtxOff = kQ4K8FrameHeaderSize;                       //   8
+constexpr size_t kQ4K8GateCtxOff     = kQ4K8QuantizeCtxOff + kQ4K8QuantizeCtxSize; //  32
+constexpr size_t kQ4K8UpCtxOff       = kQ4K8GateCtxOff     + kQ4K8GateCtxSize;     //  88
+constexpr size_t kQ4K8SwigluCtxOff   = kQ4K8UpCtxOff       + kQ4K8UpCtxSize;       // 144
+
+constexpr size_t kQ4K8ArenaBytes     = kQ4K8QuantizeCtxSize + kQ4K8GateCtxSize +
+                                       kQ4K8UpCtxSize + kQ4K8SwigluCtxSize;        // 168
+constexpr size_t kQ4K8ScratchOff     = kQ4K8SwigluCtxOff + kQ4K8SwigluCtxSize;     // 176
+
+constexpr size_t kQ4K8FrameAlign = 8;
+
+// Field-level offsets for bind patching.
+constexpr size_t kQ4K8QuantizeXOff   =
+    offsetof(ggml_hpx_quantize_q8_k_f32_ctx, x);
+constexpr size_t kQ4K8QuantizeXq8Off =
+    offsetof(ggml_hpx_quantize_q8_k_f32_ctx, x_q8);
+
+constexpr size_t kQ4K8MmatWOff   =
+    offsetof(ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx, w_q4k_8x8);
+constexpr size_t kQ4K8MmatXq8Off =
+    offsetof(ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx, x_q8);
+constexpr size_t kQ4K8MmatYOff   =
+    offsetof(ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx, y);
 
 }    // namespace
 
@@ -542,6 +606,131 @@ const char * validate_mlp_glu_qbridge_group(
 
     if (group->n_deps != 0)
         return "MLP_GLU_QBRIDGE group must have zero dependency edges";
+
+    return nullptr;
+}
+
+// Validate that `group` is a 4-region MLP_GATE_UP_GLU_Q4K8 DAG:
+//   regions[0]: REDUCTION,   run_range = quantize_q8_k_f32,         work [0, cols)
+//   regions[1]: MATMUL,      run_range = mul_mat_q4_k_8x8_q8_k,     work [0, out_cols)
+//   regions[2]: MATMUL,      run_range = mul_mat_q4_k_8x8_q8_k,     work [0, out_cols)
+//   regions[3]: ELEMENTWISE, run_range = swiglu_f32,                work [0, out_cols*rows)
+//   deps: {0→1, 0→2, 1→3, 2→3}
+//
+// Also re-validates that the compose-time ctxs match the structural identity
+// encoded in the key (cols, out_cols, w_row_stride, y_nb0, swiglu n). The
+// composer already enforces these but the packet compiler treats the group
+// as untrusted input — different callers may have built it.
+const char * validate_mlp_gate_up_glu_q4k8_group(
+    const ggml_hpx_cpu_region_group * group,
+    int64_t                           out_cols,
+    int64_t                           cols,
+    int64_t                           rows,
+    int64_t                           w_row_stride)
+{
+    if (group == nullptr)          return "fine_group is null";
+    if (group->n_regions != 4)     return "MLP_GATE_UP_GLU_Q4K8 requires exactly 4 regions";
+    if (group->regions == nullptr) return "regions is null";
+
+    if (rows != 1)
+        return "MLP_GATE_UP_GLU_Q4K8 first cut requires rows == 1";
+    if (cols <= 0 || (cols % 256) != 0)
+        return "cols must be a positive multiple of QK_K (256)";
+    if (out_cols <= 0 || (out_cols % 8) != 0)
+        return "out_cols must be a positive multiple of 8 (NB_COLS)";
+    if (w_row_stride <= 0)
+        return "key.shape[3] (w_row_stride) must be > 0";
+
+    const int64_t n_elem = out_cols * rows;
+
+    const ggml_hpx_cpu_region & r0 = group->regions[0];
+    const ggml_hpx_cpu_region & r1 = group->regions[1];
+    const ggml_hpx_cpu_region & r2 = group->regions[2];
+    const ggml_hpx_cpu_region & r3 = group->regions[3];
+
+    if (r0.kind != GGML_HPX_CPU_REGION_KIND_REDUCTION)
+        return "region 0 must be REDUCTION (Q8_K quantize)";
+    if (r1.kind != GGML_HPX_CPU_REGION_KIND_MATMUL)
+        return "region 1 must be MATMUL (gate gemv)";
+    if (r2.kind != GGML_HPX_CPU_REGION_KIND_MATMUL)
+        return "region 2 must be MATMUL (up gemv)";
+    if (r3.kind != GGML_HPX_CPU_REGION_KIND_ELEMENTWISE)
+        return "region 3 must be ELEMENTWISE (SWIGLU)";
+
+    if (r0.run_range != ggml_hpx_quantize_q8_k_f32_run_range)
+        return "region 0 run_range must be ggml_hpx_quantize_q8_k_f32_run_range";
+    if (r1.run_range != ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range)
+        return "region 1 run_range must be ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range";
+    if (r2.run_range != ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range)
+        return "region 2 run_range must be ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range";
+    if (r3.run_range != ggml_hpx_swiglu_f32_run_range)
+        return "region 3 run_range must be ggml_hpx_swiglu_f32_run_range";
+
+    if (r0.begin != 0 || r0.end != cols)
+        return "region 0 work range must be [0, cols)";
+    if (r1.begin != 0 || r1.end != out_cols)
+        return "region 1 work range must be [0, out_cols)";
+    if (r2.begin != 0 || r2.end != out_cols)
+        return "region 2 work range must be [0, out_cols)";
+    if (r3.begin != 0 || r3.end != n_elem)
+        return "region 3 work range must be [0, out_cols*rows)";
+
+    // Re-check ctx structural fields against the key: the compose-time
+    // ctxs are deep-copied into the packet template at compile, so any
+    // disagreement would silently bake the wrong constants into the frame.
+    if (r0.ctx == nullptr) return "region 0 ctx is null";
+    if (r1.ctx == nullptr) return "region 1 ctx is null";
+    if (r2.ctx == nullptr) return "region 2 ctx is null";
+    if (r3.ctx == nullptr) return "region 3 ctx is null";
+
+    {
+        const auto * c = static_cast<const ggml_hpx_quantize_q8_k_f32_ctx *>(r0.ctx);
+        if (c->cols != cols)
+            return "region 0 ctx cols mismatches key.shape[1]";
+    }
+    {
+        const auto * c = static_cast<const ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx *>(r1.ctx);
+        if (c->cols != cols)
+            return "region 1 ctx cols mismatches key.shape[1]";
+        if (c->out_cols != out_cols)
+            return "region 1 ctx out_cols mismatches key.shape[0]";
+        if (c->w_row_stride != static_cast<size_t>(w_row_stride))
+            return "region 1 ctx w_row_stride mismatches key.shape[3]";
+        if (c->y_nb0 != sizeof(float))
+            return "region 1 ctx y_nb0 must be sizeof(float)";
+    }
+    {
+        const auto * c = static_cast<const ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx *>(r2.ctx);
+        if (c->cols != cols)
+            return "region 2 ctx cols mismatches key.shape[1]";
+        if (c->out_cols != out_cols)
+            return "region 2 ctx out_cols mismatches key.shape[0]";
+        if (c->w_row_stride != static_cast<size_t>(w_row_stride))
+            return "region 2 ctx w_row_stride mismatches key.shape[3]";
+        if (c->y_nb0 != sizeof(float))
+            return "region 2 ctx y_nb0 must be sizeof(float)";
+    }
+    {
+        const auto * c = static_cast<const ggml_hpx_swiglu_f32_ctx *>(r3.ctx);
+        if (c->n != n_elem)
+            return "region 3 ctx n mismatches out_cols * rows";
+    }
+
+    if (group->n_deps != 4)     return "MLP_GATE_UP_GLU_Q4K8 requires exactly 4 dep edges";
+    if (group->deps == nullptr) return "deps is null";
+
+    bool saw_0_1 = false, saw_0_2 = false, saw_1_3 = false, saw_2_3 = false;
+    for (int i = 0; i < 4; ++i)
+    {
+        const ggml_hpx_dep_edge & d = group->deps[i];
+        if      (d.src == 0 && d.dst == 1) saw_0_1 = true;
+        else if (d.src == 0 && d.dst == 2) saw_0_2 = true;
+        else if (d.src == 1 && d.dst == 3) saw_1_3 = true;
+        else if (d.src == 2 && d.dst == 3) saw_2_3 = true;
+        else return "unexpected dep edge (expected {0→1, 0→2, 1→3, 2→3})";
+    }
+    if (!saw_0_1 || !saw_0_2 || !saw_1_3 || !saw_2_3)
+        return "missing required dep edge in MLP_GATE_UP_GLU_Q4K8 group";
 
     return nullptr;
 }
@@ -905,6 +1094,144 @@ ggml_hpx_frozen_packet * ggml_hpx_compile_packet(
         return packet;
     }
 
+    if (key->sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_GLU_Q4K8)
+    {
+        const int64_t out_cols     = key->shape[0];
+        const int64_t cols         = key->shape[1];
+        const int64_t rows         = key->shape[2];
+        const int64_t w_row_stride = key->shape[3];
+        if (out_cols <= 0 || cols <= 0 || rows <= 0 || w_row_stride <= 0)
+            return report_err(out_err,
+                "key.shape[0..3] must be > 0 for MLP_GATE_UP_GLU_Q4K8");
+        if (key->extra != 0)
+            return report_err(out_err,
+                "key.extra must be 0 for MLP_GATE_UP_GLU_Q4K8 (weight dtype is fixed)");
+        if (key->n_lanes != 1)
+            return report_err(out_err,
+                "MLP_GATE_UP_GLU_Q4K8 first cut requires key.n_lanes == 1 (SERIAL only)");
+
+        if (const char * msg = validate_mlp_gate_up_glu_q4k8_group(
+                fine_group, out_cols, cols, rows, w_row_stride))
+            return report_err(out_err, msg);
+
+        // Frame-owned Q8_K shared scratch (Design C1). The slab lives at
+        // kQ4K8ScratchOff in the frame and is sized to one Q8_K row over
+        // `cols` F32 inputs. The caller's resources->shared_scratch is NOT
+        // read by any step in this packet; resource_requirements report 0.
+        const size_t scratch_bytes = ggml_row_size(GGML_TYPE_Q8_K, cols);
+        if (scratch_bytes == 0)
+            return report_err(out_err, "ggml_row_size(Q8_K, cols) returned 0");
+
+        auto * packet = new ggml_hpx_frozen_packet{};
+        packet->key             = *key;
+        packet->n_steps         = 4;
+        packet->steps           = new PacketStep[4];
+        packet->arena_offset    = kQ4K8FrameHeaderSize;
+        packet->arena_bytes     = kQ4K8ArenaBytes;
+        packet->frame_bytes     = kQ4K8FrameHeaderSize + kQ4K8ArenaBytes + scratch_bytes;
+        packet->frame_alignment = kQ4K8FrameAlign;
+
+        // First-cut SERIAL packet: no LANE_FANOUT, no nested HPX DAG. Steps
+        // dispatch on the caller thread; no per-call resources required.
+        packet->res.n_lanes                     = 1;
+        packet->res.lane_scratch_bytes_per_lane = 0;
+        packet->res.reduction_buffer_bytes      = 0;
+        packet->res.shared_scratch_bytes        = 0;    // C1: frame-owned
+
+        packet->ctx_template = std::malloc(packet->arena_bytes);
+        if (packet->ctx_template == nullptr)
+        {
+            delete[] packet->steps;
+            delete packet;
+            return report_err(out_err, "ctx_template allocation failed");
+        }
+        std::memset(packet->ctx_template, 0, packet->arena_bytes);
+
+        auto tmpl_at = [&](size_t abs_off) -> char * {
+            return static_cast<char *>(packet->ctx_template)
+                   + (abs_off - kQ4K8FrameHeaderSize);
+        };
+
+        // Deep-copy each ctx from the compose-time group into the template,
+        // then null out every runtime pointer. Structural fields (cols,
+        // out_cols, w_row_stride, y_nb0, swiglu n) come straight from compose
+        // and were re-validated above. The runtime pointers (x, x_q8, w, y,
+        // gate, up, dst) are zeroed and MUST be patched per-call by bind —
+        // in particular the compose-time x_q8 (== lowers[0].scratch) is now
+        // stale and is intentionally overwritten by bind to the frame-owned
+        // scratch slot at kQ4K8ScratchOff.
+        {
+            const auto * src = static_cast<const ggml_hpx_quantize_q8_k_f32_ctx *>(
+                fine_group->regions[0].ctx);
+            auto * dst = reinterpret_cast<ggml_hpx_quantize_q8_k_f32_ctx *>(
+                tmpl_at(kQ4K8QuantizeCtxOff));
+            *dst = *src;
+            dst->x    = nullptr;
+            dst->x_q8 = nullptr;    // patched by bind → frame scratch slot
+        }
+        {
+            const auto * src = static_cast<const ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx *>(
+                fine_group->regions[1].ctx);
+            auto * dst = reinterpret_cast<ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx *>(
+                tmpl_at(kQ4K8GateCtxOff));
+            *dst = *src;
+            dst->w_q4k_8x8 = nullptr;
+            dst->x_q8      = nullptr;    // patched by bind → frame scratch slot
+            dst->y         = nullptr;
+        }
+        {
+            const auto * src = static_cast<const ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx *>(
+                fine_group->regions[2].ctx);
+            auto * dst = reinterpret_cast<ggml_hpx_mul_mat_q4_k_8x8_q8_k_ctx *>(
+                tmpl_at(kQ4K8UpCtxOff));
+            *dst = *src;
+            dst->w_q4k_8x8 = nullptr;
+            dst->x_q8      = nullptr;    // patched by bind → frame scratch slot
+            dst->y         = nullptr;
+        }
+        {
+            const auto * src = static_cast<const ggml_hpx_swiglu_f32_ctx *>(
+                fine_group->regions[3].ctx);
+            auto * dst = reinterpret_cast<ggml_hpx_swiglu_f32_ctx *>(
+                tmpl_at(kQ4K8SwigluCtxOff));
+            *dst = *src;
+            dst->gate = nullptr;
+            dst->up   = nullptr;
+            dst->dst  = nullptr;
+        }
+
+        // Four SERIAL steps. No LANE_FANOUT metadata is emitted for this
+        // sublayer in the first cut; n_lanes is 1 and the run loop
+        // dispatches each step on the caller thread.
+        const int64_t n_elem = out_cols * rows;
+
+        packet->steps[0] = PacketStep{
+            kStepKindSerial, ggml_hpx_quantize_q8_k_f32_run_range,
+            static_cast<uint32_t>(kQ4K8QuantizeCtxOff),
+            static_cast<uint32_t>(kQ4K8QuantizeCtxSize),
+            0, cols, 1, 0,
+        };
+        packet->steps[1] = PacketStep{
+            kStepKindSerial, ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range,
+            static_cast<uint32_t>(kQ4K8GateCtxOff),
+            static_cast<uint32_t>(kQ4K8GateCtxSize),
+            0, out_cols, 1, 0,
+        };
+        packet->steps[2] = PacketStep{
+            kStepKindSerial, ggml_hpx_mul_mat_q4_k_8x8_q8_k_run_range,
+            static_cast<uint32_t>(kQ4K8UpCtxOff),
+            static_cast<uint32_t>(kQ4K8UpCtxSize),
+            0, out_cols, 1, 0,
+        };
+        packet->steps[3] = PacketStep{
+            kStepKindSerial, ggml_hpx_swiglu_f32_run_range,
+            static_cast<uint32_t>(kQ4K8SwigluCtxOff),
+            static_cast<uint32_t>(kQ4K8SwigluCtxSize),
+            0, n_elem, 1, 0,
+        };
+        return packet;
+    }
+
     return report_err(out_err, "unsupported sublayer");
 }
 
@@ -1134,6 +1461,81 @@ void ggml_hpx_bind_mlp_glu_qbridge_packet(
     *reinterpret_cast<const float **>(base + kGluQBSwigluCtxOff + kGluSwigluUpOff)   =
         static_cast<const float *>(binding->up);
     *reinterpret_cast<float **>      (base + kGluQBSwigluCtxOff + kGluSwigluDstOff)  =
+        binding->out;
+}
+
+// ---------------------------------------------------------------------------
+// Typed bind — MLP_GATE_UP_GLU_Q4K8
+// ---------------------------------------------------------------------------
+//
+// Patches:
+//   R0 quantize ctx     : x, x_q8
+//   R1 gate gemv ctx    : w_q4k_8x8, x_q8, y
+//   R2 up   gemv ctx    : w_q4k_8x8, x_q8, y
+//   R3 SWIGLU ctx       : gate, up, dst
+//
+// All three x_q8 fields are deliberately rewired to the frame-owned shared
+// scratch slot at kQ4K8ScratchOff. After frame_init, those fields hold the
+// compose-time pointer (lowers[0].scratch) that was deep-copied into the
+// packet template at compile — that storage is dead by the time bind is
+// called, so leaving it in place would be a use-after-free. Overwriting it
+// here is the contract: every invocation must redirect x_q8 at the frame's
+// own scratch before any step runs.
+//
+// Structural fields (cols, out_cols, w_row_stride, y_nb0, swiglu n) were
+// baked into the template at compile and are NOT touched here.
+
+void ggml_hpx_bind_mlp_gate_up_glu_q4k8_packet(
+    ggml_hpx_packet_frame *                              frame,
+    const ggml_hpx_mlp_gate_up_glu_q4k8_binding *        binding)
+{
+    assert(frame != nullptr);
+    assert(binding != nullptr);
+    assert(frame->packet != nullptr);
+    assert(frame->packet->key.sublayer == GGML_HPX_PACKET_SUBLAYER_MLP_GATE_UP_GLU_Q4K8);
+    assert(binding->w_gate != nullptr);
+    assert(binding->w_up   != nullptr);
+    assert(binding->x      != nullptr);
+    assert(binding->gate   != nullptr);
+    assert(binding->up     != nullptr);
+    assert(binding->out    != nullptr);
+
+    char * const base = reinterpret_cast<char *>(frame);
+
+    // Frame-owned shared Q8_K scratch. Compile baked the offset; bind
+    // intentionally overwrites the stale compose-time pointer in every
+    // ctx that holds an x_q8 field (R0 quantize, R1 gate gemv, R2 up gemv).
+    void * const shared_scratch = base + kQ4K8ScratchOff;
+
+    // R0 quantize: x = caller activation row, x_q8 = frame scratch slot.
+    *reinterpret_cast<const float **>(base + kQ4K8QuantizeCtxOff + kQ4K8QuantizeXOff)   =
+        binding->x;
+    *reinterpret_cast<void **>       (base + kQ4K8QuantizeCtxOff + kQ4K8QuantizeXq8Off) =
+        shared_scratch;
+
+    // R1 gate gemv: w = repacked W_gate, x_q8 = frame scratch slot
+    // (overwrites stale compose-time lowers[0].scratch), y = gate output.
+    *reinterpret_cast<const void **>(base + kQ4K8GateCtxOff + kQ4K8MmatWOff)   =
+        binding->w_gate;
+    *reinterpret_cast<const void **>(base + kQ4K8GateCtxOff + kQ4K8MmatXq8Off) =
+        shared_scratch;
+    *reinterpret_cast<float **>     (base + kQ4K8GateCtxOff + kQ4K8MmatYOff)   =
+        binding->gate;
+
+    // R2 up gemv: w = repacked W_up, x_q8 = frame scratch slot, y = up output.
+    *reinterpret_cast<const void **>(base + kQ4K8UpCtxOff + kQ4K8MmatWOff)   =
+        binding->w_up;
+    *reinterpret_cast<const void **>(base + kQ4K8UpCtxOff + kQ4K8MmatXq8Off) =
+        shared_scratch;
+    *reinterpret_cast<float **>     (base + kQ4K8UpCtxOff + kQ4K8MmatYOff)   =
+        binding->up;
+
+    // R3 SWIGLU: gate = R1 output, up = R2 output, dst = caller out.
+    *reinterpret_cast<const float **>(base + kQ4K8SwigluCtxOff + kGluSwigluGateOff) =
+        static_cast<const float *>(binding->gate);
+    *reinterpret_cast<const float **>(base + kQ4K8SwigluCtxOff + kGluSwigluUpOff)   =
+        static_cast<const float *>(binding->up);
+    *reinterpret_cast<float **>      (base + kQ4K8SwigluCtxOff + kGluSwigluDstOff)  =
         binding->out;
 }
 

@@ -1,97 +1,93 @@
 # README_HPX.md — HPX CPU Execution for llama.cpp
 
-## Overview
+## Purpose
 
-This project redesigns the CPU execution side of `llama.cpp` using HPX.
+This project explores an HPX-backed CPU execution path for `llama.cpp` / `ggml`.
 
-It started with HPX-based orchestration above ggml, then moved into
-`ggml-cpu` executor ownership, and now focuses on an HPX-native execution path
-for explicit CPU work regions under `ggml/src/ggml-hpx/`.
+The goal is **not** to replace ggml kernels, BLAS, or model logic. The goal is
+to change how CPU work is represented and dispatched:
 
-The goal is not to replace ggml kernels or BLAS. The goal is to improve how CPU
-work is:
+- from whole-graph threadpool execution,
+- to explicit CPU work regions,
+- to selective lowered execution,
+- and, when useful, to packetized repeated sublayers.
 
-- represented
-- scheduled
-- dispatched
-- executed
+The main design question is:
 
-The most important direction is no longer “HPX as orchestration.”
-It is **HPX as the execution model for explicit CPU work regions and matched
-repeated sublayers**.
+> What is the right execution unit for inference?
 
----
-
-## Core idea
-
-The key question is not “pthread vs HPX.”
-
-It is:
-
-> What is the right execution contract for inference?
-
-The project has evolved through four layers:
-
-1. HPX above ggml as orchestration
-2. HPX as a CPU executor substrate inside `ggml-cpu`
-3. HPX as a direct executor of explicit fine-grained CPU work regions
-4. Selective llama-integrated lowering and packet dispatch experiments
-
-Today, layers 3 and 4 matter most.
+For this project, the answer has moved away from “one HPX task per ggml node.”
+The useful direction is larger, structure-aware units: contiguous fallback runs,
+fine-region DAGs, and frozen packets for repeated graph patterns.
 
 ---
 
-## Current architecture
-
-### Coarse CPU substrate policy
+## Architecture map
 
 ```text
-small work (decode-like)
-  → pthread substrate
-
-large work (prefill-like)
-  → HPX substrate
+llama.cpp graph_compute
+        |
+        v
+ggml backend scheduler
+        |
+        +--> normal ggml CPU backend
+        |
+        +--> HPX paths, when enabled
+                |
+                +--> coarse CPU substrate
+                |       ggml-cpu threadpool seam backed by HPX
+                |
+                +--> fine-region DAG
+                |       explicit CPU regions + dependencies + run_range kernels
+                |
+                +--> selective executor
+                |       lowered nodes + coalesced CPU fallback runs + packets
+                |
+                +--> frozen packets
+                        compile once, bind per call, dispatch repeated sublayers
 ```
-
-Routing is based on `cplan->work_size`.
-
-### Fine-region execution layer
-
-```text
-coarse graph region
-  → fine CPU region DAG
-  → run_range(...)
-  → HPX futures / dataflow
-```
-
-This path executes explicit CPU work units directly instead of routing through
-`ggml_graph_compute_thread_run(...)`.
-
-### Selective llama bridge
-
-```text
-real llama graph
-  → selective matcher
-  → lowered nodes / packetized sublayers / CPU fallback
-```
-
-This is the current bridge from HPX fine-region machinery into real llama.cpp
-execution.
 
 ---
 
-## What is implemented
+## Execution layers
 
-### 1. HPX executor substrate inside `ggml-cpu`
+### 1. Coarse CPU substrate
 
-- executor/job ownership split
-- explicit executor seam (`init`, `run_job`, `destroy`)
-- HPX-backed threadpool implementation
-- work-size-based pthread / HPX substrate split
+This was the first practical integration point inside `ggml-cpu`.
 
-### 2. Fine-region DAG contract
+It added an executor seam around CPU graph execution:
 
-Implemented under `GGML_HPX_REGION_DAG`:
+```text
+executor init
+job dispatch
+executor destroy
+```
+
+The HPX-backed substrate can run ggml's normal CPU worker function through HPX
+workers. This path is useful as a compatibility layer and as a coarse-grained
+substrate experiment.
+
+Important lesson:
+
+```text
+HPX around the whole CPU job can be reasonable.
+HPX around every tiny node is usually too expensive.
+```
+
+### 2. Fine-region DAG
+
+The fine-region layer represents explicit CPU work directly:
+
+```text
+region group
+  region[0]
+  region[1]
+  dependency edges
+  shared resources
+  run_range callbacks
+```
+
+Core concepts:
 
 - `ggml_hpx_cpu_region`
 - `ggml_hpx_cpu_region_group`
@@ -99,254 +95,275 @@ Implemented under `GGML_HPX_REGION_DAG`:
 - `ggml_hpx_region_resources`
 - `ggml_hpx_run_range_fn`
 
-This defines explicit CPU work DAGs with:
+This layer avoids re-entering `ggml_backend_graph_compute(...)` for work that
+has already been lowered into explicit CPU kernels.
 
-- work ranges
-- dependencies
-- resource bundles
+Use this layer when the operation has a safe direct kernel and the work unit is
+large enough to justify HPX scheduling.
 
-### 3. Fine-region execution
+### 3. Selective executor
 
-Implemented in `ggml-hpx-region-exec.*`:
+The selective executor is the bridge into real llama graphs.
 
-- region-group validator
-- direct F32 `mul_mat`
-- direct F32 elementwise kernels:
-  - `SiLU`
-  - `MUL`
-  - `SWIGLU`
-- `ggml_hpx_run_single_region(...)`
-- `ggml_hpx_run_region_group(...)`
+For each scheduled CPU-only graph, it chooses among:
 
-Properties:
+```text
+packetized sublayer
+lowered fine-region op
+coalesced CPU fallback run
+```
 
-- direct `run_range(...)` execution
-- no graph re-entry
-- dependency-driven scheduling with HPX futures / `dataflow`
-- real same-level overlap
+The selective path must preserve graph order and backend correctness. It should
+only run on CPU-only scheduled graphs. Mixed backend graphs, such as Metal + CPU,
+must stay on the normal backend path unless explicitly proven safe.
 
-### 4. Selective graph-level mixed execution
+Important design rule:
 
-A selective execution path exists for real llama graphs:
+```text
+Selective execution should reduce dispatch count, not multiply it.
+```
 
-- supported lowered ops use the fine-region path
-- unsupported ops fall back to the live CPU backend
-- reduction-containing groups are rejected from selective lowering
-- selective stats and debug output are wired into the llama path
-- mixed-backend graphs are excluded by a CPU-only guard
+A selective path that slices the graph into many one-node HPX submissions is the
+wrong shape, even if each individual lowered kernel is correct.
 
-The selective path is valid only on CPU-only scheduled graphs.
+### 4. Frozen packets
 
-### 5. Frozen-packet execution
+A packet is a compiled execution template for a repeated graph pattern.
 
-A packetized path is integrated behind env gating:
+A packet has:
 
-- packet runtime is lazily created
-- packet caches are owned by `llama_context`
-- packet dispatch is decode-only in first deployment
-- packet stats are reported through the selective stats stream
+```text
+matcher / prescan
+plan key
+compiled packet
+frame / scratch
+bind step
+single dispatch
+stats
+```
 
-Packetization is meant for repeated steady-state sublayers where generic
-fine-region DAG dispatch has a fixed overhead floor.
+Packets are useful when a subgraph appears repeatedly with stable structure,
+tensor types, and shapes. They are meant to reduce generic DAG overhead and
+avoid repeated per-node native-to-HPX crossings.
 
----
+A packet should not mean “some adjacent nodes.” It should mean:
 
-## Current validated behavior
-
-### Fine-region tests
-
-The core fine-region tests pass:
-
-- `test_hpx_region_group_validate`
-- `test_hpx_region_group_run`
-- `test_hpx_region_group_parallel`
-- `test_hpx_region_single_mul_mat`
-- `test_hpx_region_mixed_mul_mat`
-
-These prove:
-
-- malformed groups are rejected
-- small DAGs execute correctly
-- same-level overlap is real
-- direct region `mul_mat` works
-- mixed lowered/fallback execution works
-
-### Selective path correctness
-
-The selective llama path is validated for:
-
-- correct live-backend fallback
-- safe rejection of reduction groups
-- CPU-only guard on mixed Metal+CPU graphs
-- stable stats/debug reporting
-
-### Packet mechanism
-
-The first packet path was proven in isolation with tests covering:
-
-- exact-match recognition
-- compile-once cache behavior
-- bind-per-dispatch from live tensor storage
-- numerically correct execution
-- cache reuse on repeated dispatch
+```text
+known pattern
+known constraints
+safe ownership of intermediates
+compile once
+bind many times
+same output as baseline
+```
 
 ---
 
-## Milestone status
+## Build-time gates
 
-### v1 — complete
+The exact CMake option names may evolve, but the implementation is guarded by
+these project-level concepts:
 
-v1 established the first llama-integrated packet path and proved it in
-isolation. On TinyLlama `Q4_K_M`, packet dispatch stayed dormant because the
-model did not present a compile-able F32 packet pattern. This was an honest
-integration result, not a speedup result.
+| Gate | Purpose |
+|---|---|
+| `GGML_HPX` | Enables HPX-related code paths. |
+| `GGML_HPX_REGION_DAG` | Enables fine-region DAG, lowering, selective execution, and packet code. |
 
-### Milestone A — complete
-
-A asked a narrow question:
-
-> Can packet dispatch fire inside real llama execution?
-
-To test that, TinyLlama `Q4_K_M` was dequantized to an F32-typed GGUF.
-This activated F32 `MUL_MAT` lowering, but packet dispatch still did not fire.
-
-Root cause:
-
-- the original packet matcher expected
-  `MUL_MAT, MUL_MAT, SiLU, MUL`
-- real llama graphs emit
-  `MUL_MAT, MUL_MAT, GLU[SWIGLU]`
-
-So A closed on a graph-shape finding, not a speedup.
-
-### Milestone B.1 — complete
-
-B.1 aligned the packet path with the real llama graph shape and proved
-it on real decode.
-
-Items delivered:
-
-1. `SWIGLU_F32` primitive and tests.
-2. lowering support for `GGML_OP_GLU` with `GGML_GLU_OP_SWIGLU`.
-3. GLU-aware composer for:
-   - `MUL_MAT(W_gate, x)`
-   - `MUL_MAT(W_up, x)`
-   - `GLU[SWIGLU](gate, up)`
-4. `MLP_GLU_F32` packet sublayer (typed binding, compile, bind, narrow
-   packet test).
-5. Selective matcher/cache/env integration for the GLU packet path.
-6. `llama_context` wiring for the GLU packet cache alongside the
-   existing gate/up cache, lazy-created together on first eligible
-   decode `graph_compute`.
-
-Real-llama activation, TinyLlama F32 CPU-only decode:
-
-- `packet=22(66 nodes)` per decode graph — every MLP block fires
-- the gate/up matcher does **not** fire on real llama graphs, because
-  SWIGLU fusion subsumes the older 4-node pattern; it is exercised
-  only by isolation tests
-
-Honest end-to-end speedup on a quiet machine, measured under the fair-
-comparison protocol in `CLAUDE.local.md`:
-
-- PACKET=0: 4.05 tok/s (247.1 ms/token)
-- PACKET=1: 4.55 tok/s (219.8 ms/token)
-- **Decode speedup: 1.12× (~12%)**
-
-The
-investigation that closed B.1 is documented in
-`docs/HPX_PROVENANCE.md` and in
-`hpx-bench/results/2026-04-20-*/`.
-
-Instrumentation left in place: `LLAMA_HPX_PACKET_COMPILE_LOG=1`
-(env-gated stderr log at both compile sites; zero overhead when
-unset; compile cost measured at ~1 µs per process).
-
-### Milestone B.2 — future
-
-B.2 is separate from B.1.
-
-Its goal is to make the packet path useful on realistic quantized models by
-adding quantized `MUL_MAT` lowering or an equivalent compose path.
+When adding new HPX code, keep non-HPX builds clean. Headers should avoid
+leaking HPX dependencies into unrelated llama.cpp code.
 
 ---
 
-## Performance takeaway
+## Runtime flags and diagnostics
 
-The current message is not “HPX is faster everywhere.”
+Common runtime environment variables used by the HPX path:
 
-It is:
+| Variable | Purpose |
+|---|---|
+| `LLAMA_USE_HPX=1` | Opt into the HPX execution path where wired. |
+| `LLAMA_HPX_SELECTIVE_STATS=1` | Print selective execution counters. |
+| `LLAMA_HPX_SELECTIVE_DEBUG=1` | Print selective routing/debug information. |
+| `LLAMA_HPX_SELECTIVE_HIST=1` | Print fallback/lowering histograms when available. |
+| `LLAMA_HPX_SELECTIVE_MLP_PACKET=1` | Enable existing MLP packet matching/dispatch where supported. |
+| `LLAMA_HPX_PACKET_COMPILE_LOG=1` | Log packet compile/cache behavior. |
 
-- coarse routing protects small decode-like work
-- HPX stays competitive on large prefill-like work
-- fine-region execution gives a better execution model for explicit CPU work
-- packetized execution is the right low-overhead surface for repeated matched
-  sublayers
-- the remaining challenge is matching realistic quantized workloads; the
-  real llama graph shape is now matched as of B.1
+Rules for flags:
 
-First honest end-to-end packet result on CPU-only F32 TinyLlama decode:
-**1.12× speedup**, obtained by moving the fused GLU MLP sublayer (66 nodes
-per decode graph, 22 matches) from the generic lowered path into a frozen
-packet. That number was measured under the fair-comparison protocol in
-`CLAUDE.local.md`.
-
-Packet compile cost is ~1 µs per process. No warmup cliff is present on a
-quiet machine.
+- flags should default to off unless the path is proven safe;
+- diagnostics must be cold when disabled;
+- packet-specific flags should be named by packet or packet family;
+- stats must distinguish lowered nodes, fallback nodes, packet matches, and
+  packet-consumed nodes.
 
 ---
 
-## Where to look
+## Correctness rules
 
-### Core implementation
+HPX paths must preserve baseline llama.cpp behavior.
 
-- `ggml/src/ggml-hpx/`
-  - lowering, region execution, packet code, selective execution, runtime code
-- `ggml/src/ggml-cpu/`
-  - CPU executor seam and substrate work
+Required checks:
 
-### Tests
+- CPU-only guard before selective execution;
+- no mixed-backend contamination;
+- fallback to live CPU backend for unsupported ops;
+- no packet match unless all tensor-type, shape, stride, and ownership
+  constraints hold;
+- no skipped node unless its output is produced by the replacement path before
+  any consumer can read it;
+- output parity against selective-off / baseline before performance claims.
 
-- `tests/hpx/`
-  - fine-region tests
-  - primitive tests
-  - packet tests
-  - selective tests
-  - llama smoke tests
-
-### Benchmarks and logs
-
-- `hpx-bench/`
-  - microbenchmarks
-  - selective/packet smoke result directories
-
-### Docs
-
-- `README_HPX.md`
-  - current architecture and status
-- `docs/HPX_EXECUTOR_CONTRACT.md`
-  - design rules and execution boundaries
-- `docs/HPX_PROVENANCE.md`
-  - chronological project history and results
+For packets, the matcher is part of correctness. A packet that matches too
+broadly is worse than no packet.
 
 ---
 
-## Current limitations
+## Performance rules
 
-- direct lowering coverage is still selective
-- packet dispatch is activated on F32 CPU-only TinyLlama decode; broader
-  model families and dtypes remain to be validated
-- realistic quantized packet activation is B.2 scope
-- measured F32 decode speedup is 1.12× on TinyLlama; larger gains are the
-  subject of B.2 and later milestones
-- benchmarking is sensitive to CPU contention and thermal state; follow
-  the fair-comparison protocol in `CLAUDE.local.md`
+Do not claim HPX speedup from isolated kernel success alone.
+
+The measured unit must match the claim:
+
+```text
+kernel benchmark       -> kernel claim only
+packet microbenchmark  -> packet claim only
+llama decode run       -> live decode claim
+prefill run            -> prefill claim
+```
+
+Main performance risks:
+
+- one HPX submission per ggml node;
+- repeated `hpx::async(...).get()` in a graph loop;
+- many one-node fallback `graph_compute` calls;
+- rebuilding packet structure instead of compile-once / bind-many;
+- nested HPX tasks inside packets before the outer packet dispatch is proven.
+
+Preferred progression:
+
+```text
+coalesce fallback runs
+batch lowered work where safe
+packetize repeated sublayers
+only then add internal packet parallelism
+```
+
+---
+
+## Where the code lives
+
+```text
+ggml/src/ggml-hpx/
+  runtime, adapter, planning/cache, fine-region execution,
+  lowering, selective execution, packet code
+
+ggml/src/ggml-cpu/
+  CPU executor seam and substrate integration
+
+tests/hpx/
+  region tests, lowering tests, packet tests, selective tests
+
+hpx-bench/
+  microbenchmarks, llama smoke runs, result directories
+```
+
+---
+## Command caution on llama-simple
+
+For `llama-simple`, the prompt is positional.
+
+Correct:
+
+```bash
+./build-hpx-dag/bin/llama-simple \
+  -m model.gguf \
+  -n 32 -ngl 0 \
+  "Hello, my name is"
+```
+
+Do not use `-p` with `llama-simple`.
+---
+
+## Graph-map diagnostic
+
+When selective behavior is unclear, inspect one decode graph as an execution-unit map:
+
+```text
+idx | op | name | shape | src0 type/trait | category L/F/P | run id | reason
+```
+
+Where:
+
+```text
+L = lowered by HPX
+F = fallback to ggml
+P = packet
+```
+
+Use this to identify fallback islands, lowered islands, packet opportunities, and unexpected dispatch fragmentation.
+
+---
+## Packet guidance
+
+Do not call something a packet just because several nodes are adjacent. A packet should be a repeated, validated graph pattern with safe ownership of its intermediate tensors and a clear reduction in execution entries.
+
+Current graph-map evidence shows a strong first packet candidate:
+
+```text
+MUL_MAT ffn_gate-N
+MUL_MAT ffn_up-N
+GLU/SWIGLU ffn_swiglu-N
+```
+
+This appears once per TinyLlama layer. For a first packet design, prefer the gate/up/GLU pattern and do not include `ffn_out` until its mixed Q4_K/Q6_K behavior is handled deliberately.
+
+A useful first-cut packet should aim to own the pattern, not simply run gate/up through fallback and packetize only GLU.
+
+---
+## Result logging convention
+
+Do not write benchmark or experiment results to `/tmp`.
+
+Use:
+
+```text
+hpx-bench/results/<date>-<slug>/
+local/results/
+```
+
+Each result directory should include:
+
+```text
+stdout or CSV
+stderr / bench log
+README.md
+commit hash
+binary path
+exact command
+findings
+open questions
+```
+Each run gets its own directory with:
+
+- raw stdout or CSV
+- stderr / bench log
+- `README.md`
+
+The `README.md` should include:
+
+- what was measured
+- exact command or protocol
+- key numbers
+- findings and open questions
+- git commit hash
+- binary path
+
+Redirect output at invocation time. Do not write to a temporary location and copy results afterward.
 
 ---
 
 ## One-line summary
 
-This project moves llama.cpp CPU execution from a thread-centric model toward a
-structure-aware model where HPX executes explicit CPU work regions directly,
-selectively lowers real llama graphs, and incrementally adds packetized
-execution for repeated sublayers that match the model’s actual graph shape.
+This project moves llama.cpp CPU execution toward a structure-aware HPX model:
+coarse substrate where useful, explicit fine-region DAGs for lowered CPU work,
+selective graph execution for real llama graphs, and frozen packets for repeated
+sublayers where one compiled dispatch can replace many small execution units.
