@@ -10,6 +10,8 @@ find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
 
+option(LLAMA_BUILD_SERVING_BENCH "Build the serving benchmark harness" OFF)
+
 # tools
 
 if (EMSCRIPTEN)
@@ -39,4 +41,7 @@ else()
     endif()
     add_subdirectory(fit-params)
     add_subdirectory(results)
+    if (LLAMA_BUILD_SERVING_BENCH)
+        add_subdirectory(serving-bench)
+    endif()
 endif()

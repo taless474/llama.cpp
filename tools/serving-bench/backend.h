@@ -1,0 +1,29 @@
+#pragma once
+
+#include "harness.h"
+
+#include <future>
+#include <string>
+
+namespace serving_bench {
+
+struct engine_init_params {
+    std::string model_path;
+    int32_t     n_contexts;
+    int32_t     n_threads_per_ctx;
+};
+
+class engine {
+public:
+    engine() = default;
+    virtual ~engine() noexcept = default;
+
+    engine(const engine &)             = delete;
+    engine & operator=(const engine &) = delete;
+
+    virtual bool init(const engine_init_params & params) = 0;
+
+    virtual std::future<request_result> submit(request_params req) = 0;
+};
+
+} // namespace serving_bench

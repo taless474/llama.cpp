@@ -1,0 +1,1466 @@
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.032 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 12713.12 MB
+llama_model_load_from_file_impl: using device MTL0 (Apple M4) (unknown id) - 12123 MiB free
+llama_model_loader: loaded meta data with 23 key-value pairs and 201 tensors from models/tinyllama/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = llama
+llama_model_loader: - kv   1:                               general.name str              = tinyllama_tinyllama-1.1b-chat-v1.0
+llama_model_loader: - kv   2:                       llama.context_length u32              = 2048
+llama_model_loader: - kv   3:                     llama.embedding_length u32              = 2048
+llama_model_loader: - kv   4:                          llama.block_count u32              = 22
+llama_model_loader: - kv   5:                  llama.feed_forward_length u32              = 5632
+llama_model_loader: - kv   6:                 llama.rope.dimension_count u32              = 64
+llama_model_loader: - kv   7:                 llama.attention.head_count u32              = 32
+llama_model_loader: - kv   8:              llama.attention.head_count_kv u32              = 4
+llama_model_loader: - kv   9:     llama.attention.layer_norm_rms_epsilon f32              = 0.000010
+llama_model_loader: - kv  10:                       llama.rope.freq_base f32              = 10000.000000
+llama_model_loader: - kv  11:                          general.file_type u32              = 15
+llama_model_loader: - kv  12:                       tokenizer.ggml.model str              = llama
+llama_model_loader: - kv  13:                      tokenizer.ggml.tokens arr[str,32000]   = ["<unk>", "<s>", "</s>", "<0x00>", "<...
+llama_model_loader: - kv  14:                      tokenizer.ggml.scores arr[f32,32000]   = [0.000000, 0.000000, 0.000000, 0.0000...
+llama_model_loader: - kv  15:                  tokenizer.ggml.token_type arr[i32,32000]   = [2, 3, 3, 6, 6, 6, 6, 6, 6, 6, 6, 6, ...
+llama_model_loader: - kv  16:                      tokenizer.ggml.merges arr[str,61249]   = ["▁ t", "e r", "i n", "▁ a", "e n...
+llama_model_loader: - kv  17:                tokenizer.ggml.bos_token_id u32              = 1
+llama_model_loader: - kv  18:                tokenizer.ggml.eos_token_id u32              = 2
+llama_model_loader: - kv  19:            tokenizer.ggml.unknown_token_id u32              = 0
+llama_model_loader: - kv  20:            tokenizer.ggml.padding_token_id u32              = 2
+llama_model_loader: - kv  21:                    tokenizer.chat_template str              = {% for message in messages %}\n{% if m...
+llama_model_loader: - kv  22:               general.quantization_version u32              = 2
+llama_model_loader: - type  f32:   45 tensors
+llama_model_loader: - type q4_K:  135 tensors
+llama_model_loader: - type q6_K:   21 tensors
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = Q4_K - Medium
+print_info: file size   = 636.18 MiB (4.85 BPW) 
+init_tokenizer: initializing tokenizer for type 1
+load: 0 unused tokens
+load: control token:      1 '<s>' is not marked as EOG
+load: printing all EOG tokens:
+load:   - 2 ('</s>')
+load: special tokens cache size = 3
+load: token to piece cache size = 0.1684 MB
+print_info: arch                  = llama
+print_info: vocab_only            = 0
+print_info: no_alloc              = 0
+print_info: n_ctx_train           = 2048
+print_info: n_embd                = 2048
+print_info: n_embd_inp            = 2048
+print_info: n_layer               = 22
+print_info: n_head                = 32
+print_info: n_head_kv             = 4
+print_info: n_rot                 = 64
+print_info: n_swa                 = 0
+print_info: is_swa_any            = 0
+print_info: n_embd_head_k         = 64
+print_info: n_embd_head_v         = 64
+print_info: n_gqa                 = 8
+print_info: n_embd_k_gqa          = 256
+print_info: n_embd_v_gqa          = 256
+print_info: f_norm_eps            = 0.0e+00
+print_info: f_norm_rms_eps        = 1.0e-05
+print_info: f_clamp_kqv           = 0.0e+00
+print_info: f_max_alibi_bias      = 0.0e+00
+print_info: f_logit_scale         = 0.0e+00
+print_info: f_attn_scale          = 0.0e+00
+print_info: n_ff                  = 5632
+print_info: n_expert              = 0
+print_info: n_expert_used         = 0
+print_info: n_expert_groups       = 0
+print_info: n_group_used          = 0
+print_info: causal attn           = 1
+print_info: pooling type          = -1
+print_info: rope type             = 0
+print_info: rope scaling          = linear
+print_info: freq_base_train       = 10000.0
+print_info: freq_scale_train      = 1
+print_info: n_ctx_orig_yarn       = 2048
+print_info: rope_yarn_log_mul     = 0.0000
+print_info: rope_finetuned        = unknown
+print_info: model type            = 1B
+print_info: model params          = 1.10 B
+print_info: general.name          = tinyllama_tinyllama-1.1b-chat-v1.0
+print_info: vocab type            = SPM
+print_info: n_vocab               = 32000
+print_info: n_merges              = 0
+print_info: BOS token             = 1 '<s>'
+print_info: EOS token             = 2 '</s>'
+print_info: UNK token             = 0 '<unk>'
+print_info: PAD token             = 2 '</s>'
+print_info: LF token              = 13 '<0x0A>'
+print_info: EOG token             = 2 '</s>'
+print_info: max token length      = 48
+load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
+load_tensors: layer   0 assigned to device CPU, is_swa = 0
+load_tensors: layer   1 assigned to device CPU, is_swa = 0
+load_tensors: layer   2 assigned to device CPU, is_swa = 0
+load_tensors: layer   3 assigned to device CPU, is_swa = 0
+load_tensors: layer   4 assigned to device CPU, is_swa = 0
+load_tensors: layer   5 assigned to device CPU, is_swa = 0
+load_tensors: layer   6 assigned to device CPU, is_swa = 0
+load_tensors: layer   7 assigned to device CPU, is_swa = 0
+load_tensors: layer   8 assigned to device CPU, is_swa = 0
+load_tensors: layer   9 assigned to device CPU, is_swa = 0
+load_tensors: layer  10 assigned to device CPU, is_swa = 0
+load_tensors: layer  11 assigned to device CPU, is_swa = 0
+load_tensors: layer  12 assigned to device CPU, is_swa = 0
+load_tensors: layer  13 assigned to device CPU, is_swa = 0
+load_tensors: layer  14 assigned to device CPU, is_swa = 0
+load_tensors: layer  15 assigned to device CPU, is_swa = 0
+load_tensors: layer  16 assigned to device CPU, is_swa = 0
+load_tensors: layer  17 assigned to device CPU, is_swa = 0
+load_tensors: layer  18 assigned to device CPU, is_swa = 0
+load_tensors: layer  19 assigned to device CPU, is_swa = 0
+load_tensors: layer  20 assigned to device CPU, is_swa = 0
+load_tensors: layer  21 assigned to device CPU, is_swa = 0
+load_tensors: layer  22 assigned to device CPU, is_swa = 0
+create_tensor: loading tensor token_embd.weight
+create_tensor: loading tensor output_norm.weight
+create_tensor: loading tensor output.weight
+create_tensor: loading tensor blk.0.attn_norm.weight
+create_tensor: loading tensor blk.0.attn_q.weight
+create_tensor: loading tensor blk.0.attn_k.weight
+create_tensor: loading tensor blk.0.attn_v.weight
+create_tensor: loading tensor blk.0.attn_output.weight
+create_tensor: loading tensor blk.0.ffn_norm.weight
+create_tensor: loading tensor blk.0.ffn_gate.weight
+create_tensor: loading tensor blk.0.ffn_down.weight
+create_tensor: loading tensor blk.0.ffn_up.weight
+create_tensor: loading tensor blk.1.attn_norm.weight
+create_tensor: loading tensor blk.1.attn_q.weight
+create_tensor: loading tensor blk.1.attn_k.weight
+create_tensor: loading tensor blk.1.attn_v.weight
+create_tensor: loading tensor blk.1.attn_output.weight
+create_tensor: loading tensor blk.1.ffn_norm.weight
+create_tensor: loading tensor blk.1.ffn_gate.weight
+create_tensor: loading tensor blk.1.ffn_down.weight
+create_tensor: loading tensor blk.1.ffn_up.weight
+create_tensor: loading tensor blk.2.attn_norm.weight
+create_tensor: loading tensor blk.2.attn_q.weight
+create_tensor: loading tensor blk.2.attn_k.weight
+create_tensor: loading tensor blk.2.attn_v.weight
+create_tensor: loading tensor blk.2.attn_output.weight
+create_tensor: loading tensor blk.2.ffn_norm.weight
+create_tensor: loading tensor blk.2.ffn_gate.weight
+create_tensor: loading tensor blk.2.ffn_down.weight
+create_tensor: loading tensor blk.2.ffn_up.weight
+create_tensor: loading tensor blk.3.attn_norm.weight
+create_tensor: loading tensor blk.3.attn_q.weight
+create_tensor: loading tensor blk.3.attn_k.weight
+create_tensor: loading tensor blk.3.attn_v.weight
+create_tensor: loading tensor blk.3.attn_output.weight
+create_tensor: loading tensor blk.3.ffn_norm.weight
+create_tensor: loading tensor blk.3.ffn_gate.weight
+create_tensor: loading tensor blk.3.ffn_down.weight
+create_tensor: loading tensor blk.3.ffn_up.weight
+create_tensor: loading tensor blk.4.attn_norm.weight
+create_tensor: loading tensor blk.4.attn_q.weight
+create_tensor: loading tensor blk.4.attn_k.weight
+create_tensor: loading tensor blk.4.attn_v.weight
+create_tensor: loading tensor blk.4.attn_output.weight
+create_tensor: loading tensor blk.4.ffn_norm.weight
+create_tensor: loading tensor blk.4.ffn_gate.weight
+create_tensor: loading tensor blk.4.ffn_down.weight
+create_tensor: loading tensor blk.4.ffn_up.weight
+create_tensor: loading tensor blk.5.attn_norm.weight
+create_tensor: loading tensor blk.5.attn_q.weight
+create_tensor: loading tensor blk.5.attn_k.weight
+create_tensor: loading tensor blk.5.attn_v.weight
+create_tensor: loading tensor blk.5.attn_output.weight
+create_tensor: loading tensor blk.5.ffn_norm.weight
+create_tensor: loading tensor blk.5.ffn_gate.weight
+create_tensor: loading tensor blk.5.ffn_down.weight
+create_tensor: loading tensor blk.5.ffn_up.weight
+create_tensor: loading tensor blk.6.attn_norm.weight
+create_tensor: loading tensor blk.6.attn_q.weight
+create_tensor: loading tensor blk.6.attn_k.weight
+create_tensor: loading tensor blk.6.attn_v.weight
+create_tensor: loading tensor blk.6.attn_output.weight
+create_tensor: loading tensor blk.6.ffn_norm.weight
+create_tensor: loading tensor blk.6.ffn_gate.weight
+create_tensor: loading tensor blk.6.ffn_down.weight
+create_tensor: loading tensor blk.6.ffn_up.weight
+create_tensor: loading tensor blk.7.attn_norm.weight
+create_tensor: loading tensor blk.7.attn_q.weight
+create_tensor: loading tensor blk.7.attn_k.weight
+create_tensor: loading tensor blk.7.attn_v.weight
+create_tensor: loading tensor blk.7.attn_output.weight
+create_tensor: loading tensor blk.7.ffn_norm.weight
+create_tensor: loading tensor blk.7.ffn_gate.weight
+create_tensor: loading tensor blk.7.ffn_down.weight
+create_tensor: loading tensor blk.7.ffn_up.weight
+create_tensor: loading tensor blk.8.attn_norm.weight
+create_tensor: loading tensor blk.8.attn_q.weight
+create_tensor: loading tensor blk.8.attn_k.weight
+create_tensor: loading tensor blk.8.attn_v.weight
+create_tensor: loading tensor blk.8.attn_output.weight
+create_tensor: loading tensor blk.8.ffn_norm.weight
+create_tensor: loading tensor blk.8.ffn_gate.weight
+create_tensor: loading tensor blk.8.ffn_down.weight
+create_tensor: loading tensor blk.8.ffn_up.weight
+create_tensor: loading tensor blk.9.attn_norm.weight
+create_tensor: loading tensor blk.9.attn_q.weight
+create_tensor: loading tensor blk.9.attn_k.weight
+create_tensor: loading tensor blk.9.attn_v.weight
+create_tensor: loading tensor blk.9.attn_output.weight
+create_tensor: loading tensor blk.9.ffn_norm.weight
+create_tensor: loading tensor blk.9.ffn_gate.weight
+create_tensor: loading tensor blk.9.ffn_down.weight
+create_tensor: loading tensor blk.9.ffn_up.weight
+create_tensor: loading tensor blk.10.attn_norm.weight
+create_tensor: loading tensor blk.10.attn_q.weight
+create_tensor: loading tensor blk.10.attn_k.weight
+create_tensor: loading tensor blk.10.attn_v.weight
+create_tensor: loading tensor blk.10.attn_output.weight
+create_tensor: loading tensor blk.10.ffn_norm.weight
+create_tensor: loading tensor blk.10.ffn_gate.weight
+create_tensor: loading tensor blk.10.ffn_down.weight
+create_tensor: loading tensor blk.10.ffn_up.weight
+create_tensor: loading tensor blk.11.attn_norm.weight
+create_tensor: loading tensor blk.11.attn_q.weight
+create_tensor: loading tensor blk.11.attn_k.weight
+create_tensor: loading tensor blk.11.attn_v.weight
+create_tensor: loading tensor blk.11.attn_output.weight
+create_tensor: loading tensor blk.11.ffn_norm.weight
+create_tensor: loading tensor blk.11.ffn_gate.weight
+create_tensor: loading tensor blk.11.ffn_down.weight
+create_tensor: loading tensor blk.11.ffn_up.weight
+create_tensor: loading tensor blk.12.attn_norm.weight
+create_tensor: loading tensor blk.12.attn_q.weight
+create_tensor: loading tensor blk.12.attn_k.weight
+create_tensor: loading tensor blk.12.attn_v.weight
+create_tensor: loading tensor blk.12.attn_output.weight
+create_tensor: loading tensor blk.12.ffn_norm.weight
+create_tensor: loading tensor blk.12.ffn_gate.weight
+create_tensor: loading tensor blk.12.ffn_down.weight
+create_tensor: loading tensor blk.12.ffn_up.weight
+create_tensor: loading tensor blk.13.attn_norm.weight
+create_tensor: loading tensor blk.13.attn_q.weight
+create_tensor: loading tensor blk.13.attn_k.weight
+create_tensor: loading tensor blk.13.attn_v.weight
+create_tensor: loading tensor blk.13.attn_output.weight
+create_tensor: loading tensor blk.13.ffn_norm.weight
+create_tensor: loading tensor blk.13.ffn_gate.weight
+create_tensor: loading tensor blk.13.ffn_down.weight
+create_tensor: loading tensor blk.13.ffn_up.weight
+create_tensor: loading tensor blk.14.attn_norm.weight
+create_tensor: loading tensor blk.14.attn_q.weight
+create_tensor: loading tensor blk.14.attn_k.weight
+create_tensor: loading tensor blk.14.attn_v.weight
+create_tensor: loading tensor blk.14.attn_output.weight
+create_tensor: loading tensor blk.14.ffn_norm.weight
+create_tensor: loading tensor blk.14.ffn_gate.weight
+create_tensor: loading tensor blk.14.ffn_down.weight
+create_tensor: loading tensor blk.14.ffn_up.weight
+create_tensor: loading tensor blk.15.attn_norm.weight
+create_tensor: loading tensor blk.15.attn_q.weight
+create_tensor: loading tensor blk.15.attn_k.weight
+create_tensor: loading tensor blk.15.attn_v.weight
+create_tensor: loading tensor blk.15.attn_output.weight
+create_tensor: loading tensor blk.15.ffn_norm.weight
+create_tensor: loading tensor blk.15.ffn_gate.weight
+create_tensor: loading tensor blk.15.ffn_down.weight
+create_tensor: loading tensor blk.15.ffn_up.weight
+create_tensor: loading tensor blk.16.attn_norm.weight
+create_tensor: loading tensor blk.16.attn_q.weight
+create_tensor: loading tensor blk.16.attn_k.weight
+create_tensor: loading tensor blk.16.attn_v.weight
+create_tensor: loading tensor blk.16.attn_output.weight
+create_tensor: loading tensor blk.16.ffn_norm.weight
+create_tensor: loading tensor blk.16.ffn_gate.weight
+create_tensor: loading tensor blk.16.ffn_down.weight
+create_tensor: loading tensor blk.16.ffn_up.weight
+create_tensor: loading tensor blk.17.attn_norm.weight
+create_tensor: loading tensor blk.17.attn_q.weight
+create_tensor: loading tensor blk.17.attn_k.weight
+create_tensor: loading tensor blk.17.attn_v.weight
+create_tensor: loading tensor blk.17.attn_output.weight
+create_tensor: loading tensor blk.17.ffn_norm.weight
+create_tensor: loading tensor blk.17.ffn_gate.weight
+create_tensor: loading tensor blk.17.ffn_down.weight
+create_tensor: loading tensor blk.17.ffn_up.weight
+create_tensor: loading tensor blk.18.attn_norm.weight
+create_tensor: loading tensor blk.18.attn_q.weight
+create_tensor: loading tensor blk.18.attn_k.weight
+create_tensor: loading tensor blk.18.attn_v.weight
+create_tensor: loading tensor blk.18.attn_output.weight
+create_tensor: loading tensor blk.18.ffn_norm.weight
+create_tensor: loading tensor blk.18.ffn_gate.weight
+create_tensor: loading tensor blk.18.ffn_down.weight
+create_tensor: loading tensor blk.18.ffn_up.weight
+create_tensor: loading tensor blk.19.attn_norm.weight
+create_tensor: loading tensor blk.19.attn_q.weight
+create_tensor: loading tensor blk.19.attn_k.weight
+create_tensor: loading tensor blk.19.attn_v.weight
+create_tensor: loading tensor blk.19.attn_output.weight
+create_tensor: loading tensor blk.19.ffn_norm.weight
+create_tensor: loading tensor blk.19.ffn_gate.weight
+create_tensor: loading tensor blk.19.ffn_down.weight
+create_tensor: loading tensor blk.19.ffn_up.weight
+create_tensor: loading tensor blk.20.attn_norm.weight
+create_tensor: loading tensor blk.20.attn_q.weight
+create_tensor: loading tensor blk.20.attn_k.weight
+create_tensor: loading tensor blk.20.attn_v.weight
+create_tensor: loading tensor blk.20.attn_output.weight
+create_tensor: loading tensor blk.20.ffn_norm.weight
+create_tensor: loading tensor blk.20.ffn_gate.weight
+create_tensor: loading tensor blk.20.ffn_down.weight
+create_tensor: loading tensor blk.20.ffn_up.weight
+create_tensor: loading tensor blk.21.attn_norm.weight
+create_tensor: loading tensor blk.21.attn_q.weight
+create_tensor: loading tensor blk.21.attn_k.weight
+create_tensor: loading tensor blk.21.attn_v.weight
+create_tensor: loading tensor blk.21.attn_output.weight
+create_tensor: loading tensor blk.21.ffn_norm.weight
+create_tensor: loading tensor blk.21.ffn_gate.weight
+create_tensor: loading tensor blk.21.ffn_down.weight
+create_tensor: loading tensor blk.21.ffn_up.weight
+done_getting_tensors: tensor 'token_embd.weight' (q4_K) (and 45 others) cannot be used with preferred buffer type CPU_REPACK, using CPU instead
+load_tensors: offloading 0 repeating layers to GPU
+load_tensors: offloaded 0/23 layers to GPU
+load_tensors:   CPU_Mapped model buffer size =   584.91 MiB
+load_tensors:   CPU_REPACK model buffer size =   600.67 MiB
+.repack: repack tensor output.weight with q6_K_8x8
+.repack: repack tensor blk.0.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.0.attn_k.weight with q4_K_8x8
+.repack: repack tensor blk.0.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.0.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.0.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.0.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.0.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.1.attn_q.weight with q4_K_8x8
+.repack: repack tensor blk.1.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.1.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.1.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.1.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.1.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.1.ffn_up.weight with q4_K_8x8
+repack: repack tensor blk.2.attn_q.weight with q4_K_8x8
+.repack: repack tensor blk.2.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.2.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.2.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.2.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.2.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.2.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.3.attn_q.weight with q4_K_8x8
+.repack: repack tensor blk.3.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.3.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.3.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.3.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.3.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.3.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.4.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.4.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.4.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.4.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.4.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.4.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.4.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.5.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.5.attn_k.weight with q4_K_8x8
+.repack: repack tensor blk.5.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.5.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.5.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.5.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.5.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.6.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.6.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.6.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.6.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.6.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.6.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.6.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.7.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.7.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.7.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.7.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.7.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.7.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.7.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.8.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.8.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.8.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.8.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.8.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.8.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.8.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.9.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.9.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.9.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.9.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.9.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.9.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.9.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.10.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.10.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.10.attn_v.weight with q4_K_8x8
+.repack: repack tensor blk.10.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.10.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.10.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.10.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.11.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.11.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.11.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.11.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.11.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.11.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.11.ffn_up.weight with q4_K_8x8
+repack: repack tensor blk.12.attn_q.weight with q4_K_8x8
+.repack: repack tensor blk.12.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.12.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.12.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.12.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.12.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.12.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.13.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.13.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.13.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.13.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.13.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.13.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.13.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.14.attn_q.weight with q4_K_8x8
+.repack: repack tensor blk.14.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.14.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.14.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.14.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.14.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.14.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.15.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.15.attn_k.weight with q4_K_8x8
+.repack: repack tensor blk.15.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.15.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.15.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.15.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.15.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.16.attn_q.weight with q4_K_8x8
+.repack: repack tensor blk.16.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.16.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.16.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.16.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.16.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.16.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.17.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.17.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.17.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.17.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.17.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.17.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.17.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.18.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.18.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.18.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.18.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.18.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.18.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.18.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.19.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.19.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.19.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.19.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.19.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.19.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.19.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.20.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.20.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.20.attn_v.weight with q6_K_8x8
+repack: repack tensor blk.20.attn_output.weight with q4_K_8x8
+repack: repack tensor blk.20.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.20.ffn_down.weight with q6_K_8x8
+.repack: repack tensor blk.20.ffn_up.weight with q4_K_8x8
+.repack: repack tensor blk.21.attn_q.weight with q4_K_8x8
+repack: repack tensor blk.21.attn_k.weight with q4_K_8x8
+repack: repack tensor blk.21.attn_v.weight with q4_K_8x8
+repack: repack tensor blk.21.attn_output.weight with q4_K_8x8
+.repack: repack tensor blk.21.ffn_gate.weight with q4_K_8x8
+.repack: repack tensor blk.21.ffn_down.weight with q4_K_8x8
+.repack: repack tensor blk.21.ffn_up.weight with q4_K_8x8
+.
+llama_context: constructing llama_context
+llama_context: n_seq_max     = 1
+llama_context: n_ctx         = 256
+llama_context: n_ctx_seq     = 256
+llama_context: n_batch       = 6
+llama_context: n_ubatch      = 6
+llama_context: causal_attn   = 1
+llama_context: flash_attn    = auto
+llama_context: kv_unified    = false
+llama_context: freq_base     = 10000.0
+llama_context: freq_scale    = 1
+llama_context: n_ctx_seq (256) < n_ctx_train (2048) -- the full capacity of the model will not be utilized
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M4
+ggml_metal_init: picking default device: Apple M4
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+set_abort_callback: call
+llama_context:        CPU  output buffer size =     0.12 MiB
+llama_kv_cache: layer   0: dev = CPU
+llama_kv_cache: layer   1: dev = CPU
+llama_kv_cache: layer   2: dev = CPU
+llama_kv_cache: layer   3: dev = CPU
+llama_kv_cache: layer   4: dev = CPU
+llama_kv_cache: layer   5: dev = CPU
+llama_kv_cache: layer   6: dev = CPU
+llama_kv_cache: layer   7: dev = CPU
+llama_kv_cache: layer   8: dev = CPU
+llama_kv_cache: layer   9: dev = CPU
+llama_kv_cache: layer  10: dev = CPU
+llama_kv_cache: layer  11: dev = CPU
+llama_kv_cache: layer  12: dev = CPU
+llama_kv_cache: layer  13: dev = CPU
+llama_kv_cache: layer  14: dev = CPU
+llama_kv_cache: layer  15: dev = CPU
+llama_kv_cache: layer  16: dev = CPU
+llama_kv_cache: layer  17: dev = CPU
+llama_kv_cache: layer  18: dev = CPU
+llama_kv_cache: layer  19: dev = CPU
+llama_kv_cache: layer  20: dev = CPU
+llama_kv_cache: layer  21: dev = CPU
+llama_kv_cache:        CPU KV buffer size =     5.50 MiB
+llama_kv_cache: size =    5.50 MiB (   256 cells,  22 layers,  1/1 seqs), K (f16):    2.75 MiB, V (f16):    2.75 MiB
+llama_context: enumerating backends
+llama_context: backend_ptrs.size() = 3
+sched_reserve: reserving ...
+sched_reserve: max_nodes = 1608
+sched_reserve: reserving full memory module
+sched_reserve: worst-case: n_tokens = 6, n_seqs = 1, n_outputs = 1
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+sched_reserve: Flash Attention was auto, set to enabled
+sched_reserve: resolving fused Gated Delta Net support:
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+sched_reserve: fused Gated Delta Net (autoregressive) enabled
+graph_reserve: reserving a graph for ubatch with n_tokens =   16, n_seqs =  1, n_outputs =   16
+sched_reserve: fused Gated Delta Net (chunked) enabled
+graph_reserve: reserving a graph for ubatch with n_tokens =    6, n_seqs =  1, n_outputs =    6
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+graph_reserve: reserving a graph for ubatch with n_tokens =    6, n_seqs =  1, n_outputs =    6
+sched_reserve:        CPU compute buffer size =     0.83 MiB
+sched_reserve: graph nodes  = 689
+sched_reserve: graph splits = 1
+sched_reserve: reserve took 1.01 ms, sched copies = 1
+llama_context: HPX exec enabled (LLAMA_USE_HPX=1)
+llama_context: HPX selective mul_mat path enabled
+[hpx-map] idx=0 cat=F run=0 op=GET_ROWS name=embd shape=[2048] src0=q4_K trait=- reason=not_lowerable
+[hpx-map] idx=1 cat=F run=0 op=RMS_NORM name=norm-0 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=0 cat=F start=0 end=2 len=2 ops=GET_ROWS,RMS_NORM
+[hpx-map] idx=2 cat=L run=1 op=MUL name=attn_norm-0 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=3 cat=L run=1 op=MUL_MAT name=Qcur-0 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=1 cat=L start=2 end=4 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=4 cat=F run=2 op=RESHAPE name=Qcur-0 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=5 cat=F run=2 op=ROPE name=Qcur-0 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=6 cat=F run=2 op=MUL_MAT name=Vcur-0 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=7 cat=F run=2 op=RESHAPE name=Vcur-0 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=2 cat=F start=4 end=8 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=8 cat=L run=3 op=MUL_MAT name=Kcur-0 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=3 cat=L start=8 end=9 len=1 ops=MUL_MAT
+[hpx-map] idx=9 cat=F run=4 op=RESHAPE name=Kcur-0 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=10 cat=F run=4 op=ROPE name=Kcur-0 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=11 cat=F run=4 op=VIEW name=Kcur-0 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=12 cat=F run=4 op=SET_ROWS name=cache_k_l0 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=13 cat=F run=4 op=VIEW name=Vcur-0 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=14 cat=F run=4 op=SET_ROWS name=cache_v_l0 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=15 cat=F run=4 op=VIEW name=Qcur-0 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=16 cat=F run=4 op=PERMUTE name=Qcur-0 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=17 cat=F run=4 op=VIEW name=cache_k_l0 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=18 cat=F run=4 op=PERMUTE name=cache_k_l0 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=19 cat=F run=4 op=VIEW name=cache_v_l0 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=20 cat=F run=4 op=PERMUTE name=cache_v_l0 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=21 cat=F run=4 op=CPY name= (copy) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=22 cat=F run=4 op=FLASH_ATTN_EXT name=__fattn__-0 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=23 cat=F run=4 op=RESHAPE name=kqv_out-0 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=4 cat=F start=9 end=24 len=15 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=24 cat=L run=5 op=MUL_MAT name=attn_out-0 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=5 cat=L start=24 end=25 len=1 ops=MUL_MAT
+[hpx-map] idx=25 cat=F run=6 op=ADD name=ffn_inp-0 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=26 cat=F run=6 op=RMS_NORM name=norm-0 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=6 cat=F start=25 end=27 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=27 cat=L run=7 op=MUL name=ffn_norm-0 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=28 cat=L run=7 op=MUL_MAT name=ffn_gate-0 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=29 cat=L run=7 op=MUL_MAT name=ffn_up-0 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=30 cat=L run=7 op=GLU name=ffn_swiglu-0 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=7 cat=L start=27 end=31 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=31 cat=F run=8 op=MUL_MAT name=ffn_out-0 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=32 cat=F run=8 op=ADD name=l_out-0 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=33 cat=F run=8 op=RMS_NORM name=norm-1 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=8 cat=F start=31 end=34 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=34 cat=L run=9 op=MUL name=attn_norm-1 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=35 cat=L run=9 op=MUL_MAT name=Qcur-1 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=9 cat=L start=34 end=36 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=36 cat=F run=10 op=RESHAPE name=Qcur-1 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=37 cat=F run=10 op=ROPE name=Qcur-1 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=38 cat=F run=10 op=MUL_MAT name=Vcur-1 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=39 cat=F run=10 op=RESHAPE name=Vcur-1 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=10 cat=F start=36 end=40 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=40 cat=L run=11 op=MUL_MAT name=Kcur-1 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=11 cat=L start=40 end=41 len=1 ops=MUL_MAT
+[hpx-map] idx=41 cat=F run=12 op=RESHAPE name=Kcur-1 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=42 cat=F run=12 op=ROPE name=Kcur-1 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=43 cat=F run=12 op=VIEW name=Kcur-1 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=44 cat=F run=12 op=SET_ROWS name=cache_k_l1 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=45 cat=F run=12 op=VIEW name=Vcur-1 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=46 cat=F run=12 op=SET_ROWS name=cache_v_l1 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=47 cat=F run=12 op=VIEW name=Qcur-1 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=48 cat=F run=12 op=PERMUTE name=Qcur-1 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=49 cat=F run=12 op=VIEW name=cache_k_l1 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=50 cat=F run=12 op=PERMUTE name=cache_k_l1 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=51 cat=F run=12 op=VIEW name=cache_v_l1 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=52 cat=F run=12 op=PERMUTE name=cache_v_l1 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=53 cat=F run=12 op=FLASH_ATTN_EXT name=__fattn__-1 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=54 cat=F run=12 op=RESHAPE name=kqv_out-1 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=12 cat=F start=41 end=55 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=55 cat=L run=13 op=MUL_MAT name=attn_out-1 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=13 cat=L start=55 end=56 len=1 ops=MUL_MAT
+[hpx-map] idx=56 cat=F run=14 op=ADD name=ffn_inp-1 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=57 cat=F run=14 op=RMS_NORM name=norm-1 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=14 cat=F start=56 end=58 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=58 cat=L run=15 op=MUL name=ffn_norm-1 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=59 cat=L run=15 op=MUL_MAT name=ffn_gate-1 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=60 cat=L run=15 op=MUL_MAT name=ffn_up-1 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=61 cat=L run=15 op=GLU name=ffn_swiglu-1 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=15 cat=L start=58 end=62 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=62 cat=F run=16 op=MUL_MAT name=ffn_out-1 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=63 cat=F run=16 op=ADD name=l_out-1 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=64 cat=F run=16 op=RMS_NORM name=norm-2 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=16 cat=F start=62 end=65 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=65 cat=L run=17 op=MUL name=attn_norm-2 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=66 cat=L run=17 op=MUL_MAT name=Qcur-2 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=17 cat=L start=65 end=67 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=67 cat=F run=18 op=RESHAPE name=Qcur-2 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=68 cat=F run=18 op=ROPE name=Qcur-2 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=18 cat=F start=67 end=69 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=69 cat=L run=19 op=MUL_MAT name=Vcur-2 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=19 cat=L start=69 end=70 len=1 ops=MUL_MAT
+[hpx-map] idx=70 cat=F run=20 op=RESHAPE name=Vcur-2 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=20 cat=F start=70 end=71 len=1 ops=RESHAPE
+[hpx-map] idx=71 cat=L run=21 op=MUL_MAT name=Kcur-2 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=21 cat=L start=71 end=72 len=1 ops=MUL_MAT
+[hpx-map] idx=72 cat=F run=22 op=RESHAPE name=Kcur-2 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=73 cat=F run=22 op=ROPE name=Kcur-2 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=74 cat=F run=22 op=VIEW name=Kcur-2 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=75 cat=F run=22 op=SET_ROWS name=cache_k_l2 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=76 cat=F run=22 op=VIEW name=Vcur-2 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=77 cat=F run=22 op=SET_ROWS name=cache_v_l2 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=78 cat=F run=22 op=VIEW name=Qcur-2 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=79 cat=F run=22 op=PERMUTE name=Qcur-2 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=80 cat=F run=22 op=VIEW name=cache_k_l2 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=81 cat=F run=22 op=PERMUTE name=cache_k_l2 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=82 cat=F run=22 op=VIEW name=cache_v_l2 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=83 cat=F run=22 op=PERMUTE name=cache_v_l2 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=84 cat=F run=22 op=FLASH_ATTN_EXT name=__fattn__-2 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=85 cat=F run=22 op=RESHAPE name=kqv_out-2 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=22 cat=F start=72 end=86 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=86 cat=L run=23 op=MUL_MAT name=attn_out-2 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=23 cat=L start=86 end=87 len=1 ops=MUL_MAT
+[hpx-map] idx=87 cat=F run=24 op=ADD name=ffn_inp-2 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=88 cat=F run=24 op=RMS_NORM name=norm-2 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=24 cat=F start=87 end=89 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=89 cat=L run=25 op=MUL name=ffn_norm-2 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=90 cat=L run=25 op=MUL_MAT name=ffn_gate-2 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=91 cat=L run=25 op=MUL_MAT name=ffn_up-2 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=92 cat=L run=25 op=GLU name=ffn_swiglu-2 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=93 cat=L run=25 op=MUL_MAT name=ffn_out-2 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=25 cat=L start=89 end=94 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=94 cat=F run=26 op=ADD name=l_out-2 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=95 cat=F run=26 op=RMS_NORM name=norm-3 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=26 cat=F start=94 end=96 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=96 cat=L run=27 op=MUL name=attn_norm-3 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=97 cat=L run=27 op=MUL_MAT name=Qcur-3 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=27 cat=L start=96 end=98 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=98 cat=F run=28 op=RESHAPE name=Qcur-3 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=99 cat=F run=28 op=ROPE name=Qcur-3 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=28 cat=F start=98 end=100 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=100 cat=L run=29 op=MUL_MAT name=Vcur-3 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=29 cat=L start=100 end=101 len=1 ops=MUL_MAT
+[hpx-map] idx=101 cat=F run=30 op=RESHAPE name=Vcur-3 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=30 cat=F start=101 end=102 len=1 ops=RESHAPE
+[hpx-map] idx=102 cat=L run=31 op=MUL_MAT name=Kcur-3 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=31 cat=L start=102 end=103 len=1 ops=MUL_MAT
+[hpx-map] idx=103 cat=F run=32 op=RESHAPE name=Kcur-3 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=104 cat=F run=32 op=ROPE name=Kcur-3 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=105 cat=F run=32 op=VIEW name=Kcur-3 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=106 cat=F run=32 op=SET_ROWS name=cache_k_l3 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=107 cat=F run=32 op=VIEW name=Vcur-3 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=108 cat=F run=32 op=SET_ROWS name=cache_v_l3 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=109 cat=F run=32 op=VIEW name=Qcur-3 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=110 cat=F run=32 op=PERMUTE name=Qcur-3 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=111 cat=F run=32 op=VIEW name=cache_k_l3 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=112 cat=F run=32 op=PERMUTE name=cache_k_l3 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=113 cat=F run=32 op=VIEW name=cache_v_l3 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=114 cat=F run=32 op=PERMUTE name=cache_v_l3 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=115 cat=F run=32 op=FLASH_ATTN_EXT name=__fattn__-3 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=116 cat=F run=32 op=RESHAPE name=kqv_out-3 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=32 cat=F start=103 end=117 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=117 cat=L run=33 op=MUL_MAT name=attn_out-3 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=33 cat=L start=117 end=118 len=1 ops=MUL_MAT
+[hpx-map] idx=118 cat=F run=34 op=ADD name=ffn_inp-3 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=119 cat=F run=34 op=RMS_NORM name=norm-3 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=34 cat=F start=118 end=120 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=120 cat=L run=35 op=MUL name=ffn_norm-3 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=121 cat=L run=35 op=MUL_MAT name=ffn_gate-3 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=122 cat=L run=35 op=MUL_MAT name=ffn_up-3 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=123 cat=L run=35 op=GLU name=ffn_swiglu-3 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=124 cat=L run=35 op=MUL_MAT name=ffn_out-3 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=35 cat=L start=120 end=125 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=125 cat=F run=36 op=ADD name=l_out-3 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=126 cat=F run=36 op=RMS_NORM name=norm-4 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=36 cat=F start=125 end=127 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=127 cat=L run=37 op=MUL name=attn_norm-4 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=128 cat=L run=37 op=MUL_MAT name=Qcur-4 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=37 cat=L start=127 end=129 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=129 cat=F run=38 op=RESHAPE name=Qcur-4 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=130 cat=F run=38 op=ROPE name=Qcur-4 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=131 cat=F run=38 op=MUL_MAT name=Vcur-4 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=132 cat=F run=38 op=RESHAPE name=Vcur-4 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=38 cat=F start=129 end=133 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=133 cat=L run=39 op=MUL_MAT name=Kcur-4 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=39 cat=L start=133 end=134 len=1 ops=MUL_MAT
+[hpx-map] idx=134 cat=F run=40 op=RESHAPE name=Kcur-4 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=135 cat=F run=40 op=ROPE name=Kcur-4 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=136 cat=F run=40 op=VIEW name=Kcur-4 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=137 cat=F run=40 op=SET_ROWS name=cache_k_l4 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=138 cat=F run=40 op=VIEW name=Vcur-4 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=139 cat=F run=40 op=SET_ROWS name=cache_v_l4 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=140 cat=F run=40 op=VIEW name=Qcur-4 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=141 cat=F run=40 op=PERMUTE name=Qcur-4 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=142 cat=F run=40 op=VIEW name=cache_k_l4 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=143 cat=F run=40 op=PERMUTE name=cache_k_l4 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=144 cat=F run=40 op=VIEW name=cache_v_l4 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=145 cat=F run=40 op=PERMUTE name=cache_v_l4 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=146 cat=F run=40 op=FLASH_ATTN_EXT name=__fattn__-4 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=147 cat=F run=40 op=RESHAPE name=kqv_out-4 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=40 cat=F start=134 end=148 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=148 cat=L run=41 op=MUL_MAT name=attn_out-4 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=41 cat=L start=148 end=149 len=1 ops=MUL_MAT
+[hpx-map] idx=149 cat=F run=42 op=ADD name=ffn_inp-4 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=150 cat=F run=42 op=RMS_NORM name=norm-4 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=42 cat=F start=149 end=151 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=151 cat=L run=43 op=MUL name=ffn_norm-4 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=152 cat=L run=43 op=MUL_MAT name=ffn_gate-4 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=153 cat=L run=43 op=MUL_MAT name=ffn_up-4 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=154 cat=L run=43 op=GLU name=ffn_swiglu-4 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=43 cat=L start=151 end=155 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=155 cat=F run=44 op=MUL_MAT name=ffn_out-4 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=156 cat=F run=44 op=ADD name=l_out-4 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=157 cat=F run=44 op=RMS_NORM name=norm-5 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=44 cat=F start=155 end=158 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=158 cat=L run=45 op=MUL name=attn_norm-5 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=159 cat=L run=45 op=MUL_MAT name=Qcur-5 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=45 cat=L start=158 end=160 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=160 cat=F run=46 op=RESHAPE name=Qcur-5 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=161 cat=F run=46 op=ROPE name=Qcur-5 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=46 cat=F start=160 end=162 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=162 cat=L run=47 op=MUL_MAT name=Vcur-5 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=47 cat=L start=162 end=163 len=1 ops=MUL_MAT
+[hpx-map] idx=163 cat=F run=48 op=RESHAPE name=Vcur-5 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=48 cat=F start=163 end=164 len=1 ops=RESHAPE
+[hpx-map] idx=164 cat=L run=49 op=MUL_MAT name=Kcur-5 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=49 cat=L start=164 end=165 len=1 ops=MUL_MAT
+[hpx-map] idx=165 cat=F run=50 op=RESHAPE name=Kcur-5 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=166 cat=F run=50 op=ROPE name=Kcur-5 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=167 cat=F run=50 op=VIEW name=Kcur-5 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=168 cat=F run=50 op=SET_ROWS name=cache_k_l5 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=169 cat=F run=50 op=VIEW name=Vcur-5 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=170 cat=F run=50 op=SET_ROWS name=cache_v_l5 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=171 cat=F run=50 op=VIEW name=Qcur-5 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=172 cat=F run=50 op=PERMUTE name=Qcur-5 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=173 cat=F run=50 op=VIEW name=cache_k_l5 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=174 cat=F run=50 op=PERMUTE name=cache_k_l5 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=175 cat=F run=50 op=VIEW name=cache_v_l5 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=176 cat=F run=50 op=PERMUTE name=cache_v_l5 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=177 cat=F run=50 op=FLASH_ATTN_EXT name=__fattn__-5 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=178 cat=F run=50 op=RESHAPE name=kqv_out-5 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=50 cat=F start=165 end=179 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=179 cat=L run=51 op=MUL_MAT name=attn_out-5 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=51 cat=L start=179 end=180 len=1 ops=MUL_MAT
+[hpx-map] idx=180 cat=F run=52 op=ADD name=ffn_inp-5 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=181 cat=F run=52 op=RMS_NORM name=norm-5 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=52 cat=F start=180 end=182 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=182 cat=L run=53 op=MUL name=ffn_norm-5 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=183 cat=L run=53 op=MUL_MAT name=ffn_gate-5 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=184 cat=L run=53 op=MUL_MAT name=ffn_up-5 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=185 cat=L run=53 op=GLU name=ffn_swiglu-5 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=186 cat=L run=53 op=MUL_MAT name=ffn_out-5 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=53 cat=L start=182 end=187 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=187 cat=F run=54 op=ADD name=l_out-5 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=188 cat=F run=54 op=RMS_NORM name=norm-6 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=54 cat=F start=187 end=189 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=189 cat=L run=55 op=MUL name=attn_norm-6 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=190 cat=L run=55 op=MUL_MAT name=Qcur-6 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=55 cat=L start=189 end=191 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=191 cat=F run=56 op=RESHAPE name=Qcur-6 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=192 cat=F run=56 op=ROPE name=Qcur-6 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=56 cat=F start=191 end=193 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=193 cat=L run=57 op=MUL_MAT name=Vcur-6 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=57 cat=L start=193 end=194 len=1 ops=MUL_MAT
+[hpx-map] idx=194 cat=F run=58 op=RESHAPE name=Vcur-6 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=58 cat=F start=194 end=195 len=1 ops=RESHAPE
+[hpx-map] idx=195 cat=L run=59 op=MUL_MAT name=Kcur-6 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=59 cat=L start=195 end=196 len=1 ops=MUL_MAT
+[hpx-map] idx=196 cat=F run=60 op=RESHAPE name=Kcur-6 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=197 cat=F run=60 op=ROPE name=Kcur-6 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=198 cat=F run=60 op=VIEW name=Kcur-6 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=199 cat=F run=60 op=SET_ROWS name=cache_k_l6 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=200 cat=F run=60 op=VIEW name=Vcur-6 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=201 cat=F run=60 op=SET_ROWS name=cache_v_l6 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=202 cat=F run=60 op=VIEW name=Qcur-6 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=203 cat=F run=60 op=PERMUTE name=Qcur-6 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=204 cat=F run=60 op=VIEW name=cache_k_l6 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=205 cat=F run=60 op=PERMUTE name=cache_k_l6 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=206 cat=F run=60 op=VIEW name=cache_v_l6 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=207 cat=F run=60 op=PERMUTE name=cache_v_l6 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=208 cat=F run=60 op=FLASH_ATTN_EXT name=__fattn__-6 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=209 cat=F run=60 op=RESHAPE name=kqv_out-6 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=60 cat=F start=196 end=210 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=210 cat=L run=61 op=MUL_MAT name=attn_out-6 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=61 cat=L start=210 end=211 len=1 ops=MUL_MAT
+[hpx-map] idx=211 cat=F run=62 op=ADD name=ffn_inp-6 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=212 cat=F run=62 op=RMS_NORM name=norm-6 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=62 cat=F start=211 end=213 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=213 cat=L run=63 op=MUL name=ffn_norm-6 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=214 cat=L run=63 op=MUL_MAT name=ffn_gate-6 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=215 cat=L run=63 op=MUL_MAT name=ffn_up-6 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=216 cat=L run=63 op=GLU name=ffn_swiglu-6 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=217 cat=L run=63 op=MUL_MAT name=ffn_out-6 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=63 cat=L start=213 end=218 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=218 cat=F run=64 op=ADD name=l_out-6 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=219 cat=F run=64 op=RMS_NORM name=norm-7 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=64 cat=F start=218 end=220 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=220 cat=L run=65 op=MUL name=attn_norm-7 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=221 cat=L run=65 op=MUL_MAT name=Qcur-7 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=65 cat=L start=220 end=222 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=222 cat=F run=66 op=RESHAPE name=Qcur-7 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=223 cat=F run=66 op=ROPE name=Qcur-7 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=224 cat=F run=66 op=MUL_MAT name=Vcur-7 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=225 cat=F run=66 op=RESHAPE name=Vcur-7 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=66 cat=F start=222 end=226 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=226 cat=L run=67 op=MUL_MAT name=Kcur-7 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=67 cat=L start=226 end=227 len=1 ops=MUL_MAT
+[hpx-map] idx=227 cat=F run=68 op=RESHAPE name=Kcur-7 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=228 cat=F run=68 op=ROPE name=Kcur-7 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=229 cat=F run=68 op=VIEW name=Kcur-7 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=230 cat=F run=68 op=SET_ROWS name=cache_k_l7 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=231 cat=F run=68 op=VIEW name=Vcur-7 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=232 cat=F run=68 op=SET_ROWS name=cache_v_l7 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=233 cat=F run=68 op=VIEW name=Qcur-7 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=234 cat=F run=68 op=PERMUTE name=Qcur-7 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=235 cat=F run=68 op=VIEW name=cache_k_l7 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=236 cat=F run=68 op=PERMUTE name=cache_k_l7 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=237 cat=F run=68 op=VIEW name=cache_v_l7 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=238 cat=F run=68 op=PERMUTE name=cache_v_l7 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=239 cat=F run=68 op=FLASH_ATTN_EXT name=__fattn__-7 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=240 cat=F run=68 op=RESHAPE name=kqv_out-7 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=68 cat=F start=227 end=241 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=241 cat=L run=69 op=MUL_MAT name=attn_out-7 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=69 cat=L start=241 end=242 len=1 ops=MUL_MAT
+[hpx-map] idx=242 cat=F run=70 op=ADD name=ffn_inp-7 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=243 cat=F run=70 op=RMS_NORM name=norm-7 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=70 cat=F start=242 end=244 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=244 cat=L run=71 op=MUL name=ffn_norm-7 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=245 cat=L run=71 op=MUL_MAT name=ffn_gate-7 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=246 cat=L run=71 op=MUL_MAT name=ffn_up-7 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=247 cat=L run=71 op=GLU name=ffn_swiglu-7 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=71 cat=L start=244 end=248 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=248 cat=F run=72 op=MUL_MAT name=ffn_out-7 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=249 cat=F run=72 op=ADD name=l_out-7 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=250 cat=F run=72 op=RMS_NORM name=norm-8 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=72 cat=F start=248 end=251 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=251 cat=L run=73 op=MUL name=attn_norm-8 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=252 cat=L run=73 op=MUL_MAT name=Qcur-8 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=73 cat=L start=251 end=253 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=253 cat=F run=74 op=RESHAPE name=Qcur-8 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=254 cat=F run=74 op=ROPE name=Qcur-8 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=255 cat=F run=74 op=MUL_MAT name=Vcur-8 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=256 cat=F run=74 op=RESHAPE name=Vcur-8 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=74 cat=F start=253 end=257 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=257 cat=L run=75 op=MUL_MAT name=Kcur-8 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=75 cat=L start=257 end=258 len=1 ops=MUL_MAT
+[hpx-map] idx=258 cat=F run=76 op=RESHAPE name=Kcur-8 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=259 cat=F run=76 op=ROPE name=Kcur-8 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=260 cat=F run=76 op=VIEW name=Kcur-8 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=261 cat=F run=76 op=SET_ROWS name=cache_k_l8 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=262 cat=F run=76 op=VIEW name=Vcur-8 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=263 cat=F run=76 op=SET_ROWS name=cache_v_l8 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=264 cat=F run=76 op=VIEW name=Qcur-8 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=265 cat=F run=76 op=PERMUTE name=Qcur-8 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=266 cat=F run=76 op=VIEW name=cache_k_l8 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=267 cat=F run=76 op=PERMUTE name=cache_k_l8 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=268 cat=F run=76 op=VIEW name=cache_v_l8 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=269 cat=F run=76 op=PERMUTE name=cache_v_l8 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=270 cat=F run=76 op=FLASH_ATTN_EXT name=__fattn__-8 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=271 cat=F run=76 op=RESHAPE name=kqv_out-8 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=76 cat=F start=258 end=272 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=272 cat=L run=77 op=MUL_MAT name=attn_out-8 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=77 cat=L start=272 end=273 len=1 ops=MUL_MAT
+[hpx-map] idx=273 cat=F run=78 op=ADD name=ffn_inp-8 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=274 cat=F run=78 op=RMS_NORM name=norm-8 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=78 cat=F start=273 end=275 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=275 cat=L run=79 op=MUL name=ffn_norm-8 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=276 cat=L run=79 op=MUL_MAT name=ffn_gate-8 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=277 cat=L run=79 op=MUL_MAT name=ffn_up-8 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=278 cat=L run=79 op=GLU name=ffn_swiglu-8 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=79 cat=L start=275 end=279 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=279 cat=F run=80 op=MUL_MAT name=ffn_out-8 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=280 cat=F run=80 op=ADD name=l_out-8 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=281 cat=F run=80 op=RMS_NORM name=norm-9 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=80 cat=F start=279 end=282 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=282 cat=L run=81 op=MUL name=attn_norm-9 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=283 cat=L run=81 op=MUL_MAT name=Qcur-9 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=81 cat=L start=282 end=284 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=284 cat=F run=82 op=RESHAPE name=Qcur-9 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=285 cat=F run=82 op=ROPE name=Qcur-9 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=286 cat=F run=82 op=MUL_MAT name=Vcur-9 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=287 cat=F run=82 op=RESHAPE name=Vcur-9 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=82 cat=F start=284 end=288 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=288 cat=L run=83 op=MUL_MAT name=Kcur-9 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=83 cat=L start=288 end=289 len=1 ops=MUL_MAT
+[hpx-map] idx=289 cat=F run=84 op=RESHAPE name=Kcur-9 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=290 cat=F run=84 op=ROPE name=Kcur-9 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=291 cat=F run=84 op=VIEW name=Kcur-9 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=292 cat=F run=84 op=SET_ROWS name=cache_k_l9 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=293 cat=F run=84 op=VIEW name=Vcur-9 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=294 cat=F run=84 op=SET_ROWS name=cache_v_l9 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=295 cat=F run=84 op=VIEW name=Qcur-9 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=296 cat=F run=84 op=PERMUTE name=Qcur-9 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=297 cat=F run=84 op=VIEW name=cache_k_l9 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=298 cat=F run=84 op=PERMUTE name=cache_k_l9 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=299 cat=F run=84 op=VIEW name=cache_v_l9 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=300 cat=F run=84 op=PERMUTE name=cache_v_l9 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=301 cat=F run=84 op=FLASH_ATTN_EXT name=__fattn__-9 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=302 cat=F run=84 op=RESHAPE name=kqv_out-9 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=84 cat=F start=289 end=303 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=303 cat=L run=85 op=MUL_MAT name=attn_out-9 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=85 cat=L start=303 end=304 len=1 ops=MUL_MAT
+[hpx-map] idx=304 cat=F run=86 op=ADD name=ffn_inp-9 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=305 cat=F run=86 op=RMS_NORM name=norm-9 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=86 cat=F start=304 end=306 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=306 cat=L run=87 op=MUL name=ffn_norm-9 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=307 cat=L run=87 op=MUL_MAT name=ffn_gate-9 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=308 cat=L run=87 op=MUL_MAT name=ffn_up-9 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=309 cat=L run=87 op=GLU name=ffn_swiglu-9 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=87 cat=L start=306 end=310 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=310 cat=F run=88 op=MUL_MAT name=ffn_out-9 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=311 cat=F run=88 op=ADD name=l_out-9 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=312 cat=F run=88 op=RMS_NORM name=norm-10 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=88 cat=F start=310 end=313 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=313 cat=L run=89 op=MUL name=attn_norm-10 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=314 cat=L run=89 op=MUL_MAT name=Qcur-10 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=89 cat=L start=313 end=315 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=315 cat=F run=90 op=RESHAPE name=Qcur-10 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=316 cat=F run=90 op=ROPE name=Qcur-10 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=90 cat=F start=315 end=317 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=317 cat=L run=91 op=MUL_MAT name=Vcur-10 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=91 cat=L start=317 end=318 len=1 ops=MUL_MAT
+[hpx-map] idx=318 cat=F run=92 op=RESHAPE name=Vcur-10 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=92 cat=F start=318 end=319 len=1 ops=RESHAPE
+[hpx-map] idx=319 cat=L run=93 op=MUL_MAT name=Kcur-10 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=93 cat=L start=319 end=320 len=1 ops=MUL_MAT
+[hpx-map] idx=320 cat=F run=94 op=RESHAPE name=Kcur-10 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=321 cat=F run=94 op=ROPE name=Kcur-10 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=322 cat=F run=94 op=VIEW name=Kcur-10 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=323 cat=F run=94 op=SET_ROWS name=cache_k_l10 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=324 cat=F run=94 op=VIEW name=Vcur-10 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=325 cat=F run=94 op=SET_ROWS name=cache_v_l10 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=326 cat=F run=94 op=VIEW name=Qcur-10 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=327 cat=F run=94 op=PERMUTE name=Qcur-10 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=328 cat=F run=94 op=VIEW name=cache_k_l10 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=329 cat=F run=94 op=PERMUTE name=cache_k_l10 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=330 cat=F run=94 op=VIEW name=cache_v_l10 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=331 cat=F run=94 op=PERMUTE name=cache_v_l10 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=332 cat=F run=94 op=FLASH_ATTN_EXT name=__fattn__-10 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=333 cat=F run=94 op=RESHAPE name=kqv_out-10 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=94 cat=F start=320 end=334 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=334 cat=L run=95 op=MUL_MAT name=attn_out-10 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=95 cat=L start=334 end=335 len=1 ops=MUL_MAT
+[hpx-map] idx=335 cat=F run=96 op=ADD name=ffn_inp-10 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=336 cat=F run=96 op=RMS_NORM name=norm-10 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=96 cat=F start=335 end=337 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=337 cat=L run=97 op=MUL name=ffn_norm-10 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=338 cat=L run=97 op=MUL_MAT name=ffn_gate-10 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=339 cat=L run=97 op=MUL_MAT name=ffn_up-10 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=340 cat=L run=97 op=GLU name=ffn_swiglu-10 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=341 cat=L run=97 op=MUL_MAT name=ffn_out-10 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=97 cat=L start=337 end=342 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=342 cat=F run=98 op=ADD name=l_out-10 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=343 cat=F run=98 op=RMS_NORM name=norm-11 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=98 cat=F start=342 end=344 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=344 cat=L run=99 op=MUL name=attn_norm-11 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=345 cat=L run=99 op=MUL_MAT name=Qcur-11 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=99 cat=L start=344 end=346 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=346 cat=F run=100 op=RESHAPE name=Qcur-11 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=347 cat=F run=100 op=ROPE name=Qcur-11 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=100 cat=F start=346 end=348 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=348 cat=L run=101 op=MUL_MAT name=Vcur-11 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=101 cat=L start=348 end=349 len=1 ops=MUL_MAT
+[hpx-map] idx=349 cat=F run=102 op=RESHAPE name=Vcur-11 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=102 cat=F start=349 end=350 len=1 ops=RESHAPE
+[hpx-map] idx=350 cat=L run=103 op=MUL_MAT name=Kcur-11 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=103 cat=L start=350 end=351 len=1 ops=MUL_MAT
+[hpx-map] idx=351 cat=F run=104 op=RESHAPE name=Kcur-11 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=352 cat=F run=104 op=ROPE name=Kcur-11 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=353 cat=F run=104 op=VIEW name=Kcur-11 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=354 cat=F run=104 op=SET_ROWS name=cache_k_l11 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=355 cat=F run=104 op=VIEW name=Vcur-11 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=356 cat=F run=104 op=SET_ROWS name=cache_v_l11 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=357 cat=F run=104 op=VIEW name=Qcur-11 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=358 cat=F run=104 op=PERMUTE name=Qcur-11 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=359 cat=F run=104 op=VIEW name=cache_k_l11 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=360 cat=F run=104 op=PERMUTE name=cache_k_l11 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=361 cat=F run=104 op=VIEW name=cache_v_l11 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=362 cat=F run=104 op=PERMUTE name=cache_v_l11 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=363 cat=F run=104 op=FLASH_ATTN_EXT name=__fattn__-11 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=364 cat=F run=104 op=RESHAPE name=kqv_out-11 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=104 cat=F start=351 end=365 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=365 cat=L run=105 op=MUL_MAT name=attn_out-11 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=105 cat=L start=365 end=366 len=1 ops=MUL_MAT
+[hpx-map] idx=366 cat=F run=106 op=ADD name=ffn_inp-11 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=367 cat=F run=106 op=RMS_NORM name=norm-11 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=106 cat=F start=366 end=368 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=368 cat=L run=107 op=MUL name=ffn_norm-11 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=369 cat=L run=107 op=MUL_MAT name=ffn_gate-11 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=370 cat=L run=107 op=MUL_MAT name=ffn_up-11 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=371 cat=L run=107 op=GLU name=ffn_swiglu-11 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=372 cat=L run=107 op=MUL_MAT name=ffn_out-11 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=107 cat=L start=368 end=373 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=373 cat=F run=108 op=ADD name=l_out-11 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=374 cat=F run=108 op=RMS_NORM name=norm-12 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=108 cat=F start=373 end=375 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=375 cat=L run=109 op=MUL name=attn_norm-12 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=376 cat=L run=109 op=MUL_MAT name=Qcur-12 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=109 cat=L start=375 end=377 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=377 cat=F run=110 op=RESHAPE name=Qcur-12 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=378 cat=F run=110 op=ROPE name=Qcur-12 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=379 cat=F run=110 op=MUL_MAT name=Vcur-12 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=380 cat=F run=110 op=RESHAPE name=Vcur-12 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=110 cat=F start=377 end=381 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=381 cat=L run=111 op=MUL_MAT name=Kcur-12 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=111 cat=L start=381 end=382 len=1 ops=MUL_MAT
+[hpx-map] idx=382 cat=F run=112 op=RESHAPE name=Kcur-12 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=383 cat=F run=112 op=ROPE name=Kcur-12 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=384 cat=F run=112 op=VIEW name=Kcur-12 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=385 cat=F run=112 op=SET_ROWS name=cache_k_l12 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=386 cat=F run=112 op=VIEW name=Vcur-12 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=387 cat=F run=112 op=SET_ROWS name=cache_v_l12 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=388 cat=F run=112 op=VIEW name=Qcur-12 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=389 cat=F run=112 op=PERMUTE name=Qcur-12 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=390 cat=F run=112 op=VIEW name=cache_k_l12 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=391 cat=F run=112 op=PERMUTE name=cache_k_l12 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=392 cat=F run=112 op=VIEW name=cache_v_l12 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=393 cat=F run=112 op=PERMUTE name=cache_v_l12 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=394 cat=F run=112 op=FLASH_ATTN_EXT name=__fattn__-12 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=395 cat=F run=112 op=RESHAPE name=kqv_out-12 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=112 cat=F start=382 end=396 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=396 cat=L run=113 op=MUL_MAT name=attn_out-12 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=113 cat=L start=396 end=397 len=1 ops=MUL_MAT
+[hpx-map] idx=397 cat=F run=114 op=ADD name=ffn_inp-12 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=398 cat=F run=114 op=RMS_NORM name=norm-12 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=114 cat=F start=397 end=399 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=399 cat=L run=115 op=MUL name=ffn_norm-12 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=400 cat=L run=115 op=MUL_MAT name=ffn_gate-12 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=401 cat=L run=115 op=MUL_MAT name=ffn_up-12 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=402 cat=L run=115 op=GLU name=ffn_swiglu-12 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=115 cat=L start=399 end=403 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=403 cat=F run=116 op=MUL_MAT name=ffn_out-12 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=404 cat=F run=116 op=ADD name=l_out-12 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=405 cat=F run=116 op=RMS_NORM name=norm-13 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=116 cat=F start=403 end=406 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=406 cat=L run=117 op=MUL name=attn_norm-13 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=407 cat=L run=117 op=MUL_MAT name=Qcur-13 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=117 cat=L start=406 end=408 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=408 cat=F run=118 op=RESHAPE name=Qcur-13 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=409 cat=F run=118 op=ROPE name=Qcur-13 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=118 cat=F start=408 end=410 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=410 cat=L run=119 op=MUL_MAT name=Vcur-13 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=119 cat=L start=410 end=411 len=1 ops=MUL_MAT
+[hpx-map] idx=411 cat=F run=120 op=RESHAPE name=Vcur-13 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=120 cat=F start=411 end=412 len=1 ops=RESHAPE
+[hpx-map] idx=412 cat=L run=121 op=MUL_MAT name=Kcur-13 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=121 cat=L start=412 end=413 len=1 ops=MUL_MAT
+[hpx-map] idx=413 cat=F run=122 op=RESHAPE name=Kcur-13 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=414 cat=F run=122 op=ROPE name=Kcur-13 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=415 cat=F run=122 op=VIEW name=Kcur-13 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=416 cat=F run=122 op=SET_ROWS name=cache_k_l13 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=417 cat=F run=122 op=VIEW name=Vcur-13 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=418 cat=F run=122 op=SET_ROWS name=cache_v_l13 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=419 cat=F run=122 op=VIEW name=Qcur-13 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=420 cat=F run=122 op=PERMUTE name=Qcur-13 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=421 cat=F run=122 op=VIEW name=cache_k_l13 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=422 cat=F run=122 op=PERMUTE name=cache_k_l13 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=423 cat=F run=122 op=VIEW name=cache_v_l13 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=424 cat=F run=122 op=PERMUTE name=cache_v_l13 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=425 cat=F run=122 op=FLASH_ATTN_EXT name=__fattn__-13 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=426 cat=F run=122 op=RESHAPE name=kqv_out-13 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=122 cat=F start=413 end=427 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=427 cat=L run=123 op=MUL_MAT name=attn_out-13 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=123 cat=L start=427 end=428 len=1 ops=MUL_MAT
+[hpx-map] idx=428 cat=F run=124 op=ADD name=ffn_inp-13 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=429 cat=F run=124 op=RMS_NORM name=norm-13 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=124 cat=F start=428 end=430 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=430 cat=L run=125 op=MUL name=ffn_norm-13 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=431 cat=L run=125 op=MUL_MAT name=ffn_gate-13 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=432 cat=L run=125 op=MUL_MAT name=ffn_up-13 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=433 cat=L run=125 op=GLU name=ffn_swiglu-13 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=434 cat=L run=125 op=MUL_MAT name=ffn_out-13 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=125 cat=L start=430 end=435 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=435 cat=F run=126 op=ADD name=l_out-13 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=436 cat=F run=126 op=RMS_NORM name=norm-14 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=126 cat=F start=435 end=437 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=437 cat=L run=127 op=MUL name=attn_norm-14 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=438 cat=L run=127 op=MUL_MAT name=Qcur-14 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=127 cat=L start=437 end=439 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=439 cat=F run=128 op=RESHAPE name=Qcur-14 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=440 cat=F run=128 op=ROPE name=Qcur-14 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=128 cat=F start=439 end=441 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=441 cat=L run=129 op=MUL_MAT name=Vcur-14 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=129 cat=L start=441 end=442 len=1 ops=MUL_MAT
+[hpx-map] idx=442 cat=F run=130 op=RESHAPE name=Vcur-14 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=130 cat=F start=442 end=443 len=1 ops=RESHAPE
+[hpx-map] idx=443 cat=L run=131 op=MUL_MAT name=Kcur-14 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=131 cat=L start=443 end=444 len=1 ops=MUL_MAT
+[hpx-map] idx=444 cat=F run=132 op=RESHAPE name=Kcur-14 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=445 cat=F run=132 op=ROPE name=Kcur-14 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=446 cat=F run=132 op=VIEW name=Kcur-14 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=447 cat=F run=132 op=SET_ROWS name=cache_k_l14 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=448 cat=F run=132 op=VIEW name=Vcur-14 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=449 cat=F run=132 op=SET_ROWS name=cache_v_l14 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=450 cat=F run=132 op=VIEW name=Qcur-14 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=451 cat=F run=132 op=PERMUTE name=Qcur-14 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=452 cat=F run=132 op=VIEW name=cache_k_l14 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=453 cat=F run=132 op=PERMUTE name=cache_k_l14 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=454 cat=F run=132 op=VIEW name=cache_v_l14 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=455 cat=F run=132 op=PERMUTE name=cache_v_l14 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=456 cat=F run=132 op=FLASH_ATTN_EXT name=__fattn__-14 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=457 cat=F run=132 op=RESHAPE name=kqv_out-14 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=132 cat=F start=444 end=458 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=458 cat=L run=133 op=MUL_MAT name=attn_out-14 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=133 cat=L start=458 end=459 len=1 ops=MUL_MAT
+[hpx-map] idx=459 cat=F run=134 op=ADD name=ffn_inp-14 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=460 cat=F run=134 op=RMS_NORM name=norm-14 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=134 cat=F start=459 end=461 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=461 cat=L run=135 op=MUL name=ffn_norm-14 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=462 cat=L run=135 op=MUL_MAT name=ffn_gate-14 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=463 cat=L run=135 op=MUL_MAT name=ffn_up-14 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=464 cat=L run=135 op=GLU name=ffn_swiglu-14 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=465 cat=L run=135 op=MUL_MAT name=ffn_out-14 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=135 cat=L start=461 end=466 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=466 cat=F run=136 op=ADD name=l_out-14 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=467 cat=F run=136 op=RMS_NORM name=norm-15 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=136 cat=F start=466 end=468 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=468 cat=L run=137 op=MUL name=attn_norm-15 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=469 cat=L run=137 op=MUL_MAT name=Qcur-15 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=137 cat=L start=468 end=470 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=470 cat=F run=138 op=RESHAPE name=Qcur-15 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=471 cat=F run=138 op=ROPE name=Qcur-15 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=472 cat=F run=138 op=MUL_MAT name=Vcur-15 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=473 cat=F run=138 op=RESHAPE name=Vcur-15 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=138 cat=F start=470 end=474 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=474 cat=L run=139 op=MUL_MAT name=Kcur-15 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=139 cat=L start=474 end=475 len=1 ops=MUL_MAT
+[hpx-map] idx=475 cat=F run=140 op=RESHAPE name=Kcur-15 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=476 cat=F run=140 op=ROPE name=Kcur-15 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=477 cat=F run=140 op=VIEW name=Kcur-15 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=478 cat=F run=140 op=SET_ROWS name=cache_k_l15 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=479 cat=F run=140 op=VIEW name=Vcur-15 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=480 cat=F run=140 op=SET_ROWS name=cache_v_l15 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=481 cat=F run=140 op=VIEW name=Qcur-15 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=482 cat=F run=140 op=PERMUTE name=Qcur-15 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=483 cat=F run=140 op=VIEW name=cache_k_l15 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=484 cat=F run=140 op=PERMUTE name=cache_k_l15 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=485 cat=F run=140 op=VIEW name=cache_v_l15 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=486 cat=F run=140 op=PERMUTE name=cache_v_l15 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=487 cat=F run=140 op=FLASH_ATTN_EXT name=__fattn__-15 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=488 cat=F run=140 op=RESHAPE name=kqv_out-15 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=140 cat=F start=475 end=489 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=489 cat=L run=141 op=MUL_MAT name=attn_out-15 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=141 cat=L start=489 end=490 len=1 ops=MUL_MAT
+[hpx-map] idx=490 cat=F run=142 op=ADD name=ffn_inp-15 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=491 cat=F run=142 op=RMS_NORM name=norm-15 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=142 cat=F start=490 end=492 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=492 cat=L run=143 op=MUL name=ffn_norm-15 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=493 cat=L run=143 op=MUL_MAT name=ffn_gate-15 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=494 cat=L run=143 op=MUL_MAT name=ffn_up-15 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=495 cat=L run=143 op=GLU name=ffn_swiglu-15 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=143 cat=L start=492 end=496 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=496 cat=F run=144 op=MUL_MAT name=ffn_out-15 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=497 cat=F run=144 op=ADD name=l_out-15 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=498 cat=F run=144 op=RMS_NORM name=norm-16 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=144 cat=F start=496 end=499 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=499 cat=L run=145 op=MUL name=attn_norm-16 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=500 cat=L run=145 op=MUL_MAT name=Qcur-16 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=145 cat=L start=499 end=501 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=501 cat=F run=146 op=RESHAPE name=Qcur-16 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=502 cat=F run=146 op=ROPE name=Qcur-16 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=146 cat=F start=501 end=503 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=503 cat=L run=147 op=MUL_MAT name=Vcur-16 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=147 cat=L start=503 end=504 len=1 ops=MUL_MAT
+[hpx-map] idx=504 cat=F run=148 op=RESHAPE name=Vcur-16 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=148 cat=F start=504 end=505 len=1 ops=RESHAPE
+[hpx-map] idx=505 cat=L run=149 op=MUL_MAT name=Kcur-16 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=149 cat=L start=505 end=506 len=1 ops=MUL_MAT
+[hpx-map] idx=506 cat=F run=150 op=RESHAPE name=Kcur-16 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=507 cat=F run=150 op=ROPE name=Kcur-16 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=508 cat=F run=150 op=VIEW name=Kcur-16 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=509 cat=F run=150 op=SET_ROWS name=cache_k_l16 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=510 cat=F run=150 op=VIEW name=Vcur-16 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=511 cat=F run=150 op=SET_ROWS name=cache_v_l16 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=512 cat=F run=150 op=VIEW name=Qcur-16 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=513 cat=F run=150 op=PERMUTE name=Qcur-16 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=514 cat=F run=150 op=VIEW name=cache_k_l16 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=515 cat=F run=150 op=PERMUTE name=cache_k_l16 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=516 cat=F run=150 op=VIEW name=cache_v_l16 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=517 cat=F run=150 op=PERMUTE name=cache_v_l16 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=518 cat=F run=150 op=FLASH_ATTN_EXT name=__fattn__-16 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=519 cat=F run=150 op=RESHAPE name=kqv_out-16 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=150 cat=F start=506 end=520 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=520 cat=L run=151 op=MUL_MAT name=attn_out-16 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=151 cat=L start=520 end=521 len=1 ops=MUL_MAT
+[hpx-map] idx=521 cat=F run=152 op=ADD name=ffn_inp-16 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=522 cat=F run=152 op=RMS_NORM name=norm-16 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=152 cat=F start=521 end=523 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=523 cat=L run=153 op=MUL name=ffn_norm-16 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=524 cat=L run=153 op=MUL_MAT name=ffn_gate-16 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=525 cat=L run=153 op=MUL_MAT name=ffn_up-16 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=526 cat=L run=153 op=GLU name=ffn_swiglu-16 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=527 cat=L run=153 op=MUL_MAT name=ffn_out-16 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=153 cat=L start=523 end=528 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=528 cat=F run=154 op=ADD name=l_out-16 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=529 cat=F run=154 op=RMS_NORM name=norm-17 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=154 cat=F start=528 end=530 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=530 cat=L run=155 op=MUL name=attn_norm-17 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=531 cat=L run=155 op=MUL_MAT name=Qcur-17 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=155 cat=L start=530 end=532 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=532 cat=F run=156 op=RESHAPE name=Qcur-17 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=533 cat=F run=156 op=ROPE name=Qcur-17 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=156 cat=F start=532 end=534 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=534 cat=L run=157 op=MUL_MAT name=Vcur-17 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=157 cat=L start=534 end=535 len=1 ops=MUL_MAT
+[hpx-map] idx=535 cat=F run=158 op=RESHAPE name=Vcur-17 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=158 cat=F start=535 end=536 len=1 ops=RESHAPE
+[hpx-map] idx=536 cat=L run=159 op=MUL_MAT name=Kcur-17 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=159 cat=L start=536 end=537 len=1 ops=MUL_MAT
+[hpx-map] idx=537 cat=F run=160 op=RESHAPE name=Kcur-17 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=538 cat=F run=160 op=ROPE name=Kcur-17 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=539 cat=F run=160 op=VIEW name=Kcur-17 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=540 cat=F run=160 op=SET_ROWS name=cache_k_l17 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=541 cat=F run=160 op=VIEW name=Vcur-17 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=542 cat=F run=160 op=SET_ROWS name=cache_v_l17 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=543 cat=F run=160 op=VIEW name=Qcur-17 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=544 cat=F run=160 op=PERMUTE name=Qcur-17 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=545 cat=F run=160 op=VIEW name=cache_k_l17 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=546 cat=F run=160 op=PERMUTE name=cache_k_l17 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=547 cat=F run=160 op=VIEW name=cache_v_l17 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=548 cat=F run=160 op=PERMUTE name=cache_v_l17 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=549 cat=F run=160 op=FLASH_ATTN_EXT name=__fattn__-17 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=550 cat=F run=160 op=RESHAPE name=kqv_out-17 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=160 cat=F start=537 end=551 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=551 cat=L run=161 op=MUL_MAT name=attn_out-17 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=161 cat=L start=551 end=552 len=1 ops=MUL_MAT
+[hpx-map] idx=552 cat=F run=162 op=ADD name=ffn_inp-17 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=553 cat=F run=162 op=RMS_NORM name=norm-17 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=162 cat=F start=552 end=554 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=554 cat=L run=163 op=MUL name=ffn_norm-17 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=555 cat=L run=163 op=MUL_MAT name=ffn_gate-17 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=556 cat=L run=163 op=MUL_MAT name=ffn_up-17 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=557 cat=L run=163 op=GLU name=ffn_swiglu-17 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=558 cat=L run=163 op=MUL_MAT name=ffn_out-17 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=163 cat=L start=554 end=559 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=559 cat=F run=164 op=ADD name=l_out-17 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=560 cat=F run=164 op=RMS_NORM name=norm-18 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=164 cat=F start=559 end=561 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=561 cat=L run=165 op=MUL name=attn_norm-18 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=562 cat=L run=165 op=MUL_MAT name=Qcur-18 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=165 cat=L start=561 end=563 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=563 cat=F run=166 op=RESHAPE name=Qcur-18 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=564 cat=F run=166 op=ROPE name=Qcur-18 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=565 cat=F run=166 op=MUL_MAT name=Vcur-18 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=566 cat=F run=166 op=RESHAPE name=Vcur-18 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=166 cat=F start=563 end=567 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=567 cat=L run=167 op=MUL_MAT name=Kcur-18 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=167 cat=L start=567 end=568 len=1 ops=MUL_MAT
+[hpx-map] idx=568 cat=F run=168 op=RESHAPE name=Kcur-18 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=569 cat=F run=168 op=ROPE name=Kcur-18 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=570 cat=F run=168 op=VIEW name=Kcur-18 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=571 cat=F run=168 op=SET_ROWS name=cache_k_l18 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=572 cat=F run=168 op=VIEW name=Vcur-18 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=573 cat=F run=168 op=SET_ROWS name=cache_v_l18 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=574 cat=F run=168 op=VIEW name=Qcur-18 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=575 cat=F run=168 op=PERMUTE name=Qcur-18 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=576 cat=F run=168 op=VIEW name=cache_k_l18 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=577 cat=F run=168 op=PERMUTE name=cache_k_l18 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=578 cat=F run=168 op=VIEW name=cache_v_l18 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=579 cat=F run=168 op=PERMUTE name=cache_v_l18 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=580 cat=F run=168 op=FLASH_ATTN_EXT name=__fattn__-18 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=581 cat=F run=168 op=RESHAPE name=kqv_out-18 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=168 cat=F start=568 end=582 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=582 cat=L run=169 op=MUL_MAT name=attn_out-18 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=169 cat=L start=582 end=583 len=1 ops=MUL_MAT
+[hpx-map] idx=583 cat=F run=170 op=ADD name=ffn_inp-18 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=584 cat=F run=170 op=RMS_NORM name=norm-18 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=170 cat=F start=583 end=585 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=585 cat=L run=171 op=MUL name=ffn_norm-18 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=586 cat=L run=171 op=MUL_MAT name=ffn_gate-18 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=587 cat=L run=171 op=MUL_MAT name=ffn_up-18 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=588 cat=L run=171 op=GLU name=ffn_swiglu-18 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=171 cat=L start=585 end=589 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=589 cat=F run=172 op=MUL_MAT name=ffn_out-18 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=590 cat=F run=172 op=ADD name=l_out-18 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=591 cat=F run=172 op=RMS_NORM name=norm-19 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=172 cat=F start=589 end=592 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=592 cat=L run=173 op=MUL name=attn_norm-19 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=593 cat=L run=173 op=MUL_MAT name=Qcur-19 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=173 cat=L start=592 end=594 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=594 cat=F run=174 op=RESHAPE name=Qcur-19 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=595 cat=F run=174 op=ROPE name=Qcur-19 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=174 cat=F start=594 end=596 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=596 cat=L run=175 op=MUL_MAT name=Vcur-19 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=175 cat=L start=596 end=597 len=1 ops=MUL_MAT
+[hpx-map] idx=597 cat=F run=176 op=RESHAPE name=Vcur-19 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=176 cat=F start=597 end=598 len=1 ops=RESHAPE
+[hpx-map] idx=598 cat=L run=177 op=MUL_MAT name=Kcur-19 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=177 cat=L start=598 end=599 len=1 ops=MUL_MAT
+[hpx-map] idx=599 cat=F run=178 op=RESHAPE name=Kcur-19 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=600 cat=F run=178 op=ROPE name=Kcur-19 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=601 cat=F run=178 op=VIEW name=Kcur-19 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=602 cat=F run=178 op=SET_ROWS name=cache_k_l19 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=603 cat=F run=178 op=VIEW name=Vcur-19 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=604 cat=F run=178 op=SET_ROWS name=cache_v_l19 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=605 cat=F run=178 op=VIEW name=Qcur-19 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=606 cat=F run=178 op=PERMUTE name=Qcur-19 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=607 cat=F run=178 op=VIEW name=cache_k_l19 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=608 cat=F run=178 op=PERMUTE name=cache_k_l19 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=609 cat=F run=178 op=VIEW name=cache_v_l19 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=610 cat=F run=178 op=PERMUTE name=cache_v_l19 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=611 cat=F run=178 op=FLASH_ATTN_EXT name=__fattn__-19 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=612 cat=F run=178 op=RESHAPE name=kqv_out-19 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=178 cat=F start=599 end=613 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=613 cat=L run=179 op=MUL_MAT name=attn_out-19 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=179 cat=L start=613 end=614 len=1 ops=MUL_MAT
+[hpx-map] idx=614 cat=F run=180 op=ADD name=ffn_inp-19 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=615 cat=F run=180 op=RMS_NORM name=norm-19 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=180 cat=F start=614 end=616 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=616 cat=L run=181 op=MUL name=ffn_norm-19 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=617 cat=L run=181 op=MUL_MAT name=ffn_gate-19 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=618 cat=L run=181 op=MUL_MAT name=ffn_up-19 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=619 cat=L run=181 op=GLU name=ffn_swiglu-19 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=620 cat=L run=181 op=MUL_MAT name=ffn_out-19 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=181 cat=L start=616 end=621 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=621 cat=F run=182 op=ADD name=l_out-19 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=622 cat=F run=182 op=RMS_NORM name=norm-20 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=182 cat=F start=621 end=623 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=623 cat=L run=183 op=MUL name=attn_norm-20 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=624 cat=L run=183 op=MUL_MAT name=Qcur-20 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=183 cat=L start=623 end=625 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=625 cat=F run=184 op=RESHAPE name=Qcur-20 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=626 cat=F run=184 op=ROPE name=Qcur-20 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=627 cat=F run=184 op=MUL_MAT name=Vcur-20 shape=[256] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=628 cat=F run=184 op=RESHAPE name=Vcur-20 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=184 cat=F start=625 end=629 len=4 ops=RESHAPE,ROPE,MUL_MAT,RESHAPE
+[hpx-map] idx=629 cat=L run=185 op=MUL_MAT name=Kcur-20 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=185 cat=L start=629 end=630 len=1 ops=MUL_MAT
+[hpx-map] idx=630 cat=F run=186 op=RESHAPE name=Kcur-20 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=631 cat=F run=186 op=ROPE name=Kcur-20 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=632 cat=F run=186 op=VIEW name=Kcur-20 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=633 cat=F run=186 op=SET_ROWS name=cache_k_l20 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=634 cat=F run=186 op=VIEW name=Vcur-20 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=635 cat=F run=186 op=SET_ROWS name=cache_v_l20 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=636 cat=F run=186 op=VIEW name=Qcur-20 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=637 cat=F run=186 op=PERMUTE name=Qcur-20 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=638 cat=F run=186 op=VIEW name=cache_k_l20 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=639 cat=F run=186 op=PERMUTE name=cache_k_l20 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=640 cat=F run=186 op=VIEW name=cache_v_l20 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=641 cat=F run=186 op=PERMUTE name=cache_v_l20 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=642 cat=F run=186 op=FLASH_ATTN_EXT name=__fattn__-20 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=643 cat=F run=186 op=RESHAPE name=kqv_out-20 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=186 cat=F start=630 end=644 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=644 cat=L run=187 op=MUL_MAT name=attn_out-20 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=187 cat=L start=644 end=645 len=1 ops=MUL_MAT
+[hpx-map] idx=645 cat=F run=188 op=ADD name=ffn_inp-20 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=646 cat=F run=188 op=RMS_NORM name=norm-20 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=188 cat=F start=645 end=647 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=647 cat=L run=189 op=MUL name=ffn_norm-20 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=648 cat=L run=189 op=MUL_MAT name=ffn_gate-20 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=649 cat=L run=189 op=MUL_MAT name=ffn_up-20 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=650 cat=L run=189 op=GLU name=ffn_swiglu-20 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=189 cat=L start=647 end=651 len=4 ops=MUL,MUL_MAT,MUL_MAT,GLU
+[hpx-map] idx=651 cat=F run=190 op=MUL_MAT name=ffn_out-20 shape=[2048] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map] idx=652 cat=F run=190 op=ADD name=l_out-20 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=653 cat=F run=190 op=RMS_NORM name=norm-21 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=190 cat=F start=651 end=654 len=3 ops=MUL_MAT,ADD,RMS_NORM
+[hpx-map] idx=654 cat=L run=191 op=MUL name=attn_norm-21 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=655 cat=L run=191 op=MUL_MAT name=Qcur-21 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=191 cat=L start=654 end=656 len=2 ops=MUL,MUL_MAT
+[hpx-map] idx=656 cat=F run=192 op=RESHAPE name=Qcur-21 (reshaped) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=657 cat=F run=192 op=ROPE name=Qcur-21 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=192 cat=F start=656 end=658 len=2 ops=RESHAPE,ROPE
+[hpx-map] idx=658 cat=L run=193 op=MUL_MAT name=Vcur-21 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=193 cat=L start=658 end=659 len=1 ops=MUL_MAT
+[hpx-map] idx=659 cat=F run=194 op=RESHAPE name=Vcur-21 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=194 cat=F start=659 end=660 len=1 ops=RESHAPE
+[hpx-map] idx=660 cat=L run=195 op=MUL_MAT name=Kcur-21 shape=[256] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=195 cat=L start=660 end=661 len=1 ops=MUL_MAT
+[hpx-map] idx=661 cat=F run=196 op=RESHAPE name=Kcur-21 (reshaped) shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=662 cat=F run=196 op=ROPE name=Kcur-21 shape=[64,4] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=663 cat=F run=196 op=VIEW name=Kcur-21 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=664 cat=F run=196 op=SET_ROWS name=cache_k_l21 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=665 cat=F run=196 op=VIEW name=Vcur-21 (view) shape=[256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=666 cat=F run=196 op=SET_ROWS name=cache_v_l21 (view) shape=[256,256] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=667 cat=F run=196 op=VIEW name=Qcur-21 (view) shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=668 cat=F run=196 op=PERMUTE name=Qcur-21 (view) (permuted) shape=[64,1,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=669 cat=F run=196 op=VIEW name=cache_k_l21 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=670 cat=F run=196 op=PERMUTE name=cache_k_l21 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=671 cat=F run=196 op=VIEW name=cache_v_l21 (view) shape=[64,4,256] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=672 cat=F run=196 op=PERMUTE name=cache_v_l21 (view) (permuted) shape=[64,256,4] src0=f16 trait=- reason=not_lowerable
+[hpx-map] idx=673 cat=F run=196 op=FLASH_ATTN_EXT name=__fattn__-21 shape=[64,32] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=674 cat=F run=196 op=RESHAPE name=kqv_out-21 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map-run] run=196 cat=F start=661 end=675 len=14 ops=RESHAPE,ROPE,VIEW,SET_ROWS,VIEW,SET_ROWS,VIEW,PERMUTE,...
+[hpx-map] idx=675 cat=L run=197 op=MUL_MAT name=attn_out-21 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=197 cat=L start=675 end=676 len=1 ops=MUL_MAT
+[hpx-map] idx=676 cat=F run=198 op=GET_ROWS name=node_676 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=677 cat=F run=198 op=GET_ROWS name=node_677 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=678 cat=F run=198 op=ADD name=ffn_inp-21 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=679 cat=F run=198 op=RMS_NORM name=norm-21 shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=198 cat=F start=676 end=680 len=4 ops=GET_ROWS,GET_ROWS,ADD,RMS_NORM
+[hpx-map] idx=680 cat=L run=199 op=MUL name=ffn_norm-21 shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map] idx=681 cat=L run=199 op=MUL_MAT name=ffn_gate-21 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=682 cat=L run=199 op=MUL_MAT name=ffn_up-21 shape=[5632] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map] idx=683 cat=L run=199 op=GLU name=ffn_swiglu-21 shape=[5632] src0=f32 trait=- reason=lowered
+[hpx-map] idx=684 cat=L run=199 op=MUL_MAT name=ffn_out-21 shape=[2048] src0=q4_K trait=q4_K_8x8_q8_K reason=lowered
+[hpx-map-run] run=199 cat=L start=680 end=685 len=5 ops=MUL,MUL_MAT,MUL_MAT,GLU,MUL_MAT
+[hpx-map] idx=685 cat=F run=200 op=ADD name=l_out-21 shape=[2048] src0=f32 trait=- reason=not_lowerable
+[hpx-map] idx=686 cat=F run=200 op=RMS_NORM name=norm shape=[2048] src0=f32 trait=- reason=resource_reduction
+[hpx-map-run] run=200 cat=F start=685 end=687 len=2 ops=ADD,RMS_NORM
+[hpx-map] idx=687 cat=L run=201 op=MUL name=result_norm shape=[2048] src0=f32 trait=- reason=lowered
+[hpx-map-run] run=201 cat=L start=687 end=688 len=1 ops=MUL
+[hpx-map] idx=688 cat=F run=202 op=MUL_MAT name=result_output shape=[32000] src0=q6_K trait=repacked reason=not_lowerable
+[hpx-map-run] run=202 cat=F start=688 end=689 len=1 ops=MUL_MAT
+[hpx-map-summary] nodes=689 lowered_nodes=201 fallback_nodes=488 packet_nodes=0 lowered_runs=101 fallback_runs=102 packet_runs=0
+[hpx-selective] lowered=201 fallback=488(102 runs) packet=0(0 nodes) lowered_ms=77.455 fallback_ms=61.933 packet_ms=0.000
+[hpx-selective] lowered=201 fallback=488(102 runs) packet=0(0 nodes) lowered_ms=79.533 fallback_ms=16.663 packet_ms=0.000
+[hpx-selective] lowered=201 fallback=488(102 runs) packet=0(0 nodes) lowered_ms=74.242 fallback_ms=22.893 packet_ms=0.000
+main: decoded 4 tokens in 0.37 s, speed: 10.67 t/s
+
+llama_perf_sampler_print:    samplers time =       0.06 ms /     4 runs
+llama_perf_context_print:        load time =     757.07 ms
+llama_perf_context_print: prompt eval time =      38.56 ms /     6 tokens (    6.43 ms per token,   155.59 tokens per second)
+llama_perf_context_print:        eval time =     335.99 ms /     3 runs   (  112.00 ms per token,     8.93 tokens per second)
+llama_perf_context_print:       total time =    1093.35 ms /     9 tokens
+llama_perf_context_print:    graphs reused =          2
+
+~llama_context:       MTL0 compute buffer size is   0.0000 MiB, matches expectation of   0.0000 MiB
+~llama_context:        CPU compute buffer size is   0.8262 MiB, matches expectation of   0.8262 MiB
+~llama_context:        CPU compute buffer size is   0.0000 MiB, matches expectation of   0.0000 MiB
+ggml_metal_free: deallocating

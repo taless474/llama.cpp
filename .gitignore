@@ -157,3 +157,32 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Out-of-tree build outputs accidentally created in repo
+.build/
+build/
+cmake-build-*/
+
+# Nested CMake / Ninja artifacts accidentally created in source dirs
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Compile database
+/compile_commands.json
+
+# Local-only Claude/session files
+/CLAUDE.local.md
+/local/
+
+# Local models or model symlink
+/models/
+
+# macOS
+.DS_Store
+**/.DS_Store
