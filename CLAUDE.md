@@ -1,27 +1,22 @@
-# Claude Guidance for HPX / llama.cpp Run-Level Work
+# Claude Guidance for HPX / llama.cpp Serving Work
 
 ## Intent
 
-This branch starts fresh from upstream `llama.cpp` and explores an HPX-based orchestration for inference workloads where there is actual concurrency:
-multi-request serving, multiple decode streams, cancellation, scheduling policy, and later possible batching/pipelining.
+This branch explores HPX-based orchestration for llama.cpp inference workloads with real request-level concurrency.
 
+The direction is: HPX serving-level orchestration around opaque llama.cpp work.
 
-The old HPX branch is evidence and reference only. Do not continue the old selective executor design by default.
+Focus on request-level concurrency, context ownership, scheduling policy, cancellation, and later batching / pipelining.
 
-Current priority order:
+The old HPX branch is evidence and reference only. Do not continue the old design by default.
 
-1. Keep the repo clean and reproducible.
-2. Keep HPX installed outside this repo.
-3. Preserve old-branch evidence as reference docs.
-4. Do not implement execution before the design is reviewed.
+## Reading
 
-## First reading
-
-Read this first:
+Read first:
 
 - `local/handoff.md`
 
-Use it only as current session context. Do not treat it as historical truth.
+Use it as current session context. Do not treat it as permanent historical truth.
 
 Do not read broad project history by default.
 
@@ -29,70 +24,90 @@ Do not read broad project history by default.
 
 Use these when relevant:
 
-- `docs/hpx/executor_contract.md`  
-  Durable execution rules and review criteria.
+- `docs/hpx/executor_contract.md`
+- `docs/hpx/benchmark_protocol.md`
+- `docs/hpx/cpu_repack_baseline_notes.md`
+- `docs/hpx/prefill_branch_summary.md`
+- `docs/hpx/selective_graph_map_reference.txt`
+- `docs/hpx/gates.md`
 
-- `docs/hpx/benchmark_protocol.md`  
-  Required protocol before interpreting benchmark comparisons.
+These are evidence and review context. They are not the current implementation plan.
 
-- `docs/hpx/cpu_repack_baseline_notes.md`  
-  Baseline notes for CPU_REPACK, q4_K/q6_K physical layout, and real kernel paths.
+## Source of truth
 
-- `docs/hpx/prefill_branch_summary.md`  
-  Summary of what the previous HPX branch proved and why it was closed.
+Use current code, current git state, and the current handoff as the source of truth.
 
-- `docs/hpx/selective_graph_map_reference.txt`  
-  Raw old-branch graph-map reference.
+Do not use provenance as design truth.
 
-Do not treat old reference docs as implementation instructions. They are evidence.
+Do not treat old docs as implementation instructions unless the handoff explicitly points to them.
 
+## Architecture principles
 
-## Hard invariants
+Prefer serving-level orchestration around opaque llama.cpp execution:
 
-- HPX runtime startup must be process-wide and one-shot.
-- Fail closed to normal llama.cpp / ggml execution.
-- Preserve ggml graph order.
-- Preserve backend assignment.
-- Preserve tensor lifetimes and scratch ownership.
-- Do not compute Metal/CUDA/offloaded nodes on CPU by mistake.
-- Unified memory is not proof of CPU ownership.
-- BLAS and delegated backend work remain opaque.
-- Do not use HPX per tiny decode node.
-- Do not use `hpx::async(...).get()` as a repeated per-node bridge.
-- Do not use historical provenance as design truth.
-
-## Backend-layout rule
-
-Do not assume `tensor->type` fully describes the physical layout.
-
-For quantized tensors, inspect the actual backend path and metadata. Repacked tensors may have:
-
-```cpp
-tensor->extra != nullptr
+```text
+one shared llama_model
+prewarmed llama_context objects
+exclusive llama_context ownership per active request
+normal llama_decode inside each leased context
+backend-owned work remains opaque
 ```
 
-A lowering or classification rule must be explicit about the physical layout/trait it supports. Unsupported layouts must fall back.
+The validated baseline should be simple and understandable before HPX-specific behavior is added.
 
-## Preferred direction
+HPX designs should be HPX-native where appropriate:
 
-- Build and baseline first.
-- Inspect the real ggml/backend path before proposing lowering.
-- Use physical backend paths, not only logical ggml op types.
-- Reduce dispatch fragmentation.
-- Prefer run-level planning over per-node HPX entry.
-- Treat packets as one possible run kind, not the main architecture.
-- Keep backend-owned work opaque.
-- Keep diagnostics env-gated and cold when disabled.
-- Do not add more kernels before proving the path engages and has a plausible route to beating the baseline.
+```text
+async request state machines
+future-based resource pools
+RAII ownership for leased resources
+continuations for readiness
+clear lifecycle boundaries
+```
 
+Avoid designs that merely rename a std::thread worker pool with HPX types unless that is explicitly the experiment being run.
+
+## HPX runtime invariants
+
+- HPX runtime startup must be process-wide and one-shot.
+- The program entry/lifecycle layer owns HPX startup and shutdown.
+- Individual engines must not start or stop HPX.
+- Non-HPX backends must not start HPX.
+- Fail closed when HPX is unavailable or not built.
+- Keep the HPX runtime API narrow.
+- Keep runtime diagnostics and lifecycle traces env-gated unless they are errors.
+
+## Serving correctness invariants
+
+- Preserve exclusive access to each `llama_context`.
+- Do not run concurrent `llama_decode` calls on the same context.
+- Reset per-request context state deliberately.
+- Use the same tokenization path for fit checks and real request execution.
+- Keep timing semantics explicit; queue wait should not be accidentally excluded.
+- Treat generated-token hashes or equivalent fingerprints as correctness signals, not performance metrics.
+- Do not make performance claims before correctness and lifecycle gates pass.
+
+## Preferred working style
+
+- Define the problem first.
+- Define contracts before implementation.
+- Define acceptance gates before `.cpp` work.
+- Implement in small slices.
+- After each slice, run only the relevant checks.
+- Stop on the first correctness failure and fix the narrowest cause.
+- Keep build, test, and result claims separate.
+- Do not interpret smoke tests as performance evidence.
 
 ## Layout
 
-Builds should stay outside this repo. External build path examples:
+Builds stay outside this repo.
+
+Example build paths:
 
 ```text
 /Users/unick/Desktop/hpx/builds/llama-base
 /Users/unick/Desktop/hpx/builds/llama-hpx
+/Users/unick/Desktop/hpx/builds/llama-hpx-hpx-on
 ```
 
 External HPX paths:
@@ -113,7 +128,7 @@ Models stay outside the repo:
 
 Do not write outputs to `/tmp`.
 
-For committed or shareable benchmark evidence, use a clear repo path such as:
+For committed or shareable benchmark evidence, use:
 
 ```text
 hpx-bench/results/<date>-<slug>/
@@ -125,3 +140,4 @@ For local-only notes, use:
 local/
 ```
 
+Correctness/lifecycle checks do not need benchmark result directories unless explicitly requested.

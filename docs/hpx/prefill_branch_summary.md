@@ -1031,3 +1031,30 @@ only as data; everything else builds on that.
 
 These are the targets the run-level executor's first measurable
 phase must move.
+
+
+## Lessons for future ggml / run-level work
+
+These notes are historical lessons from the prefill / run-level branch. They are not the default direction for the current serving-bench work.
+
+If a future milestone explicitly returns to ggml, backend scheduling, graph execution, lowering, packets, or run-level analysis, preserve these constraints:
+
+- Preserve ggml graph order.
+- Preserve backend assignment.
+- Preserve tensor lifetimes and scratch ownership.
+- Do not compute Metal/CUDA/offloaded nodes on CPU by mistake.
+- Unified memory is not proof of CPU ownership.
+- BLAS and delegated backend work remain opaque.
+- Do not use HPX per tiny decode node.
+- Do not use `hpx::async(...).get()` as a repeated per-node bridge.
+
+### Backend-layout lesson
+
+Do not assume `tensor->type` fully describes physical layout.
+
+For quantized tensors, inspect the actual backend path and metadata. Repacked tensors may have:
+
+```cpp
+tensor->extra != nullptr
+```
+A lowering or classification rule must be explicit about the physical layout or trait it supports. Unsupported layouts must fall back.

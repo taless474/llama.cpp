@@ -351,4 +351,439 @@ Do not:
 - add an HPX-backed ggml threadpool for v1
 - claim speedup from smoke tests
 - compare against llama-server before the std-vs-HPX harness exists
-- write result artifacts to `/tmp`
+
+## 2. tools: add HPX-native serving backend and gates
+
+This commit turns the serving-bench direction from a stub and plan into a working controlled experiment.
+
+The first commit established the new question:
+
+```text
+Can HPX improve serving-level orchestration for concurrent CPU inference requests?
+```
+
+This commit implements enough of the harness to ask that question honestly:
+
+```text
+std backend
+vs.
+HPX-native backend
+```
+
+Both backends run the same opaque llama.cpp decode path. HPX does not enter ggml, lower ops, rewrite kernels, or touch `src/llama-context.cpp`. The comparison stays at the serving-orchestration layer.
+
+### What changed
+
+The serving benchmark now has a real backend interface and two backend implementations:
+
+```text
+--backend std
+--backend hpx
+```
+
+The std backend is the control group. It uses a simple worker-pool shape:
+
+```text
+one shared llama_model
+N prewarmed llama_context objects
+one std worker per context
+mutex / condition-variable queue
+normal llama_decode inside each context
+```
+
+The HPX backend is intentionally not a std worker-pool clone. After rejecting the conservative "one HPX worker per context" design, the HPX implementation uses an HPX-native orchestration shape:
+
+```text
+request as HPX async/continuation chain
+future-based hpx_context_pool
+exclusive llama_context lease
+RAII context_guard release
+normal llama_decode inside the leased context
+```
+
+This keeps the experiment focused:
+
+```text
+same model
+same prompt
+same context count
+same llama_decode path
+same greedy argmax
+same generated-token hash
+different orchestration runtime
+```
+
+### Backend selection and correctness surface
+
+The harness now exposes backend selection explicitly:
+
+```text
+--backend std
+--backend hpx
+```
+
+The default backend is `std`.
+
+The harness also gained the pieces needed to prevent misleading runs:
+
+- `--ctx-size`
+- `--batch-size`
+- prompt-token fit check before request submission
+- clean unknown-backend error
+- clean HPX-OFF stub error
+- `generated_token_hash` for structural correctness
+- request-index tracing for HPX acquire/release checks
+
+The HPX-OFF path is deliberately safe. In a build without HPX support, asking for `--backend hpx` exits before model load or request submission:
+
+```text
+[serving-bench] HPX backend not built (LLAMA_SERVING_BENCH_HPX=OFF)
+```
+
+This means the benchmark can distinguish:
+
+```text
+invalid backend name
+vs.
+valid backend name unavailable in this build
+vs.
+real HPX backend
+```
+
+### HPX runtime lifecycle
+
+HPX runtime ownership was placed at the program lifecycle layer, not inside the engine.
+
+The narrow runtime API is:
+
+```cpp
+bool hpx_runtime_start_once(int32_t os_threads);
+void hpx_runtime_stop();
+```
+
+Important invariants:
+
+```text
+--backend std does not start HPX
+--backend hpx starts HPX before make_engine_hpx()
+engine_hpx does not start or stop HPX
+HPX stops after engine cleanup and llama_backend_free()
+```
+
+Lifecycle tracing is env-gated through:
+
+```text
+LLAMA_SERVING_BENCH_HPX_TRACE=1
+```
+
+This made it possible to verify that enabling HPX support does not perturb the std backend.
+
+### HPX-native engine design
+
+The HPX backend was built in slices.
+
+First, `engine_hpx` became real but only supported the empty-generation path. That proved:
+
+```text
+HPX runtime starts
+make_engine_hpx returns a real engine
+engine_hpx loads model and creates contexts
+max_tokens=0 completes through the HPX path
+HPX runtime stops
+```
+
+Then the placeholder pool became a real HPX-native context pool:
+
+```text
+acquire() returns hpx::future<llama_context *>
+available context -> ready future
+no context available -> enqueue hpx::promise waiter
+release(ctx) wakes one waiter or returns ctx to available pool
+close() rejects future acquires and resolves queued waiters
+```
+
+A move-only `context_guard` releases the leased context on normal and error paths.
+
+This is the key design decision of the commit: the HPX backend does not use permanent context-bound workers. Waiting for a context is represented as future readiness, not a blocked OS thread.
+
+### Real HPX decode
+
+After the pool and guard were validated, the intentional placeholder:
+
+```text
+hpx decode not implemented yet
+```
+
+was replaced with real decode.
+
+The HPX decode path matches the std decode behavior on the important structural points:
+
+```text
+llama_memory_clear(llama_get_memory(ctx), false)
+same tokenization helper and retry behavior
+same prompt prefill batch
+same decode loop condition
+same llama_decode handling
+same llama_synchronize call
+same logits access through llama_get_logits_ith(ctx, -1)
+same greedy argmax
+same EOG handling
+same token-hash fold order
+same empty-hash rule
+same TTFT timing semantics
+```
+
+The result is that HPX changes request orchestration, not the token stream.
+
+### Correctness gates
+
+The project now has HPX-ON acceptance gates documented separately in:
+
+```text
+docs/hpx/gates.md
+```
+
+The relevant gates passed:
+
+```text
+Gate 1: HPX-ON build/link
+Gate 2: std path regression in HPX-capable build
+Gate 3: HPX smoke
+Gate 4: std vs HPX hash equality
+Gate 5: empty-generation path
+Gate 6: HPX repeat stability
+Gate 7: two-context HPX smoke
+Gate 9: pool queueing under real decode
+```
+
+OFF Tests 1-7 also passed after the HPX implementation.
+
+The most important correctness result is Gate 4:
+
+```text
+std hash == hpx hash == 0x833045f1e2ebf49f
+```
+
+That result says the HPX backend produced the same generated token stream as the std backend for the canonical TinyLlama smoke.
+
+### Pinned correctness values
+
+Canonical model:
+
+```text
+/Users/unick/Desktop/hpx/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+```
+
+Canonical prompt:
+
+```text
+Hello, my name is
+```
+
+Pinned hashes:
+
+```text
+max_tokens=16:
+  generated_token_hash=0x833045f1e2ebf49f
+
+max_tokens=0:
+  generated_token_hash=0x0000000000000000
+
+max_tokens=32:
+  generated_token_hash=0x6794e47fe0f84af1
+```
+
+These hashes are correctness signals. They are not quality or performance metrics.
+
+### First sanity benchmark
+
+After correctness gates passed, a small local std-vs-HPX sanity benchmark was run.
+
+Matrix:
+
+```text
+A: 1 context / 1 concurrent / 8 requests / 16 tokens
+B: 2 contexts / 2 concurrent / 16 requests / 16 tokens
+C: 1 context / 4 concurrent / 16 requests / 16 tokens
+Backends: std, hpx
+Repeats: 1 per cell
+```
+
+Result files:
+
+```text
+local/bench_small/{A,B,C}_{std,hpx}.{stdout,stderr}
+```
+
+All six runs completed with:
+
+```text
+n_error=0
+n_cancelled=0
+canonical hash counts matched expectations
+```
+
+First-pass aggregate tokens/sec:
+
+```text
+A_std: 58.87
+A_hpx: 72.61
+
+B_std: 118.56
+B_hpx: 123.69
+
+C_std: 65.70
+C_hpx: 74.31
+```
+
+These numbers were useful only as a narrow sanity check: HPX showed no obvious overhead in that tiny single-shot matrix. They were not final performance evidence.
+
+### Repeatable benchmark protocol and result
+
+A repeatable local benchmark protocol was then prepared and run.
+
+Protocol file:
+
+```text
+local/bench_protocol_repeat.md
+```
+
+Matrix:
+
+```text
+A: 1 context / 1 concurrent / 8 requests / 16 tokens
+B: 2 contexts / 2 concurrent / 16 requests / 16 tokens
+C: 1 context / 4 concurrent / 16 requests / 16 tokens
+Backends: std, hpx
+Repeats: 5 per cell
+Total runs: 30
+```
+
+Run order alternated std and HPX within each shape:
+
+```text
+A_std_r1, A_hpx_r1, A_std_r2, A_hpx_r2, ...
+then B
+then C
+```
+
+Output directory:
+
+```text
+local/bench_repeat/
+```
+
+The repeated benchmark completed with:
+
+```text
+30 stdout files
+30 stderr files
+all runs: n_cancelled=0
+all runs: n_error=0
+all A runs: canonical hash count = 8
+all B runs: canonical hash count = 16
+all C runs: canonical hash count = 16
+git_status_pre.txt == git_status_post.txt
+```
+
+Five-repeat summary, mean ± sample standard deviation:
+
+| Shape | Backend | wall s | agg tok/s | TTFT p95 ms | total p95 ms |
+|---|---|---:|---:|---:|---:|
+| A | std | 1.311 ± 0.165 | 98.90 ± 12.24 | 38.82 ± 8.24 | 251.63 ± 92.95 |
+| A | hpx | 1.231 ± 0.114 | 104.64 ± 9.17 | 66.87 ± 63.11 | 205.95 ± 63.76 |
+| B | std | 1.831 ± 0.024 | 139.85 ± 1.84 | 40.70 ± 3.69 | 245.67 ± 11.48 |
+| B | hpx | 1.967 ± 0.065 | 130.29 ± 4.11 | 57.08 ± 13.79 | 340.28 ± 68.92 |
+| C | std | 2.501 ± 0.169 | 102.78 ± 7.44 | 660.82 ± 134.34 | 780.95 ± 135.65 |
+| C | hpx | 2.448 ± 0.274 | 105.57 ± 11.07 | 614.39 ± 227.68 | 737.63 ± 231.87 |
+
+The repeated benchmark changed the interpretation from the single-shot sanity run.
+
+Observed in this local matrix:
+
+```text
+A: HPX had slightly higher mean aggregate throughput than std, but both paths had noisy outliers.
+B: std had higher mean aggregate throughput and tighter p95 total latency than HPX.
+C: HPX and std were close on mean aggregate throughput; both paths showed high queueing-tail variability.
+```
+
+So the result is useful but mixed. It supports correctness and plausibility. It does not support a broad speedup claim.
+
+No final performance claim exists yet.
+
+### What this commit proves
+
+This commit proves that the branch has crossed the first real threshold:
+
+```text
+Both std and HPX backends exist.
+Both run real llama.cpp decode.
+HPX uses a native async context-pool design.
+HPX preserves the std token stream for the canonical smoke.
+HPX handles concurrent contexts and queued requests correctly in the tested matrix.
+The repeated local benchmark completed without errors, cancellations, or hash drift.
+```
+
+This is enough to justify moving from implementation correctness into broader benchmark design.
+
+It does not prove:
+
+```text
+HPX is faster than std.
+HPX is better than llama-server.
+The pool-of-contexts design beats upstream continuous batching.
+The current thread-count formula is optimal.
+TinyLlama short-decode behavior predicts larger-model or longer-decode behavior.
+```
+
+Those questions require broader workload matrices.
+
+### What changed in the story
+
+The branch no longer has only a plan for a std backend and a planned HPX backend.
+
+It now has a working controlled harness:
+
+```text
+std backend: simple baseline
+HPX backend: HPX-native async orchestration
+correctness gates: green
+first sanity benchmark: complete
+repeat benchmark protocol: complete
+repeat benchmark result: correct but mixed
+```
+
+The story has moved from:
+
+```text
+Can we build the harness?
+```
+
+to:
+
+```text
+The harness is correct. The first repeated benchmark is mixed. What workload shapes should we test next?
+```
+
+### Current useful evidence standard
+
+Useful evidence now requires:
+
+- correctness gates green
+- same model and prompt
+- same request shape
+- same build
+- canonical hash count verified for every run
+- multiple repeats before interpreting performance
+- working tree status stable during a benchmark matrix
+- outputs saved under `local/` for exploratory work or under `hpx-bench/results/<date>-<slug>/` for shareable benchmark evidence
+
+Still not useful as final evidence:
+
+- one run per cell
+- any run with `n_error > 0`
+- any run with `n_cancelled > 0`
+- any run with wrong hash count
+- interpreting smoke tests as benchmark results
+- comparing runs after source changes between std and HPX
+- making broad speedup claims from this TinyLlama / short-decode matrix

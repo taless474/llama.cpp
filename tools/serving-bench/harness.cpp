@@ -57,6 +57,9 @@ void print_usage(FILE * out) {
         "      --n-requests N       total requests (default 1)\n"
         "  -n, --max-tokens N       max generated tokens (default 64)\n"
         "      --n-threads N        per-context kernel threads (0=auto)\n"
+        "      --ctx-size N         per-context KV size in tokens (default 2048)\n"
+        "      --batch-size N       per-context logical batch size (default 512)\n"
+        "      --backend NAME       engine backend: std | hpx (default std)\n"
         "      --seed-base N        RNG seed base (default 1234)\n"
         "  -h, --help               show this message and exit\n");
 }
@@ -131,6 +134,9 @@ parse_result parse_cli(int argc, char ** argv, harness_config & out) {
     out.n_requests        = 1;
     out.max_tokens        = 64;
     out.n_threads_per_ctx = 0;
+    out.ctx_size          = 2048;
+    out.batch_size        = 512;
+    out.backend           = "std";
     out.seed_base         = 1234;
 
     auto need = [&](int & idx) -> const char * {
@@ -167,6 +173,30 @@ parse_result parse_cli(int argc, char ** argv, harness_config & out) {
         } else if (a == "--n-threads") {
             const char * v = need(i); if (!v) return parse_result::error;
             out.n_threads_per_ctx = std::atoi(v);
+        } else if (a == "--ctx-size") {
+            const char * v = need(i); if (!v) return parse_result::error;
+            out.ctx_size = std::atoi(v);
+            if (out.ctx_size <= 0) {
+                std::fprintf(stderr, "--ctx-size must be > 0 (got %d)\n", out.ctx_size);
+                return parse_result::error;
+            }
+        } else if (a == "--batch-size") {
+            const char * v = need(i); if (!v) return parse_result::error;
+            out.batch_size = std::atoi(v);
+            if (out.batch_size <= 0) {
+                std::fprintf(stderr, "--batch-size must be > 0 (got %d)\n", out.batch_size);
+                return parse_result::error;
+            }
+        } else if (a == "--backend") {
+            const char * v = need(i); if (!v) return parse_result::error;
+            const std::string s = v;
+            if (s != "std" && s != "hpx") {
+                std::fprintf(stderr,
+                             "--backend must be one of: std, hpx (got \"%s\")\n",
+                             s.c_str());
+                return parse_result::error;
+            }
+            out.backend = s;
         } else if (a == "--seed-base") {
             const char * v = need(i); if (!v) return parse_result::error;
             out.seed_base = static_cast<uint32_t>(std::atoll(v));
@@ -189,6 +219,9 @@ void print_config(FILE * out, const harness_config & c) {
     std::fprintf(out, "  max_tokens         = %d\n", c.max_tokens);
     std::fprintf(out, "  n_threads_per_ctx  = %d%s\n",
         c.n_threads_per_ctx, c.n_threads_per_ctx == 0 ? " (auto)" : "");
+    std::fprintf(out, "  ctx_size           = %d\n", c.ctx_size);
+    std::fprintf(out, "  batch_size         = %d\n", c.batch_size);
+    std::fprintf(out, "  backend            = %s\n", c.backend.c_str());
     std::fprintf(out, "  seed_base          = %u\n", c.seed_base);
 }
 
