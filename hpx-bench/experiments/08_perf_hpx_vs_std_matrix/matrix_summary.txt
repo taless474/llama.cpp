@@ -1,0 +1,112 @@
+# matrix summary (cross-cell HPX-vs-std performance matrix)
+# machine-readable header (KEY: VALUE); ends at '# END HEADER'
+cell.A_1x1.present: true
+cell.A_1x1.correctness_overall: PASS
+cell.A_1x1.correctness_trace_on.std: PASS
+cell.A_1x1.correctness_trace_on.hpx: PASS
+cell.A_1x1.timing_trace_off.std: PASS
+cell.A_1x1.timing_trace_off.hpx: PASS
+cell.B_2x2.present: true
+cell.B_2x2.correctness_overall: PASS
+cell.B_2x2.correctness_trace_on.std: PASS
+cell.B_2x2.correctness_trace_on.hpx: PASS
+cell.B_2x2.timing_trace_off.std: PASS
+cell.B_2x2.timing_trace_off.hpx: PASS
+cell.C_2x4.present: true
+cell.C_2x4.correctness_overall: PASS
+cell.C_2x4.correctness_trace_on.std: PASS
+cell.C_2x4.correctness_trace_on.hpx: PASS
+cell.C_2x4.timing_trace_off.std: PASS
+cell.C_2x4.timing_trace_off.hpx: PASS
+cell.D_4x4.present: true
+cell.D_4x4.correctness_overall: PASS
+cell.D_4x4.correctness_trace_on.std: PASS
+cell.D_4x4.correctness_trace_on.hpx: PASS
+cell.D_4x4.timing_trace_off.std: PASS
+cell.D_4x4.timing_trace_off.hpx: PASS
+MATRIX_OVERALL_CORRECTNESS: PASS
+# END HEADER
+
+=== HPX-vs-std performance matrix — cross-cell summary ===
+
+--- correctness gate by cell ---
+| cell  | n_ctx | n_conc | n_req | c_std | c_hpx | t_std | t_hpx | OVERALL |
+| A_1x1 |     1 |      1 |     6 | PASS  | PASS  | PASS  | PASS  | PASS    |
+| B_2x2 |     2 |      2 |     8 | PASS  | PASS  | PASS  | PASS  | PASS    |
+| C_2x4 |     2 |      4 |    12 | PASS  | PASS  | PASS  | PASS  | PASS    |
+| D_4x4 |     4 |      4 |    16 | PASS  | PASS  | PASS  | PASS  | PASS    |
+
+MATRIX_OVERALL_CORRECTNESS: PASS
+
+--- total_ms (view: pool; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   |  174.075ms       |  174.210ms       |   +0.136ms       |  +0.08% |  0.0453 |  0.1318 |
+| B_2x2 |     2 |      2 |     8 | yes   |  234.417ms       |  244.556ms       |  +10.140ms       |  +4.33% |  0.0978 |  0.1357 |
+| C_2x4 |     2 |      4 |    12 | yes   |  475.062ms       |  511.560ms       |  +36.498ms       |  +7.68% |  0.2178 |  0.2366 |
+| D_4x4 |     4 |      4 |    16 | yes   | 1217.710ms       | 1200.312ms       |  -17.398ms       |  -1.43% |  0.3819 |  0.3747 |
+
+--- ttft_ms (view: pool; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   |   27.372ms       |   27.610ms       |   +0.238ms       |  +0.87% |  0.1788 |  0.1804 |
+| B_2x2 |     2 |      2 |     8 | yes   |   39.847ms       |   41.182ms       |   +1.335ms       |  +3.35% |  0.2917 |  0.0825 |
+| C_2x4 |     2 |      4 |    12 | yes   |  275.767ms       |  295.075ms       |  +19.308ms       |  +7.00% |  0.3750 |  0.3846 |
+| D_4x4 |     4 |      4 |    16 | yes   |  391.589ms       |  410.622ms       |  +19.033ms       |  +4.86% |  0.7492 |  0.7571 |
+
+--- total_minus_ttft_ms (view: pool; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   |  146.083ms       |  146.170ms       |   +0.086ms       |  +0.06% |  0.0359 |  0.1534 |
+| B_2x2 |     2 |      2 |     8 | yes   |  195.235ms       |  203.228ms       |   +7.993ms       |  +4.09% |  0.0924 |  0.1594 |
+| C_2x4 |     2 |      4 |    12 | yes   |  200.026ms       |  213.831ms       |  +13.804ms       |  +6.90% |  0.0641 |  0.1327 |
+| D_4x4 |     4 |      4 |    16 | yes   |  740.449ms       |  705.610ms       |  -34.839ms       |  -4.71% |  0.4077 |  0.3721 |
+
+--- tokens_per_second (view: pool; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   |   91.914tps      |   91.843tps      |   -0.071tps      |  -0.08% |  0.0344 |  0.0717 |
+| B_2x2 |     2 |      2 |     8 | yes   |   68.255tps      |   65.425tps      |   -2.830tps      |  -4.15% |  0.0776 |  0.0967 |
+| C_2x4 |     2 |      4 |    12 | yes   |   33.680tps      |   31.277tps      |   -2.403tps      |  -7.13% |  0.3471 |  0.3701 |
+| D_4x4 |     4 |      4 |    16 | yes   |   13.139tps      |   13.330tps      |   +0.190tps      |  +1.45% |  0.4498 |  0.4058 |
+
+--- process_wall_ms (view: per_trial; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   | 1333.215ms       | 1350.292ms       |  +17.077ms       |  +1.28% |  0.0225 |  0.0413 |
+| B_2x2 |     2 |      2 |     8 | yes   | 1263.887ms       | 1335.703ms       |  +71.817ms       |  +5.68% |  0.0507 |  0.0602 |
+| C_2x4 |     2 |      4 |    12 | yes   | 1794.560ms       | 1906.228ms       | +111.668ms       |  +6.22% |  0.0192 |  0.0475 |
+| D_4x4 |     4 |      4 |    16 | yes   | 5296.890ms       | 5487.855ms       | +190.965ms       |  +3.61% |  0.0785 |  0.0576 |
+
+--- agg_tok_s (view: per_trial; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   |   91.280tps      |   91.035tps      |   -0.245tps      |  -0.27% |  0.0241 |  0.0462 |
+| B_2x2 |     2 |      2 |     8 | yes   |  135.175tps      |  129.120tps      |   -6.055tps      |  -4.48% |  0.0610 |  0.0695 |
+| C_2x4 |     2 |      4 |    12 | yes   |  131.150tps      |  123.860tps      |   -7.290tps      |  -5.56% |  0.0216 |  0.0471 |
+| D_4x4 |     4 |      4 |    16 | yes   |   51.620tps      |   50.425tps      |   -1.195tps      |  -2.31% |  0.0734 |  0.0566 |
+
+--- per-trial median total_ms (view: per_trial; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   |  173.911ms       |  174.211ms       |   +0.299ms       |  +0.17% |  0.0109 |  0.0070 |
+| B_2x2 |     2 |      2 |     8 | yes   |  235.590ms       |  245.694ms       |  +10.104ms       |  +4.29% |  0.0465 |  0.0429 |
+| C_2x4 |     2 |      4 |    12 | yes   |  473.611ms       |  503.477ms       |  +29.866ms       |  +6.31% |  0.0204 |  0.0336 |
+| D_4x4 |     4 |      4 |    16 | yes   | 1208.389ms       | 1167.415ms       |  -40.974ms       |  -3.39% |  0.1114 |  0.1018 |
+
+--- per-trial median tmt_ms (view: per_trial; std vs hpx; Δ on median) ---
+| cell  | n_ctx | n_conc | n_req | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+| A_1x1 |     1 |      1 |     6 | yes   |  146.123ms       |  146.202ms       |   +0.079ms       |  +0.05% |  0.0084 |  0.0066 |
+| B_2x2 |     2 |      2 |     8 | yes   |  194.941ms       |  203.878ms       |   +8.937ms       |  +4.58% |  0.0469 |  0.0434 |
+| C_2x4 |     2 |      4 |    12 | yes   |  199.108ms       |  213.030ms       |  +13.923ms       |  +6.99% |  0.0269 |  0.0303 |
+| D_4x4 |     4 |      4 |    16 | yes   |  729.006ms       |  703.492ms       |  -25.514ms       |  -3.50% |  0.1289 |  0.0996 |
+
+--- caveats ---
+- The matrix OVERALL gate is correctness for all four cells. Timing
+  numbers above are descriptive and do not gate anything.
+- Cross-cell deltas (e.g. C is slower than B) reflect oversubscription
+  shape, not anything HPX-vs-std. Only within-cell std-vs-hpx deltas
+  speak to the protocol's question.
+- Δ % is (hpx_median - std_median) / std_median * 100. Sub-1% deltas
+  inside the CV band are not interpretable as 'different'.
+- Timing rows for cells whose correctness is FAIL or MISSING are
+  shown as '<suppressed>' to keep readers from interpreting timing
+  over an uncertain correctness state.
+- This protocol measures the HPX-vs-std overhead of THIS serving-bench
+  harness on THIS machine, with THIS build, THIS model, THIS prompt,
+  THIS generation length. It is not a measurement of llama.cpp
+  performance, not a measurement of HPX scheduler quality in general,
+  and not a recommendation for or against either backend.

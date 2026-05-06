@@ -1,0 +1,45 @@
+=== Aligned comparison summary: llama-server vs llama-serving-bench std ===
+
+server n_threads (parsed from server_start.stderr): 4
+bench  n_threads_per_ctx (parsed from bench.stderr): 4
+expected n_threads on both sides:                   4
+
+--- token-hash parity ---
+server measured hashes (n_distinct=1): 0x833045f1e2ebf49f
+bench  measured hashes (n_distinct=1): 0x833045f1e2ebf49f
+server warmup hash: 0x833045f1e2ebf49f
+bench  warmup hash: 0x833045f1e2ebf49f
+canonical bench hash: 0x833045f1e2ebf49f
+
+--- interval-aligned table (descriptive, not a gate) ---
+interval pair under comparison: llama-server timings.predicted_ms vs llama-serving-bench std (total_ms - ttft_ms)
+server timings.predicted_ms (measured, n=5):  n=5 min=145.454ms max=146.543ms mean=146.076ms median=146.007ms stdev_pop=0.411ms
+bench  total_ms - ttft_ms   (measured, n=5):  n=5 min=145.329ms max=146.247ms mean=145.736ms median=145.816ms stdev_pop=0.322ms
+
+--- informational outer-wall (not a gate, scope §4.4) ---
+server  sum of 5 measured client wall_ms: 861.871 ms
+bench   process_wall_ms (line 1 of process_wall_ms.txt): 1320.214
+
+--- checks ---
+[PASS] G6a server per-binary OVERALL: PASS
+[PASS] G6b bench per-binary OVERALL: PASS
+[PASS] G1a server stderr declares n_threads = 4
+[PASS] G1b bench  stderr declares n_threads_per_ctx = 4
+[PASS] G1c thread parity (server == bench)
+[PASS] G4a server csv has token_id_count and token_id_hash columns
+[PASS] G4b bench csv has total_minus_ttft_ms column
+[PASS] G2a server measured token_id_hash all identical (n_distinct == 1)
+[PASS] G2b bench measured generated_token_hash all identical (n_distinct == 1)
+[PASS] G2c server measured hash == bench measured hash
+[PASS] G2d measured hash equals canonical 0x833045f1e2ebf49f
+[PASS] G2e server measured token_id_count == 16 on all 5 rows
+[PASS] G3 warmup hash parity (server warmup == bench warmup)
+[PASS] G5 README.md declares the interval pair verbatim
+
+OVERALL: PASS
+
+--- scope ---
+This summary is the cross-binary leg of the aligned comparison run.
+Per-binary gates live in comparison_aligned/server/summary.txt and
+comparison_aligned/bench/summary.txt; G6 above asserts both PASS.
+No HPX. No concurrency. n=5 measured. Descriptive only.

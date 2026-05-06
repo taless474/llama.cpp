@@ -1,6 +1,6 @@
 # HPX serving-bench provenance
 
-## 1. Initial commit, add HPX serving-bench direction and docs
+## 1. Add HPX serving-bench direction and docs
 
 This branch starts fresh from upstream `llama.cpp`.
 
@@ -352,17 +352,17 @@ Do not:
 - claim speedup from smoke tests
 - compare against llama-server before the std-vs-HPX harness exists
 
-## 2. tools: add HPX-native serving backend and gates
+## 2. Tools: add HPX-native serving backend and gates
 
-This commit turns the serving-bench direction from a stub and plan into a working controlled experiment.
+This section turns the serving-bench direction from a stub and plan into a working controlled experiment.
 
-The first commit established the new question:
+The first section established the new question:
 
 ```text
 Can HPX improve serving-level orchestration for concurrent CPU inference requests?
 ```
 
-This commit implements enough of the harness to ask that question honestly:
+This section implements enough of the harness to ask that question honestly:
 
 ```text
 std backend
@@ -504,7 +504,7 @@ close() rejects future acquires and resolves queued waiters
 
 A move-only `context_guard` releases the leased context on normal and error paths.
 
-This is the key design decision of the commit: the HPX backend does not use permanent context-bound workers. Waiting for a context is represented as future readiness, not a blocked OS thread.
+This is the key design decision of the section: the HPX backend does not use permanent context-bound workers. Waiting for a context is represented as future readiness, not a blocked OS thread.
 
 ### Real HPX decode
 
@@ -711,9 +711,9 @@ So the result is useful but mixed. It supports correctness and plausibility. It 
 
 No final performance claim exists yet.
 
-### What this commit proves
+### What this section proves
 
-This commit proves that the branch has crossed the first real threshold:
+This section proves that the branch has crossed the first real threshold:
 
 ```text
 Both std and HPX backends exist.
@@ -787,3 +787,403 @@ Still not useful as final evidence:
 - interpreting smoke tests as benchmark results
 - comparing runs after source changes between std and HPX
 - making broad speedup claims from this TinyLlama / short-decode matrix
+
+## 3. bench: package HPX serving-bench evidence
+
+This section packages the benchmark evidence produced after the HPX serving backend became functional.
+
+The previous section made the controlled serving harness real:
+
+```text
+std backend
+vs.
+HPX-native backend
+```
+
+with both backends running the same opaque llama.cpp decode path and preserving the same generated-token stream for the pinned TinyLlama smoke.
+
+This section is about packaging and interpretation. It does not introduce a new speedup claim.
+
+The central result is:
+
+```text
+HPX serving orchestration is correct and robust in the tested shapes.
+HPX does not show a reliable performance win in the fixed-shape CPU TinyLlama serving-bench harness.
+The measured overhead is small, real, and configuration-dependent.
+```
+
+### What changed
+
+This section adds a curated benchmark evidence package under:
+
+```text
+hpx-bench/
+```
+
+It keeps:
+
+```text
+protocol docs
+helper scripts
+deterministic schedules
+compact summaries
+final result snapshots
+```
+
+The package is organized chronologically under:
+
+```text
+hpx-bench/experiments/
+```
+
+The project-level result reports live under:
+
+```text
+docs/hpx/
+```
+
+### Packaged experiment chain
+
+The packaged experiment chain now records the evidence path from server baseline to HPX performance interpretation.
+
+The main packaged steps are:
+
+```text
+server repeatability and timing baselines
+serving-bench std timing baseline
+aligned llama-server vs serving-bench comparison
+HPX-vs-std single-context correctness
+HPX 2-context concurrency correctness
+HPX waiter-pressure correctness
+full HPX-vs-std performance matrix
+C_2x4 n_threads sensitivity sweep
+heterogeneous-budget design checkpoint
+```
+
+The heterogeneous-budget workload is only a design checkpoint at this stage. It is not performance evidence yet.
+
+### Full HPX-vs-std performance matrix
+
+A benchmark-grade HPX-vs-std matrix was designed and summarized.
+
+Matrix:
+
+```text
+A_1x1: n_contexts=1, n_concurrent=1, n_requests=6
+B_2x2: n_contexts=2, n_concurrent=2, n_requests=8
+C_2x4: n_contexts=2, n_concurrent=4, n_requests=12
+D_4x4: n_contexts=4, n_concurrent=4, n_requests=16
+```
+
+Common settings:
+
+```text
+model:      tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+prompt:     "Hello, my name is"
+max_tokens: 16
+ctx_size:   2048
+batch_size: 512
+n_threads:  4
+seed_base:  1234
+```
+
+Protocol:
+
+```text
+two layers:
+  correctness_trace_on
+  timing_trace_off
+
+two backends:
+  std
+  hpx
+
+K = 31 process-level trials per backend per cell per layer
+trial 0 correctness-checked but excluded from timing aggregation
+
+total:
+  4 cells × 2 layers × 2 backends × 31 trials = 496 invocations
+```
+
+Correctness result:
+
+```text
+MATRIX_OVERALL_CORRECTNESS: PASS
+16 / 16 layer summaries: PASS
+4 / 4 condition summaries: PASS
+496 / 496 raw trials completed
+```
+
+The matrix correctness gates checked:
+
+```text
+all harness exit codes are 0
+all expected request rows are parsed
+all aggregate lines match n_ok=N n_cancelled=0 n_error=0
+all request statuses are ok
+all n_tokens_generated values are 16
+all generated_token_hash values equal 0x833045f1e2ebf49f
+prompt-fits line is present
+no serving-bench error/failed diagnostics appear
+HPX lifecycle counts match each cell
+std remains HPX-trace-free where required
+same-context acquire/release pairing holds
+```
+
+This allowed timing interpretation under the protocol.
+
+The top-line timing result was:
+
+```text
+A_1x1: HPX and std are indistinguishable.
+B_2x2: HPX shows modest overhead.
+C_2x4: HPX shows larger overhead under waiter pressure.
+D_4x4: signal is mixed and noisy.
+```
+
+Median `total_ms`:
+
+| Cell | std median | hpx median | Delta | Delta % |
+|---|---:|---:|---:|---:|
+| A_1x1 | 174.075 ms | 174.210 ms | +0.136 ms | +0.08% |
+| B_2x2 | 234.417 ms | 244.556 ms | +10.140 ms | +4.33% |
+| C_2x4 | 475.062 ms | 511.560 ms | +36.498 ms | +7.68% |
+| D_4x4 | 1217.710 ms | 1200.312 ms | -17.398 ms | -1.43% |
+
+Median `total_minus_ttft_ms`:
+
+| Cell | std median | hpx median | Delta | Delta % |
+|---|---:|---:|---:|---:|
+| A_1x1 | 146.084 ms | 146.170 ms | +0.087 ms | +0.06% |
+| B_2x2 | 195.235 ms | 203.228 ms | +7.993 ms | +4.09% |
+| C_2x4 | 200.026 ms | 213.831 ms | +13.804 ms | +6.90% |
+| D_4x4 | 740.449 ms | 705.610 ms | -34.839 ms | -4.71% |
+
+Median process wall time:
+
+| Cell | std median | hpx median | Delta | Delta % |
+|---|---:|---:|---:|---:|
+| A_1x1 | 1333.215 ms | 1350.292 ms | +17.077 ms | +1.28% |
+| B_2x2 | 1263.887 ms | 1335.703 ms | +71.817 ms | +5.68% |
+| C_2x4 | 1794.560 ms | 1906.228 ms | +111.668 ms | +6.22% |
+| D_4x4 | 5296.890 ms | 5487.855 ms | +190.965 ms | +3.61% |
+
+The matrix does not support a reliable HPX speedup claim.
+
+The useful result is:
+
+```text
+The HPX serving backend preserves correctness and lifecycle invariants across the tested matrix, but the current CPU-only TinyLlama harness does not show a performance advantage over the simpler std backend.
+```
+
+### C_2x4 n_threads sensitivity sweep
+
+The C_2x4 cell had the clearest overhead in the matrix, so a targeted diagnostic sweep was run.
+
+Fixed cell:
+
+```text
+n_contexts=2
+n_concurrent=4
+n_requests=12
+```
+
+Sweep variable:
+
+```text
+n_threads ∈ {1, 2, 4}
+```
+
+Protocol:
+
+```text
+two layers:
+  correctness_trace_on
+  timing_trace_off
+
+two backends:
+  std
+  hpx
+
+K = 11 process-level trials per backend per thread setting per layer
+trial 0 correctness-checked but excluded from timing aggregation
+
+total:
+  3 thread settings × 2 layers × 2 backends × 11 trials = 132 invocations
+```
+
+Correctness result:
+
+```text
+SWEEP_OVERALL_CORRECTNESS: PASS
+12 / 12 layer summaries: PASS
+3 / 3 thread-setting summaries: PASS
+132 / 132 raw trials completed
+```
+
+Median `total_ms`:
+
+| n_threads | std median | hpx median | Delta | Delta % |
+|---:|---:|---:|---:|---:|
+| 1 | 741.918 ms | 751.691 ms | +9.773 ms | +1.32% |
+| 2 | 541.571 ms | 580.258 ms | +38.687 ms | +7.14% |
+| 4 | 488.700 ms | 506.925 ms | +18.226 ms | +3.73% |
+
+Median `total_minus_ttft_ms`:
+
+| n_threads | std median | hpx median | Delta | Delta % |
+|---:|---:|---:|---:|---:|
+| 1 | 296.796 ms | 300.538 ms | +3.743 ms | +1.26% |
+| 2 | 220.489 ms | 236.490 ms | +16.001 ms | +7.26% |
+| 4 | 204.109 ms | 211.719 ms | +7.609 ms | +3.73% |
+
+All trend metrics were classified as:
+
+```text
+mixed
+```
+
+The sweep does not support a clean oversubscription-only explanation.
+
+If kernel-thread oversubscription were the whole explanation, HPX overhead should grow monotonically with `n_threads`:
+
+```text
+n_threads=1 < n_threads=2 < n_threads=4
+```
+
+That did not happen.
+
+The sweep also does not support a flat orchestration-only explanation because the overhead range is too large to call invariant.
+
+The best interpretation is:
+
+```text
+C_2x4 HPX overhead appears to come from an interaction between HPX serving orchestration / waiter pressure and llama/ggml kernel-thread behavior. The interaction is worst at n_threads=2 in this run.
+```
+
+### Heterogeneous-budget design checkpoint
+
+After the fixed-shape matrix and the n_threads sweep, continuing to add more fixed-shape dimensions was judged to have diminishing returns.
+
+A future HPX-favoring workload was designed:
+
+```text
+heterogeneous request budgets
+```
+
+The design lives under:
+
+```text
+hpx-bench/experiments/10_perf_heterogeneous_budgets_design/
+```
+
+It asks:
+
+```text
+When requests have mixed generation lengths, does HPX serving orchestration behave differently from std in short-request latency, queue-drain behavior, or makespan?
+```
+
+The key inspection finding was:
+
+```text
+serving_bench::request_params already has per-request max_tokens and prompt
+backend_std.cpp already reads req.max_tokens
+backend_hpx.cpp already reads req.max_tokens
+```
+
+The limitation is the call site:
+
+```text
+main.cpp pins every request to cfg.max_tokens
+```
+
+So the expected source change is small and harness-level:
+
+```text
+add --max-tokens-plan CSV parsing
+validate plan length equals n_requests
+validate all entries are positive
+use max(plan) for fit-check
+set rp.max_tokens from plan[next_idx]
+```
+
+The heterogeneous-budget experiment is not completed in this section.
+
+It still needs:
+
+```text
+source change for --max-tokens-plan
+HPX-on rebuild
+small CLI smoke
+helper scripts
+schedule generation
+correctness and timing runs
+summary docs
+```
+
+Until then, it is future work, not evidence.
+
+### Current conclusion
+
+The branch now has stronger evidence than the first repeated benchmark.
+
+It proves:
+
+```text
+The std and HPX backends both run real llama.cpp decode.
+The HPX backend preserves the std token stream for the pinned smoke.
+HPX lifecycle ownership is clean.
+HPX context leasing and release are correct in the tested shapes.
+HPX handles multi-context and waiter-pressure workloads without starvation.
+The benchmark-grade matrix and thread sweep both pass correctness.
+```
+
+It does not prove:
+
+```text
+HPX is faster than std.
+HPX is better than llama-server.
+HPX is useful for all serving workloads.
+The pool-of-contexts design beats continuous batching.
+The current HPX backend exposes HPX's full scheduling value.
+```
+
+The performance conclusion is:
+
+```text
+On this fixed-shape CPU TinyLlama serving-bench workload, HPX does not outperform the simpler std backend. Its overhead is small, measurable, and dependent on workload/thread configuration.
+```
+
+The project conclusion is:
+
+```text
+The HPX serving backend is correct and robust, but the current fixed-shape harness mostly measures the cost of an HPX wrapper around opaque llama.cpp work. To test HPX's actual strengths, the next workload must exercise richer orchestration: heterogeneous request lengths, cancellation/backpressure, priority scheduling, or pipelining.
+```
+
+### Evidence standard going forward
+
+The evidence standard after this section is:
+
+```text
+correctness gates first
+timing interpretation only after correctness passes
+trace-on layer for lifecycle
+trace-off layer for timing
+trial 0 excluded from timing aggregation
+no speedup claims from smoke tests
+no broad performance claims from one model / one prompt / one machine
+```
+
+For future HPX-serving experiments, useful evidence should test at least one HPX-relevant serving behavior:
+
+```text
+heterogeneous request budgets
+cancellation under load
+backpressure
+priority / fairness
+prefill-decode overlap
+pipeline scheduling
+larger or more varied prompts
+```
+
+More fixed-shape TinyLlama sweeps are no longer likely to change the central conclusion.

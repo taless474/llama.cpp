@@ -1,0 +1,54 @@
+=== llama-serving-bench std_control concurrency summary (comparison_hpx_concurrency/std_control) ===
+
+binary exit code: 0
+requests: 8 requests, all correctness-gated (no warmup phase)
+variant:  std_control
+shape:    n_contexts=2, n_concurrent=2, n_requests=8, max_tokens=16, n_threads=4
+
+--- per-request rows ---
+req[0] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=51.089 total_ms=237.884 total_minus_ttft_ms=186.795 tps=67.260
+req[1] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=51.091 total_ms=242.709 total_minus_ttft_ms=191.618 tps=65.923
+req[2] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=36.721 total_ms=233.673 total_minus_ttft_ms=196.952 tps=68.472
+req[3] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=36.740 total_ms=236.170 total_minus_ttft_ms=199.430 tps=67.748
+req[4] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=34.456 total_ms=230.938 total_minus_ttft_ms=196.482 tps=69.283
+req[5] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=37.119 total_ms=234.076 total_minus_ttft_ms=196.957 tps=68.354
+req[6] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=39.012 total_ms=228.704 total_minus_ttft_ms=189.692 tps=69.959
+req[7] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=38.518 total_ms=228.814 total_minus_ttft_ms=190.296 tps=69.926
+
+--- ttft_ms ---
+n=8 min=34.456ms max=51.091ms mean=40.593ms median=37.819ms stdev_pop=6.192ms
+--- total_ms ---
+n=8 min=228.704ms max=242.709ms mean=234.121ms median=233.875ms stdev_pop=4.472ms
+--- total_ms - ttft_ms ---
+n=8 min=186.795ms max=199.430ms mean=193.528ms median=194.050ms stdev_pop=4.201ms
+--- tokens_per_second ---
+n=8 min=65.923tps max=69.959tps mean=68.365tps median=68.413tps stdev_pop=1.294tps
+
+--- HPX trace lines (filtered) ---
+trace_lines_total: 0
+(expected zero trace lines at --backend std)
+
+--- checks ---
+[PASS] harness exit code == 0
+[PASS] all 8 req lines parsed
+[PASS] stdout aggregate line contains: 'n_ok=8 n_cancelled=0 n_error=0'
+[PASS] all 8 status == ok
+[PASS] all 8 n_tokens_generated == 16
+[PASS] all 8 generated_token_hash equal canonical 0x833045f1e2ebf49f
+[PASS] stderr contains: 'prompt fits: 6 prompt tokens + 16 max_tokens <= 2048 ctx_size'
+[PASS] stderr has no '[serving-bench] error'
+[PASS] stderr has no 'failed'
+[PASS] per_repeat.csv has 8 data rows + header
+[PASS] hpx_trace.txt contains zero HPX lifecycle/pool lines
+
+OVERALL: PASS
+
+--- caveats ---
+This is one bench-side leg of the (2,2) HPX concurrency slice.
+Cross-backend gates live in comparison_hpx_concurrency/comparison_summary.txt.
+All 8 requests are correctness-gated. No warmup separation.
+Timing stats above are descriptive only; gates do not depend on them.
+Oversubscription (2 contexts x 4 threads = 8 kernel threads on a 4-core box)
+is expected and is NOT a regression.
+Trace lines are event-ordered but not timestamped; we do NOT claim
+true overlap of in-flight requests in time.

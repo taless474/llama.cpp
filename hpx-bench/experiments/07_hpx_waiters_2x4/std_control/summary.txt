@@ -1,0 +1,64 @@
+=== llama-serving-bench std_control waiter-pressure summary (comparison_hpx_waiters/std_control) ===
+
+binary exit code: 0
+requests: 12 requests, all correctness-gated (no warmup phase)
+variant:  std_control
+shape:    n_contexts=2, n_concurrent=4, n_requests=12, max_tokens=16, n_threads=4
+
+--- per-request rows ---
+req[0] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=52.243 total_ms=234.295 total_minus_ttft_ms=182.052 tps=68.290
+req[1] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=52.242 total_ms=239.639 total_minus_ttft_ms=187.397 tps=66.767
+req[2] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=268.099 total_ms=470.415 total_minus_ttft_ms=202.316 tps=34.013
+req[3] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=274.799 total_ms=475.122 total_minus_ttft_ms=200.323 tps=33.676
+req[4] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=269.913 total_ms=456.341 total_minus_ttft_ms=186.428 tps=35.062
+req[5] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=275.979 total_ms=466.522 total_minus_ttft_ms=190.543 tps=34.296
+req[6] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=251.395 total_ms=436.797 total_minus_ttft_ms=185.402 tps=36.630
+req[7] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=265.954 total_ms=458.125 total_minus_ttft_ms=192.171 tps=34.925
+req[8] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=251.042 total_ms=441.527 total_minus_ttft_ms=190.485 tps=36.238
+req[9] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=260.486 total_ms=451.789 total_minus_ttft_ms=191.303 tps=35.415
+req[10] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=256.470 total_ms=444.702 total_minus_ttft_ms=188.232 tps=35.979
+req[11] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=254.775 total_ms=439.114 total_minus_ttft_ms=184.339 tps=36.437
+
+--- ttft_ms ---
+n=12 min=52.242ms max=275.979ms mean=227.783ms median=258.478ms stdev_pop=78.919ms
+--- total_ms ---
+n=12 min=234.295ms max=475.122ms mean=417.866ms median=448.245ms stdev_pop=81.758ms
+--- total_ms - ttft_ms ---
+n=12 min=182.052ms max=202.316ms mean=190.083ms median=189.358ms stdev_pop=5.803ms
+--- tokens_per_second ---
+n=12 min=33.676tps max=68.290tps mean=40.644tps median=35.697tps stdev_pop=12.061tps
+
+--- HPX trace lines (filtered) ---
+trace_lines_total: 0
+(expected zero trace lines at --backend std)
+
+--- checks ---
+[PASS] harness exit code == 0
+[PASS] all 12 req lines parsed
+[PASS] stdout aggregate line contains: 'n_ok=12 n_cancelled=0 n_error=0'
+[PASS] all 12 status == ok
+[PASS] all 12 n_tokens_generated == 16
+[PASS] all 12 generated_token_hash equal canonical 0x833045f1e2ebf49f
+[PASS] stderr contains: 'prompt fits: 6 prompt tokens + 16 max_tokens <= 2048 ctx_size'
+[PASS] stderr has no '[serving-bench] error'
+[PASS] stderr has no 'failed'
+[PASS] per_repeat.csv has 12 data rows + header
+[PASS] hpx_trace.txt contains zero HPX lifecycle/pool lines
+
+OVERALL: PASS
+
+--- caveats ---
+This is one bench-side leg of the (2, 4, 12) HPX waiter-pressure slice.
+Cross-backend gates live in comparison_hpx_waiters/comparison_summary.txt.
+All 12 requests are correctness-gated. No warmup separation.
+Timing stats above are descriptive only; gates do not depend on them.
+Oversubscription (2 contexts x 4 threads = 8 kernel threads on a 4-core box,
+with 4 in-flight at saturation) is more severe than the (2, 2) slice and is
+expected. It will slow each decode but must not change tokens.
+Trace lines are event-ordered but not timestamped; we do NOT claim true
+overlap of in-flight requests in time.
+This slice does NOT establish FIFO waiter ordering. backend_hpx.cpp uses
+std::deque<hpx::promise> with front-pop (the structural intent is FIFO),
+but no queued/wake trace events are emitted today, so FIFO is not
+observable from the trace and is not gated here.
+This slice does NOT establish per-request wait time before acquire.

@@ -1,0 +1,49 @@
+=== std-vs-HPX comparison summary (comparison_hpx_vs_std) ===
+
+inputs:
+  hpx:                     /Users/Ashk/Desktop/HPX/llama-hpx/local/baselines/comparison_hpx_vs_std/hpx
+  hpx_off_regression:      /Users/Ashk/Desktop/HPX/llama-hpx/local/baselines/comparison_hpx_vs_std/hpx_off_regression
+  std reference (existing): /Users/Ashk/Desktop/HPX/llama-hpx/local/baselines/comparison_aligned/bench
+
+--- token hashes ---
+hpx        warmup=0x833045f1e2ebf49f   measured=0x833045f1e2ebf49f   distinct_measured=1
+regression warmup=0x833045f1e2ebf49f   measured=0x833045f1e2ebf49f   distinct_measured=1
+std ref    warmup=0x833045f1e2ebf49f   measured=0x833045f1e2ebf49f   distinct_measured=1
+canonical:  0x833045f1e2ebf49f
+
+--- regression trace lines ---
+hpx_off_regression/hpx_trace.txt non-empty lines: 0
+
+--- descriptive timing (not gated) ---
+hpx        measured (total_ms - ttft_ms): n=5 min=145.141ms max=148.804ms mean=146.288ms median=145.805ms
+std ref    measured (total_ms - ttft_ms): n=5 min=145.329ms max=146.247ms mean=145.736ms median=145.816ms
+regression measured (total_ms - ttft_ms): n=5 min=145.538ms max=158.651ms mean=148.658ms median=145.952ms
+delta of means (hpx - std_ref): +0.552ms
+note: this is an n=5 smoke at single-context, single-concurrent.
+note: not a performance claim. timing is informational only.
+
+--- checks ---
+[PASS] hpx/summary.txt has 'OVERALL: PASS'
+[PASS] hpx_off_regression/summary.txt has 'OVERALL: PASS'
+[PASS] hpx_off_regression/hpx_trace.txt is empty (zero trace lines)
+[PASS] HPX warmup hash equals std reference warmup hash
+[PASS] HPX measured hash equals std reference measured hash
+[PASS] HPX-off regression warmup hash equals std reference warmup hash
+[PASS] HPX-off regression measured hash equals std reference measured hash
+[PASS] all warmup + measured hashes equal canonical 0x833045f1e2ebf49f
+[PASS] all n_tokens_generated == 16 across hpx/, hpx_off_regression/, std reference
+[PASS] HPX lifecycle gates passed (per-line PASS in hpx/summary.txt)
+[PASS] std reference still passes its own gates (integrity stand-in for 'not modified')
+
+OVERALL: PASS
+
+--- caveats ---
+This is the cross-binary leg of the std-vs-HPX comparison.
+Per-binary gates live in <variant>/summary.txt.
+No HPX speed claim from this n=5 smoke.
+No concurrency. Single context, single concurrent.
+Not benchmark-grade. Correctness + lifecycle only.
+'std reference was not modified' is verified indirectly by checking
+that the existing reference still produces the canonical hash and
+still passes its own per-binary gates; byte-level immutability is
+not asserted.

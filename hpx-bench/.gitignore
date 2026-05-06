@@ -1,0 +1,45 @@
+# Raw benchmark trial outputs
+conditions/
+thread_settings/
+driver_logs/
+trial_*/
+
+# Per-trial benchmark artifacts
+bench.stdout
+bench.stderr
+bench.exit_code.txt
+process_wall_ms.txt
+per_repeat.csv
+request_summary.txt
+hpx_trace.txt
+binary_used.txt
+build_info.txt
+git_head.txt
+schedule_entry.json
+
+# HTTP/server raw artifacts
+health.json
+metrics.txt
+metrics_before.txt
+metrics_after.txt
+port_released.txt
+server.pid
+server_shutdown.txt
+server_start.stdout
+server_start.stderr
+single_request.json
+single_request.headers
+single_request.curl.stderr
+request_warmup.json
+request_warmup.headers
+request_warmup.curl_meta.txt
+request_measured_*.json
+request_measured_*.headers
+request_measured_*.curl_meta.txt
+
+# Local shell logs
+*.stdout
+*.stderr
+
+# macOS metadata
+.DS_Store

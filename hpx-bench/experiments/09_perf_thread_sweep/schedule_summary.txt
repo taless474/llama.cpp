@@ -1,0 +1,48 @@
+C_2x4 n_threads sensitivity sweep — schedule summary
+
+seed:                 1234
+cell_id:              C_2x4
+thread_settings:      [1, 2, 4]
+layers:               ['correctness_trace_on', 'timing_trace_off']
+backends:             ['std', 'hpx']
+trials per backend:   11 (indices 0..10 inclusive)
+total entries:        132
+expected total:       3 × 2 × 2 × 11 = 132
+
+Per (n_threads × layer × backend) trial counts:
+  n_thr  layer                  bk   trials  measured_for_timing
+      1  correctness_trace_on   std      11       0
+      1  correctness_trace_on   hpx      11       0
+      1  timing_trace_off       std      11      10
+      1  timing_trace_off       hpx      11      10
+      2  correctness_trace_on   std      11       0
+      2  correctness_trace_on   hpx      11       0
+      2  timing_trace_off       std      11      10
+      2  timing_trace_off       hpx      11      10
+      4  correctness_trace_on   std      11       0
+      4  correctness_trace_on   hpx      11       0
+      4  timing_trace_off       std      11      10
+      4  timing_trace_off       hpx      11      10
+
+First 8 entries:
+  gidx  n_thr  layer                  bk   trial  measured  trace
+     0      1  correctness_trace_on   std      6  False     True
+     1      1  correctness_trace_on   hpx      5  False     True
+     2      1  correctness_trace_on   std      8  False     True
+     3      1  correctness_trace_on   std      9  False     True
+     4      1  correctness_trace_on   hpx      6  False     True
+     5      1  correctness_trace_on   hpx     10  False     True
+     6      1  correctness_trace_on   std      4  False     True
+     7      1  correctness_trace_on   std      7  False     True
+
+Last 4 entries:
+  gidx  n_thr  layer                  bk   trial  measured  trace
+   128      4  timing_trace_off       std      2  True      False
+   129      4  timing_trace_off       std      0  False     False
+   130      4  timing_trace_off       std      3  True      False
+   131      4  timing_trace_off       hpx      3  True      False
+
+Reproducibility: each (n_threads × layer) pair re-seeds random.Random(1234)
+and shuffles a fresh list of 22 (backend, trial_index) pairs. The seed
+is the only source of randomness; rerunning this script must produce an
+identical _schedule.json byte-for-byte.

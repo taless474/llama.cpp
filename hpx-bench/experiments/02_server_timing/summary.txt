@@ -1,0 +1,66 @@
+=== HPX-OFF llama-server timing smoke summary ===
+
+requests: 1 warmup + 5 measured
+warmup wall_ms: 192.553
+
+--- measured client wall_ms (ms) ---
+n=5 min=171.881ms max=174.611ms mean=173.353ms median=173.381ms stdev_pop=1.126ms
+
+--- measured client tokens/sec (predicted/wall) ---
+n=5 min=91.632tps max=93.088tps mean=92.301tps median=92.282tps stdev_pop=0.600tps
+
+--- measured server prompt_ms (ms) ---
+n=5 min=24.825ms max=27.617ms mean=26.150ms median=26.037ms stdev_pop=1.097ms
+--- measured server predicted_ms (ms) ---
+n=5 min=146.403ms max=146.728ms mean=146.570ms median=146.589ms stdev_pop=0.129ms
+--- measured server prompt_per_second (tokens/s) ---
+n=5 min=217.257tps max=241.692tps mean=229.845tps median=230.441tps stdev_pop=9.605tps
+--- measured server predicted_per_second (tokens/s) ---
+n=5 min=109.045tps max=109.287tps mean=109.163tps median=109.149tps stdev_pop=0.096tps
+
+--- per-request rows ---
+warmup       kind=warmup   status=200 wall_ms=192.553 tp=16 te=6 prompt_ms=27.035000 predicted_ms=149.843000
+measured_1   kind=measured status=200 wall_ms=174.611 tp=16 te=6 prompt_ms=27.160000 predicted_ms=146.688000
+measured_2   kind=measured status=200 wall_ms=174.581 tp=16 te=6 prompt_ms=27.617000 predicted_ms=146.403000
+measured_3   kind=measured status=200 wall_ms=171.881 tp=16 te=6 prompt_ms=24.825000 predicted_ms=146.442000
+measured_4   kind=measured status=200 wall_ms=172.311 tp=16 te=6 prompt_ms=25.113000 predicted_ms=146.589000
+measured_5   kind=measured status=200 wall_ms=173.381 tp=16 te=6 prompt_ms=26.037000 predicted_ms=146.728000
+
+--- metrics deltas ---
+llamacpp:prompt_tokens_total: before=0 after=36 delta=36 expected=36
+llamacpp:tokens_predicted_total: before=0 after=96 delta=96 expected=96
+llamacpp:n_decode_total: before=0 after=96 delta=96 expected=96
+
+--- checks ---
+[PASS] warmup HTTP 200
+[PASS] measured_1 HTTP 200
+[PASS] measured_2 HTTP 200
+[PASS] measured_3 HTTP 200
+[PASS] measured_4 HTTP 200
+[PASS] measured_5 HTTP 200
+[PASS] warmup JSON parsed
+[PASS] measured_1 JSON parsed
+[PASS] measured_2 JSON parsed
+[PASS] measured_3 JSON parsed
+[PASS] measured_4 JSON parsed
+[PASS] measured_5 JSON parsed
+[PASS] measured_1 content byte-equal canonical
+[PASS] measured_1 tokens_evaluated == 6
+[PASS] measured_1 tokens_predicted == 16
+[PASS] measured_2 content byte-equal canonical
+[PASS] measured_2 tokens_evaluated == 6
+[PASS] measured_2 tokens_predicted == 16
+[PASS] measured_3 content byte-equal canonical
+[PASS] measured_3 tokens_evaluated == 6
+[PASS] measured_3 tokens_predicted == 16
+[PASS] measured_4 content byte-equal canonical
+[PASS] measured_4 tokens_evaluated == 6
+[PASS] measured_4 tokens_predicted == 16
+[PASS] measured_5 content byte-equal canonical
+[PASS] measured_5 tokens_evaluated == 6
+[PASS] measured_5 tokens_predicted == 16
+[PASS] llamacpp:prompt_tokens_total delta == 36
+[PASS] llamacpp:tokens_predicted_total delta == 96
+[PASS] llamacpp:n_decode_total delta == 96
+
+OVERALL: PASS

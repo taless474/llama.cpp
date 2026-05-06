@@ -1,0 +1,58 @@
+=== HPX vs std_control concurrency comparison summary (comparison_hpx_concurrency) ===
+
+inputs:
+  hpx:         /Users/Ashk/Desktop/HPX/llama-hpx/local/baselines/comparison_hpx_concurrency/hpx
+  std_control: /Users/Ashk/Desktop/HPX/llama-hpx/local/baselines/comparison_hpx_concurrency/std_control
+
+shape: n_contexts=2, n_concurrent=2, n_requests=8, max_tokens=16, n_threads=4
+
+--- token hashes ---
+hpx        : ['0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f']
+std_control: ['0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f']
+canonical:   0x833045f1e2ebf49f
+
+--- std_control trace lines ---
+std_control/hpx_trace.txt non-empty lines: 0
+
+--- descriptive timing, all 8 rows (NOT gated) ---
+hpx        ttft_ms             : n=8 min=36.367ms max=54.577ms mean=41.611ms median=37.038ms
+hpx        total_ms            : n=8 min=231.810ms max=251.588ms mean=239.918ms median=237.065ms
+hpx        total_ms - ttft_ms  : n=8 min=191.949ms max=215.221ms mean=198.306ms median=195.983ms
+hpx        tokens_per_second   : n=8 min=63.596tps max=69.022tps mean=66.756tps median=67.494tps
+std_control ttft_ms            : n=8 min=34.456ms max=51.091ms mean=40.593ms median=37.819ms
+std_control total_ms           : n=8 min=228.704ms max=242.709ms mean=234.121ms median=233.875ms
+std_control total_ms - ttft_ms : n=8 min=186.795ms max=199.430ms mean=193.528ms median=194.050ms
+std_control tokens_per_second  : n=8 min=65.923tps max=69.959tps mean=68.365tps median=68.413tps
+
+--- descriptive timing, req[2..7] trim, presentation only (NOT gated) ---
+hpx        total_ms - ttft_ms  : n=6 min=191.949ms max=215.221ms mean=199.885ms median=197.799ms
+std_control total_ms - ttft_ms : n=6 min=189.692ms max=199.430ms mean=194.968ms median=196.717ms
+
+--- delta of means (HPX - std_control) ---
+all-rows  total_ms - ttft_ms : +4.779ms
+trim view total_ms - ttft_ms : +4.917ms
+
+note: this is an n=8 smoke at n_contexts=2, n_concurrent=2.
+note: oversubscription (2 ctx x 4 threads on a 4-core box) is expected.
+note: not a performance claim. timing is informational only.
+note: trace lines are NOT timestamped; we do NOT claim true in-flight overlap.
+
+--- checks ---
+[PASS] hpx/summary.txt has 'OVERALL: PASS'
+[PASS] std_control/summary.txt has 'OVERALL: PASS'
+[PASS] std_control/hpx_trace.txt is empty (zero non-empty lines)
+[PASS] HPX hash equals std_control hash for each req[0..7]
+[PASS] all 16 hashes equal canonical 0x833045f1e2ebf49f
+[PASS] all 16 n_tokens_generated == 16
+[PASS] HPX lifecycle gates passed (per-line PASS in hpx/summary.txt)
+
+OVERALL: PASS
+
+--- caveats ---
+Cross-backend leg of the (2,2) HPX concurrency slice.
+Per-backend gates live in <variant>/summary.txt.
+No HPX speed claim from this n=8 smoke.
+No claim of true in-flight overlap; trace is event-ordered, not timestamped.
+This slice does NOT exercise n_concurrent > n_contexts (Gate 9 / a later slice).
+Reference integrity (prior baselines unmodified) is a discipline note, not
+a gate; this script does not read or write any prior baseline directory.

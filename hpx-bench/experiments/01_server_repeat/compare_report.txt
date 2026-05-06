@@ -1,0 +1,34 @@
+=== contents ===
+session1 content: ' John Smith. I am a software engineer at XYZ Company. I have'
+session2 content: ' John Smith. I am a software engineer at XYZ Company. I have'
+
+=== token counts ===
+session1 tokens_predicted=16 tokens_evaluated=6
+session2 tokens_predicted=16 tokens_evaluated=6
+
+=== checks ===
+[PASS] session1 HTTP 200
+[PASS] session2 HTTP 200
+[PASS] session1 JSON parse
+[PASS] session2 JSON parse
+[PASS] content byte-equal across sessions
+[PASS] session1 tokens_predicted == 16
+[PASS] session2 tokens_predicted == 16
+[PASS] tokens_predicted parity
+[PASS] session1 tokens_evaluated == 6
+[PASS] session2 tokens_evaluated == 6
+[PASS] tokens_evaluated parity
+[PASS] session1 generation_settings.seed == 1234
+[PASS] session1 generation_settings.temperature == 0.0
+[PASS] session1 generation_settings.top_k == 1
+[PASS] session1 generation_settings.stream == False
+[PASS] session1 generation_settings.n_predict == 16
+[PASS] session2 generation_settings.seed == 1234
+[PASS] session2 generation_settings.temperature == 0.0
+[PASS] session2 generation_settings.top_k == 1
+[PASS] session2 generation_settings.stream == False
+[PASS] session2 generation_settings.n_predict == 16
+[PASS] session1 clean shutdown
+[PASS] session2 clean shutdown
+
+OVERALL: PASS

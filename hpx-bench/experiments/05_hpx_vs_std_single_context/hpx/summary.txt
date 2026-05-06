@@ -1,0 +1,74 @@
+=== llama-serving-bench hpx timing summary (comparison_hpx_vs_std/hpx) ===
+
+binary exit code: 0
+requests: 1 warmup (req[0]) + 5 measured (req[1..5])
+variant:  hpx
+
+--- per-request rows ---
+req[0] kind=warmup   status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=38.372 total_ms=183.700 tps=87.099
+req[1] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=26.241 total_ms=172.130 tps=92.953
+req[2] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=26.695 total_ms=175.499 tps=91.169
+req[3] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=25.508 total_ms=170.649 tps=93.760
+req[4] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=25.438 total_ms=171.237 tps=93.438
+req[5] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=24.612 total_ms=170.417 tps=93.887
+
+--- measured ttft_ms ---
+n=5 min=24.612ms max=26.695ms mean=25.699ms median=25.508ms stdev_pop=0.717ms
+--- measured total_ms ---
+n=5 min=170.417ms max=175.499ms mean=171.986ms median=171.237ms stdev_pop=1.853ms
+--- measured tokens_per_second ---
+n=5 min=91.169tps max=93.887tps mean=93.041tps median=93.438tps stdev_pop=0.990tps
+
+--- token hash ---
+warmup hash:   0x833045f1e2ebf49f
+measured hash: 0x833045f1e2ebf49f  (n_distinct=1)
+
+--- HPX trace lines (filtered) ---
+trace_lines_total: 15
+start lines: 1
+ready lines: 1
+stop lines:  1
+acquire lines: 6
+release lines: 6
+
+--- checks ---
+[PASS] harness exit code == 0
+[PASS] all 6 req lines parsed
+[PASS] stdout aggregate line contains: 'n_ok=6 n_cancelled=0 n_error=0'
+[PASS] all 6 status == ok
+[PASS] all 6 n_tokens_generated == 16
+[PASS] req[1..5] generated_token_hash all identical
+[PASS] req[0] generated_token_hash equals measured hash
+[PASS] stderr contains: 'prompt fits: 6 prompt tokens + 16 max_tokens <= 2048 ctx_size'
+[PASS] stderr has no '[serving-bench] error'
+[PASS] stderr has no 'failed'
+[PASS] per_repeat.csv has 6 data rows + header
+[PASS] exactly one start line: '[serving-bench] hpx_runtime_start_once: starting (os_threads=1)'
+[PASS] exactly one ready line: '[serving-bench] engine_hpx ready: n_contexts=1 pool_size=1'
+[PASS] exactly one stop line: '[serving-bench] hpx_runtime_stop: stopping'
+[PASS] req[0] exactly one acquire ctx=0
+[PASS] req[0] exactly one release ctx=0
+[PASS] req[0] acquire precedes release
+[PASS] req[1] exactly one acquire ctx=0
+[PASS] req[1] exactly one release ctx=0
+[PASS] req[1] acquire precedes release
+[PASS] req[2] exactly one acquire ctx=0
+[PASS] req[2] exactly one release ctx=0
+[PASS] req[2] acquire precedes release
+[PASS] req[3] exactly one acquire ctx=0
+[PASS] req[3] exactly one release ctx=0
+[PASS] req[3] acquire precedes release
+[PASS] req[4] exactly one acquire ctx=0
+[PASS] req[4] exactly one release ctx=0
+[PASS] req[4] acquire precedes release
+[PASS] req[5] exactly one acquire ctx=0
+[PASS] req[5] exactly one release ctx=0
+[PASS] req[5] acquire precedes release
+
+OVERALL: PASS
+
+--- caveats ---
+This is one bench-side leg of the std-vs-HPX comparison.
+Cross-binary gates live in comparison_hpx_vs_std/comparison_summary.txt.
+No concurrency. Single context, single concurrent. Not benchmark-grade.
+Timing stats above are descriptive only; gates do not depend on them.

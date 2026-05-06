@@ -56,6 +56,9 @@ void print_usage(FILE * out) {
         "      --n-concurrent N     concurrent in-flight (default 1)\n"
         "      --n-requests N       total requests (default 1)\n"
         "  -n, --max-tokens N       max generated tokens (default 64)\n"
+        "      --max-tokens-plan CSV  per-request max_tokens, comma-separated;\n"
+        "                             length must equal --n-requests; entries > 0;\n"
+        "                             empty means every request uses --max-tokens\n"
         "      --n-threads N        per-context kernel threads (0=auto)\n"
         "      --ctx-size N         per-context KV size in tokens (default 2048)\n"
         "      --batch-size N       per-context logical batch size (default 512)\n"
@@ -170,6 +173,41 @@ parse_result parse_cli(int argc, char ** argv, harness_config & out) {
         } else if (a == "--max-tokens" || a == "-n") {
             const char * v = need(i); if (!v) return parse_result::error;
             out.max_tokens = std::atoi(v);
+        } else if (a == "--max-tokens-plan") {
+            const char * v = need(i); if (!v) return parse_result::error;
+            out.max_tokens_plan.clear();
+            const std::string s = v;
+            size_t pos = 0;
+            while (true) {
+                const size_t comma = s.find(',', pos);
+                const std::string tok = (comma == std::string::npos)
+                    ? s.substr(pos)
+                    : s.substr(pos, comma - pos);
+                if (tok.empty()) {
+                    std::fprintf(stderr,
+                                 "--max-tokens-plan: empty entry in \"%s\"\n",
+                                 s.c_str());
+                    return parse_result::error;
+                }
+                for (char c : tok) {
+                    if (c < '0' || c > '9') {
+                        std::fprintf(stderr,
+                                     "--max-tokens-plan: non-digit char in entry \"%s\"\n",
+                                     tok.c_str());
+                        return parse_result::error;
+                    }
+                }
+                const long n = std::strtol(tok.c_str(), nullptr, 10);
+                if (n <= 0 || n > 2147483647L) {
+                    std::fprintf(stderr,
+                                 "--max-tokens-plan: entry \"%s\" out of range\n",
+                                 tok.c_str());
+                    return parse_result::error;
+                }
+                out.max_tokens_plan.push_back(static_cast<int32_t>(n));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
         } else if (a == "--n-threads") {
             const char * v = need(i); if (!v) return parse_result::error;
             out.n_threads_per_ctx = std::atoi(v);
@@ -223,6 +261,15 @@ void print_config(FILE * out, const harness_config & c) {
     std::fprintf(out, "  batch_size         = %d\n", c.batch_size);
     std::fprintf(out, "  backend            = %s\n", c.backend.c_str());
     std::fprintf(out, "  seed_base          = %u\n", c.seed_base);
+    if (!c.max_tokens_plan.empty()) {
+        std::fprintf(out, "  max_tokens_plan    = [");
+        for (size_t i = 0; i < c.max_tokens_plan.size(); i++) {
+            std::fprintf(out, "%s%d",
+                         i == 0 ? "" : ",",
+                         c.max_tokens_plan[i]);
+        }
+        std::fprintf(out, "] (%zu entries)\n", c.max_tokens_plan.size());
+    }
 }
 
 } // namespace serving_bench

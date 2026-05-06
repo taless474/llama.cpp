@@ -1,0 +1,64 @@
+=== HPX vs std_control waiter-pressure comparison summary (comparison_hpx_waiters) ===
+
+inputs:
+  hpx:         /Users/Ashk/Desktop/HPX/llama-hpx/local/baselines/comparison_hpx_waiters/hpx
+  std_control: /Users/Ashk/Desktop/HPX/llama-hpx/local/baselines/comparison_hpx_waiters/std_control
+
+shape: n_contexts=2, n_concurrent=4, n_requests=12, max_tokens=16, n_threads=4
+
+--- token hashes ---
+hpx        : ['0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f']
+std_control: ['0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f', '0x833045f1e2ebf49f']
+canonical:   0x833045f1e2ebf49f
+
+--- std_control trace lines ---
+std_control/hpx_trace.txt non-empty lines: 0
+
+--- descriptive timing, all 12 rows (NOT gated) ---
+hpx        ttft_ms             : n=12 min=52.368ms max=281.317ms mean=230.189ms median=263.337ms
+hpx        total_ms            : n=12 min=239.312ms max=479.695ms mean=421.626ms median=454.919ms
+hpx        total_ms - ttft_ms  : n=12 min=184.641ms max=198.378ms mean=191.438ms median=191.284ms
+hpx        tokens_per_second   : n=12 min=33.355tps max=66.858tps mean=40.187tps median=35.171tps
+std_control ttft_ms            : n=12 min=52.242ms max=275.979ms mean=227.783ms median=258.478ms
+std_control total_ms           : n=12 min=234.295ms max=475.122ms mean=417.866ms median=448.245ms
+std_control total_ms - ttft_ms : n=12 min=182.052ms max=202.316ms mean=190.083ms median=189.358ms
+std_control tokens_per_second  : n=12 min=33.676tps max=68.290tps mean=40.644tps median=35.697tps
+
+--- descriptive timing, req[4..11] trim, presentation only (NOT gated) ---
+hpx        total_ms - ttft_ms  : n=8 min=184.641ms max=195.459ms mean=191.378ms median=191.970ms
+std_control total_ms - ttft_ms : n=8 min=184.339ms max=192.171ms mean=188.613ms median=189.358ms
+
+--- delta of means (HPX - std_control) ---
+all-rows  total_ms - ttft_ms : +1.355ms
+trim view total_ms - ttft_ms : +2.765ms
+
+note: this is an n=12 smoke at n_contexts=2, n_concurrent=4.
+note: oversubscription (2 ctx x 4 threads on a 4-core box, 4 in-flight) is
+      more severe than the (2, 2) slice and is expected.
+note: not a performance claim. timing is informational only.
+note: trace lines are NOT timestamped; we do NOT claim true in-flight overlap.
+note: this slice does NOT establish FIFO waiter ordering — no queued/wake
+      trace events are emitted today, so the FIFO claim is not observable.
+
+--- checks ---
+[PASS] hpx/summary.txt has 'OVERALL: PASS'
+[PASS] std_control/summary.txt has 'OVERALL: PASS'
+[PASS] std_control/hpx_trace.txt is empty (zero non-empty lines)
+[PASS] HPX hash equals std_control hash for each req[0..11]
+[PASS] all 24 hashes equal canonical 0x833045f1e2ebf49f
+[PASS] all 24 n_tokens_generated == 16
+[PASS] HPX lifecycle / capacity-correctness gates passed (per-line PASS in hpx/summary.txt)
+
+OVERALL: PASS
+
+--- caveats ---
+Cross-backend leg of the (2, 4, 12) HPX waiter-pressure slice.
+Per-backend gates live in <variant>/summary.txt.
+No HPX speed claim from this n=12 smoke.
+No claim of true in-flight overlap; trace is event-ordered, not timestamped.
+No claim of FIFO waiter ordering; current trace lacks queued/wake events.
+No claim of per-request wait time; no queued event to anchor it.
+This slice does NOT exercise n_concurrent >> n_contexts (e.g. 8x2, 16x2).
+This slice does NOT exercise cancellation under backpressure.
+Reference integrity (prior baselines unmodified) is a discipline note, not
+a gate; this script does not read or write any prior baseline directory.

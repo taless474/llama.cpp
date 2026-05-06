@@ -1,0 +1,43 @@
+=== Aligned llama-serving-bench std timing summary (comparison_aligned/bench) ===
+
+binary exit code: 0
+requests: 1 warmup (req[0]) + 5 measured (req[1..5])
+
+--- per-request rows ---
+req[0] kind=warmup   status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=43.639 total_ms=190.743 tps=83.883
+req[1] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=26.343 total_ms=171.802 tps=93.130
+req[2] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=26.197 total_ms=171.526 tps=93.280
+req[3] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=25.036 total_ms=170.864 tps=93.642
+req[4] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=25.455 total_ms=171.271 tps=93.419
+req[5] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=25.240 total_ms=171.487 tps=93.302
+
+--- measured ttft_ms ---
+n=5 min=25.036ms max=26.343ms mean=25.654ms median=25.455ms stdev_pop=0.522ms
+--- measured total_ms ---
+n=5 min=170.864ms max=171.802ms mean=171.390ms median=171.487ms stdev_pop=0.313ms
+--- measured tokens_per_second ---
+n=5 min=93.130tps max=93.642tps mean=93.355tps median=93.302tps stdev_pop=0.170tps
+
+--- token hash ---
+warmup hash:   0x833045f1e2ebf49f
+measured hash: 0x833045f1e2ebf49f  (n_distinct=1)
+
+--- checks ---
+[PASS] harness exit code == 0
+[PASS] all 6 req lines parsed
+[PASS] stdout aggregate line contains: 'n_ok=6 n_cancelled=0 n_error=0'
+[PASS] all 6 status == ok
+[PASS] all 6 n_tokens_generated == 16
+[PASS] req[1..5] generated_token_hash all identical
+[PASS] req[0] generated_token_hash equals measured hash
+[PASS] stderr contains: 'prompt fits: 6 prompt tokens + 16 max_tokens <= 2048 ctx_size'
+[PASS] stderr has no '[serving-bench] error'
+[PASS] stderr has no 'failed'
+[PASS] per_repeat.csv has 6 data rows + header
+
+OVERALL: PASS
+
+--- caveats ---
+This is the bench-side leg of the aligned comparison run.
+Cross-binary gates live in comparison_aligned/comparison_summary.txt.
+No HPX. No concurrency. Single context, single concurrent.

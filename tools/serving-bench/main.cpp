@@ -51,6 +51,14 @@ int main(int argc, char ** argv) {
     if (cfg.n_concurrent < 1) cfg.n_concurrent = 1;
     if (cfg.n_requests   < 1) cfg.n_requests   = 1;
 
+    if (!cfg.max_tokens_plan.empty()
+        && static_cast<int32_t>(cfg.max_tokens_plan.size()) != cfg.n_requests) {
+        std::fprintf(stderr,
+                     "error: --max-tokens-plan has %zu entries but --n-requests is %d\n",
+                     cfg.max_tokens_plan.size(), cfg.n_requests);
+        return 1;
+    }
+
     bool started_hpx = false;
     std::unique_ptr<serving_bench::engine> eng;
     if (cfg.backend == "std") {
@@ -114,11 +122,14 @@ int main(int argc, char ** argv) {
         }
         return 1;
     }
-    if (n_prompt_tokens + cfg.max_tokens > cfg.ctx_size) {
+    const int32_t fit_max_tokens = cfg.max_tokens_plan.empty()
+        ? cfg.max_tokens
+        : *std::max_element(cfg.max_tokens_plan.begin(), cfg.max_tokens_plan.end());
+    if (n_prompt_tokens + fit_max_tokens > cfg.ctx_size) {
         std::fprintf(stderr,
                      "[serving-bench] error: prompt uses %d tokens, max_tokens=%d, "
                      "ctx_size=%d; request exceeds context size\n",
-                     n_prompt_tokens, cfg.max_tokens, cfg.ctx_size);
+                     n_prompt_tokens, fit_max_tokens, cfg.ctx_size);
         eng.reset();
         llama_backend_free();
         if (started_hpx) {
@@ -128,7 +139,7 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr,
                  "[serving-bench] prompt fits: %d prompt tokens + %d max_tokens <= %d ctx_size\n",
-                 n_prompt_tokens, cfg.max_tokens, cfg.ctx_size);
+                 n_prompt_tokens, fit_max_tokens, cfg.ctx_size);
 
     const int32_t n_req = cfg.n_requests;
     const int32_t n_cc  = cfg.n_concurrent;
@@ -142,7 +153,9 @@ int main(int argc, char ** argv) {
     auto submit_one = [&]() {
         serving_bench::request_params rp{};
         rp.prompt        = cfg.prompt;
-        rp.max_tokens    = cfg.max_tokens;
+        rp.max_tokens    = cfg.max_tokens_plan.empty()
+                               ? cfg.max_tokens
+                               : cfg.max_tokens_plan[next_idx];
         rp.seed          = cfg.seed_base + static_cast<uint32_t>(next_idx);
         rp.request_index = next_idx;
         next_idx++;

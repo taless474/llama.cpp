@@ -1,0 +1,44 @@
+=== HPX-OFF llama-serving-bench std timing smoke summary ===
+
+binary exit code: 0
+requests: 1 warmup (req[0]) + 5 measured (req[1..5])
+
+--- per-request rows ---
+req[0] kind=warmup   status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=179.492 total_ms=356.518 tps=44.879
+req[1] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=37.780 total_ms=246.215 tps=64.984
+req[2] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=53.019 total_ms=293.325 tps=54.547
+req[3] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=35.216 total_ms=206.752 tps=77.387
+req[4] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=32.401 total_ms=280.250 tps=57.092
+req[5] kind=measured status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=36.850 total_ms=211.551 tps=75.632
+
+--- measured ttft_ms ---
+n=5 min=32.401ms max=53.019ms mean=39.053ms median=36.850ms stdev_pop=7.218ms
+--- measured total_ms ---
+n=5 min=206.752ms max=293.325ms mean=247.619ms median=246.215ms stdev_pop=35.005ms
+--- measured tokens_per_second ---
+n=5 min=54.547tps max=77.387tps mean=65.928tps median=64.984tps stdev_pop=9.316tps
+
+--- token hash ---
+warmup hash:   0x833045f1e2ebf49f
+measured hash: 0x833045f1e2ebf49f  (n_distinct=1)
+
+--- checks ---
+[PASS] harness exit code == 0
+[PASS] all 6 req lines parsed
+[PASS] stdout aggregate line contains: 'n_ok=6 n_cancelled=0 n_error=0'
+[PASS] all 6 status == ok
+[PASS] all 6 n_tokens_generated == 16
+[PASS] req[1..5] generated_token_hash all identical
+[PASS] req[0] generated_token_hash equals measured hash
+[PASS] stderr contains: 'prompt fits: 6 prompt tokens + 16 max_tokens <= 2048 ctx_size'
+[PASS] stderr has no '[serving-bench] error'
+[PASS] stderr has no 'failed'
+[PASS] per_repeat.csv has 6 data rows + header
+
+OVERALL: PASS
+
+--- caveats ---
+This is a small std-backend timing smoke, not a benchmark.
+No HPX comparison.
+No concurrency behavior.
+No cross-binary wall-clock comparison to llama-server yet.

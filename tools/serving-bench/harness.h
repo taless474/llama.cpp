@@ -82,6 +82,12 @@ struct harness_config {
     // Parser must reject any other value.
     std::string backend;
     uint32_t    seed_base;
+    // Optional per-request max_tokens plan. Empty means every request uses
+    // cfg.max_tokens (existing behavior). Non-empty must have exactly
+    // n_requests entries, each strictly positive. main.cpp's submit_one
+    // selects plan[next_idx] when non-empty; the fit-check uses
+    // max(plan) when non-empty.
+    std::vector<int32_t> max_tokens_plan;
 };
 
 enum class parse_result : uint8_t {

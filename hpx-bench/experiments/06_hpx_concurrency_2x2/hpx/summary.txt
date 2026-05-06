@@ -1,0 +1,111 @@
+=== llama-serving-bench hpx concurrency summary (comparison_hpx_concurrency/hpx) ===
+
+binary exit code: 0
+requests: 8 requests, all correctness-gated (no warmup phase)
+variant:  hpx
+shape:    n_contexts=2, n_concurrent=2, n_requests=8, max_tokens=16, n_threads=4
+
+--- per-request rows ---
+req[0] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=54.512 total_ms=246.517 total_minus_ttft_ms=192.005 tps=64.904
+req[1] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=54.577 total_ms=249.714 total_minus_ttft_ms=195.137 tps=64.073
+req[2] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=36.769 total_ms=238.224 total_minus_ttft_ms=201.455 tps=67.164
+req[3] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=36.367 total_ms=251.588 total_minus_ttft_ms=215.221 tps=63.596
+req[4] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=39.861 total_ms=231.810 total_minus_ttft_ms=191.949 tps=69.022
+req[5] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=36.729 total_ms=231.814 total_minus_ttft_ms=195.085 tps=69.021
+req[6] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=37.134 total_ms=235.905 total_minus_ttft_ms=198.771 tps=67.824
+req[7] kind=request  status=ok n_tok=16 hash=0x833045f1e2ebf49f ttft_ms=36.943 total_ms=233.771 total_minus_ttft_ms=196.828 tps=68.443
+
+--- ttft_ms ---
+n=8 min=36.367ms max=54.577ms mean=41.611ms median=37.038ms stdev_pop=7.535ms
+--- total_ms ---
+n=8 min=231.810ms max=251.588ms mean=239.918ms median=237.065ms stdev_pop=7.615ms
+--- total_ms - ttft_ms ---
+n=8 min=191.949ms max=215.221ms mean=198.306ms median=195.983ms stdev_pop=7.062ms
+--- tokens_per_second ---
+n=8 min=63.596tps max=69.022tps mean=66.756tps median=67.494tps stdev_pop=2.093tps
+
+--- HPX trace lines (filtered) ---
+trace_lines_total: 19
+start lines: 1
+ready lines: 1
+stop lines:  1
+acquire lines: 8
+release lines: 8
+acquire ctx ids seen: [0, 1]
+
+--- checks ---
+[PASS] harness exit code == 0
+[PASS] all 8 req lines parsed
+[PASS] stdout aggregate line contains: 'n_ok=8 n_cancelled=0 n_error=0'
+[PASS] all 8 status == ok
+[PASS] all 8 n_tokens_generated == 16
+[PASS] all 8 generated_token_hash equal canonical 0x833045f1e2ebf49f
+[PASS] stderr contains: 'prompt fits: 6 prompt tokens + 16 max_tokens <= 2048 ctx_size'
+[PASS] stderr has no '[serving-bench] error'
+[PASS] stderr has no 'failed'
+[PASS] per_repeat.csv has 8 data rows + header
+[PASS] exactly one start line: '[serving-bench] hpx_runtime_start_once: starting (os_threads=2)'
+[PASS] exactly one ready line: '[serving-bench] engine_hpx ready: n_contexts=2 pool_size=2'
+[PASS] exactly one stop line: '[serving-bench] hpx_runtime_stop: stopping'
+[PASS] req[0] exactly one acquire
+[PASS] req[0] exactly one release
+[PASS] req[0] acquire ctx id in {0, 1}
+[PASS] req[0] release ctx id in {0, 1}
+[PASS] req[0] release ctx equals acquire ctx
+[PASS] req[0] acquire precedes release
+[PASS] req[1] exactly one acquire
+[PASS] req[1] exactly one release
+[PASS] req[1] acquire ctx id in {0, 1}
+[PASS] req[1] release ctx id in {0, 1}
+[PASS] req[1] release ctx equals acquire ctx
+[PASS] req[1] acquire precedes release
+[PASS] req[2] exactly one acquire
+[PASS] req[2] exactly one release
+[PASS] req[2] acquire ctx id in {0, 1}
+[PASS] req[2] release ctx id in {0, 1}
+[PASS] req[2] release ctx equals acquire ctx
+[PASS] req[2] acquire precedes release
+[PASS] req[3] exactly one acquire
+[PASS] req[3] exactly one release
+[PASS] req[3] acquire ctx id in {0, 1}
+[PASS] req[3] release ctx id in {0, 1}
+[PASS] req[3] release ctx equals acquire ctx
+[PASS] req[3] acquire precedes release
+[PASS] req[4] exactly one acquire
+[PASS] req[4] exactly one release
+[PASS] req[4] acquire ctx id in {0, 1}
+[PASS] req[4] release ctx id in {0, 1}
+[PASS] req[4] release ctx equals acquire ctx
+[PASS] req[4] acquire precedes release
+[PASS] req[5] exactly one acquire
+[PASS] req[5] exactly one release
+[PASS] req[5] acquire ctx id in {0, 1}
+[PASS] req[5] release ctx id in {0, 1}
+[PASS] req[5] release ctx equals acquire ctx
+[PASS] req[5] acquire precedes release
+[PASS] req[6] exactly one acquire
+[PASS] req[6] exactly one release
+[PASS] req[6] acquire ctx id in {0, 1}
+[PASS] req[6] release ctx id in {0, 1}
+[PASS] req[6] release ctx equals acquire ctx
+[PASS] req[6] acquire precedes release
+[PASS] req[7] exactly one acquire
+[PASS] req[7] exactly one release
+[PASS] req[7] acquire ctx id in {0, 1}
+[PASS] req[7] release ctx id in {0, 1}
+[PASS] req[7] release ctx equals acquire ctx
+[PASS] req[7] acquire precedes release
+[PASS] set of acquire ctx ids equals {0, 1}
+[PASS] total filtered HPX trace lines == 19
+
+OVERALL: PASS
+
+--- caveats ---
+This is one bench-side leg of the (2,2) HPX concurrency slice.
+Cross-backend gates live in comparison_hpx_concurrency/comparison_summary.txt.
+All 8 requests are correctness-gated. No warmup separation.
+Timing stats above are descriptive only; gates do not depend on them.
+Oversubscription (2 contexts x 4 threads = 8 kernel threads on a 4-core box)
+is expected and is NOT a regression.
+Trace lines are event-ordered but not timestamped; we do NOT claim
+true overlap of in-flight requests in time.

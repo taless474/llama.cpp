@@ -1,0 +1,169 @@
+# sweep summary (cross-n_threads HPX-vs-std at C_2x4)
+# machine-readable header (KEY: VALUE); ends at '# END HEADER'
+cell_id: C_2x4
+thread_setting.n1.present: true
+thread_setting.n1.correctness_overall: PASS
+thread_setting.n1.correctness_trace_on.std: PASS
+thread_setting.n1.correctness_trace_on.hpx: PASS
+thread_setting.n1.timing_trace_off.std: PASS
+thread_setting.n1.timing_trace_off.hpx: PASS
+thread_setting.n2.present: true
+thread_setting.n2.correctness_overall: PASS
+thread_setting.n2.correctness_trace_on.std: PASS
+thread_setting.n2.correctness_trace_on.hpx: PASS
+thread_setting.n2.timing_trace_off.std: PASS
+thread_setting.n2.timing_trace_off.hpx: PASS
+thread_setting.n4.present: true
+thread_setting.n4.correctness_overall: PASS
+thread_setting.n4.correctness_trace_on.std: PASS
+thread_setting.n4.correctness_trace_on.hpx: PASS
+thread_setting.n4.timing_trace_off.std: PASS
+thread_setting.n4.timing_trace_off.hpx: PASS
+flat_threshold_pct: 1.0
+trend.total_ms.pool: mixed
+trend.total_minus_ttft_ms.pool: mixed
+trend.ttft_ms.pool: mixed
+trend.process_wall_ms.per_trial: mixed
+delta_pct.total_ms.pool.n1: 1.3172
+delta_pct.total_ms.pool.n2: 7.1435
+delta_pct.total_ms.pool.n4: 3.7294
+delta_pct.total_minus_ttft_ms.pool.n1: 1.2610
+delta_pct.total_minus_ttft_ms.pool.n2: 7.2571
+delta_pct.total_minus_ttft_ms.pool.n4: 3.7279
+delta_pct.ttft_ms.pool.n1: 1.2028
+delta_pct.ttft_ms.pool.n2: 6.9297
+delta_pct.ttft_ms.pool.n4: 3.6569
+delta_pct.process_wall_ms.per_trial.n1: 2.4506
+delta_pct.process_wall_ms.per_trial.n2: 4.9670
+delta_pct.process_wall_ms.per_trial.n4: 4.6898
+SWEEP_OVERALL_CORRECTNESS: PASS
+# END HEADER
+
+=== C_2x4 n_threads sensitivity sweep — cross-setting summary ===
+
+--- correctness gate by thread setting ---
+| n_thr | n_ctx | n_conc | n_req | c_std | c_hpx | t_std | t_hpx | OVERALL |
+|     1 |     2 |      4 |    12 | PASS  | PASS  | PASS  | PASS  | PASS    |
+|     2 |     2 |      4 |    12 | PASS  | PASS  | PASS  | PASS  | PASS    |
+|     4 |     2 |      4 |    12 | PASS  | PASS  | PASS  | PASS  | PASS    |
+
+SWEEP_OVERALL_CORRECTNESS: PASS
+
+--- total_ms (view: pool; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   |  741.918ms       |  751.691ms       |   +9.773ms       |  +1.32% |  0.2003 |  0.2176 |
+|     2 | yes   |  541.571ms       |  580.258ms       |  +38.687ms       |  +7.14% |  0.2227 |  0.2272 |
+|     4 | yes   |  488.700ms       |  506.925ms       |  +18.226ms       |  +3.73% |  0.2082 |  0.2546 |
+
+--- ttft_ms (view: pool; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   |  445.502ms       |  450.861ms       |   +5.359ms       |  +1.20% |  0.3496 |  0.3642 |
+|     2 | yes   |  318.880ms       |  340.977ms       |  +22.098ms       |  +6.93% |  0.3673 |  0.3772 |
+|     4 | yes   |  283.055ms       |  293.406ms       |  +10.351ms       |  +3.66% |  0.3729 |  0.4105 |
+
+--- total_minus_ttft_ms (view: pool; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   |  296.796ms       |  300.538ms       |   +3.743ms       |  +1.26% |  0.0298 |  0.1211 |
+|     2 | yes   |  220.489ms       |  236.490ms       |  +16.001ms       |  +7.26% |  0.1026 |  0.0767 |
+|     4 | yes   |  204.109ms       |  211.719ms       |   +7.609ms       |  +3.73% |  0.0781 |  0.2174 |
+
+--- tokens_per_second (view: pool; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   |   21.566tps      |   21.285tps      |   -0.280tps      |  -1.30% |  0.3118 |  0.3248 |
+|     2 | yes   |   29.544tps      |   27.574tps      |   -1.970tps      |  -6.67% |  0.3476 |  0.3651 |
+|     4 | yes   |   32.740tps      |   31.563tps      |   -1.177tps      |  -3.60% |  0.3259 |  0.3578 |
+
+--- process_wall_ms (view: per_trial; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   | 2528.322ms       | 2590.280ms       |  +61.958ms       |  +2.45% |  0.0172 |  0.0339 |
+|     2 | yes   | 1979.565ms       | 2077.892ms       |  +98.326ms       |  +4.97% |  0.0236 |  0.0240 |
+|     4 | yes   | 1804.687ms       | 1889.323ms       |  +84.636ms       |  +4.69% |  0.0265 |  0.0565 |
+
+--- agg_tok_s (view: per_trial; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   |   85.275tps      |   83.475tps      |   -1.800tps      |  -2.11% |  0.0181 |  0.0362 |
+|     2 | yes   |  114.205tps      |  108.945tps      |   -5.260tps      |  -4.61% |  0.0290 |  0.0278 |
+|     4 | yes   |  128.710tps      |  124.230tps      |   -4.480tps      |  -3.48% |  0.0306 |  0.0584 |
+
+--- per-trial median total_ms (view: per_trial; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   |  741.534ms       |  754.100ms       |  +12.566ms       |  +1.69% |  0.0149 |  0.0149 |
+|     2 | yes   |  544.260ms       |  578.505ms       |  +34.245ms       |  +6.29% |  0.0175 |  0.0232 |
+|     4 | yes   |  489.545ms       |  505.115ms       |  +15.570ms       |  +3.18% |  0.0195 |  0.0229 |
+
+--- per-trial median tmt_ms (view: per_trial; std vs hpx; Δ on median) ---
+| n_thr | OK?   | std median       | hpx median       | Δ                | Δ %     | std CV  | hpx CV  |
+|     1 | yes   |  296.259ms       |  299.933ms       |   +3.675ms       |  +1.24% |  0.0144 |  0.0132 |
+|     2 | yes   |  220.784ms       |  236.167ms       |  +15.383ms       |  +6.97% |  0.0236 |  0.0402 |
+|     4 | yes   |  203.237ms       |  210.913ms       |   +7.677ms       |  +3.78% |  0.0255 |  0.0129 |
+
+--- HPX-vs-std delta % across n_threads (primary trend metric: total_ms median) ---
+flat_threshold_pct: 1.0
+
+  primary  (metric.total_ms.pool.delta_pct)
+    n_threads=1: +1.3172%
+    n_threads=2: +7.1435%
+    n_threads=4: +3.7294%
+    range:              5.8263%
+    trend:             mixed
+
+  secondary  (metric.total_minus_ttft_ms.pool.delta_pct)
+    n_threads=1: +1.2610%
+    n_threads=2: +7.2571%
+    n_threads=4: +3.7279%
+    range:              5.9961%
+    trend:             mixed
+
+  secondary  (metric.ttft_ms.pool.delta_pct)
+    n_threads=1: +1.2028%
+    n_threads=2: +6.9297%
+    n_threads=4: +3.6569%
+    range:              5.7269%
+    trend:             mixed
+
+  secondary  (metric.process_wall_ms.per_trial.delta_pct)
+    n_threads=1: +2.4506%
+    n_threads=2: +4.9670%
+    n_threads=4: +4.6898%
+    range:              2.5164%
+    trend:             mixed
+
+--- trend interpretation rules (a-priori) ---
+- oversubscription:
+    delta_pct(n=1) < delta_pct(n=2) < delta_pct(n=4) (strict monotonic)
+    AND max - min >= 1.0%
+    Reading: prior C_2x4 HPX overhead was amplified by kernel-thread
+    oversubscription. Orchestration overhead alone is small.
+- orchestration_or_waiter_path:
+    max - min < 1.0%
+    Reading: HPX overhead is intrinsic to serving-level orchestration
+    or waiter path, not to oversubscription. C_2x4 in the matrix was
+    not confounded by thread pressure.
+- mixed:
+    delta_pct trend is non-monotonic across n_threads = {1, 2, 4}.
+    Reading: both effects contribute; cannot cleanly attribute.
+- incomplete:
+    any thread setting missing or its correctness state is FAIL.
+    Reading: do not interpret timing.
+
+--- caveats ---
+- The sweep OVERALL gate is correctness for all three thread settings.
+  Timing numbers above are descriptive and do not gate anything.
+- Δ % is (hpx_median - std_median) / std_median * 100. Sub-1% deltas
+  inside the CV band are not interpretable as 'different'.
+- Timing rows for thread settings whose correctness is FAIL or MISSING
+  are shown as '<suppressed>'.
+- This is still C_2x4: waiter pressure is held constant. The sweep
+  reduces kernel-thread oversubscription, not queueing pressure.
+- n_threads=1 may use a different ggml/single-thread path. If the
+  shrink is concentrated at n=1 only, prefer the 'mixed' or
+  'incomplete' reading over a clean 'oversubscription' label.
+- If the trend label is 'orchestration_or_waiter_path', the likely
+  source is serving / HPX orchestration or waiter-path overhead.
+- If the trend label is 'oversubscription', the prior C_2x4 overhead
+  was likely amplified by oversubscription.
+- This protocol measures THIS serving-bench harness on THIS machine,
+  with THIS build, THIS model, THIS prompt, THIS generation length.
+  It is not a measurement of llama.cpp performance, not a measurement
+  of HPX scheduler quality in general, and not a recommendation for
+  or against either backend.
