@@ -1,0 +1,61 @@
+LAYER: timing_trace_off
+BACKEND: hpx
+N_TRIALS_SCHEDULED: 11
+N_TRIALS_PASS: 11
+N_TRIALS_PRESENT: 11
+LAYER_OVERALL: PASS
+N_TRIALS_WITH_MULTISET_MISMATCH: 0
+N_MEASURED_TRIALS: 10
+PLAN: 64,8,16,8,64,16,8,64,8,16,8,32
+PLAN_MAX: 64
+PLAN_BUDGETS_SORTED_UNIQUE: 8,16,32,64
+CROSS_TRIAL_HASH_INCONSISTENT_BUDGETS: none
+# END HEADER
+
+layer=timing_trace_off  backend=hpx  n_trials_scheduled=11  n_trials_pass=11
+
+Per-trial gate results:
+  trial  present  pass  n_rows  multiset_delta            failed_gates
+      0  True     True      12  -                          -
+      1  True     True      12  -                          -
+      2  True     True      12  -                          -
+      3  True     True      12  -                          -
+      4  True     True      12  -                          -
+      5  True     True      12  -                          -
+      6  True     True      12  -                          -
+      7  True     True      12  -                          -
+      8  True     True      12  -                          -
+      9  True     True      12  -                          -
+     10  True     True      12  -                          -
+
+Failed-gate details (per trial):
+  (none)
+
+Per-budget hash observed in this (layer, backend):
+  budget=  8  hash=0x0619d4d1900c2365
+  budget= 16  hash=0x833045f1e2ebf49f
+  budget= 32  hash=0x6794e47fe0f84af1
+  budget= 64  hash=0x7efcc69b4edadb70
+
+Descriptive timing aggregates (measured trials only):
+  measured trials   : 10
+  ----- per-class request pools -----
+  short  total_ms                      n= 80  median=645.668  p95=950.928  mean=630.481  cv=0.3850
+  short  ttft_ms                       n= 80  median=477.611  p95=809.493  mean=457.695  cv=0.5020
+  short  total_minus_ttft_ms           n= 80  median=124.800  p95=267.946  mean=172.785  cv=0.4316
+  medium total_ms                      n= 10  median=995.477  p95=1056.596  mean=1000.258  cv=0.0333
+  medium ttft_ms                       n= 10  median=544.118  p95=555.674  mean=542.061  cv=0.0219
+  medium total_minus_ttft_ms           n= 10  median=447.845  p95=508.812  mean=458.197  cv=0.0637
+  long   total_ms                      n= 30  median=1561.854  p95=1733.405  mean=1441.844  cv=0.1786
+  long   ttft_ms                       n= 30  median=542.880  p95=586.792  mean=390.146  cv=0.6039
+  long   total_minus_ttft_ms           n= 30  median=1051.683  p95=1111.532  mean=1051.698  cv=0.0559
+  ----- per-trial trial-level -----
+  makespan_ms                          n= 10  median=1614.351  p95=1785.145  mean=1638.155  cv=0.0547
+  queue_drain_ms                       n= 10  median=45.045  p95=91.877  mean=46.669  cv=0.6445
+  process_wall_ms                      n= 10  median=3609.168  p95=3962.133  mean=3622.950  cv=0.0691
+  agg_tok_per_s                        n= 10  median=106.700  p95=110.410  mean=105.715  cv=0.0399
+
+Outputs:
+  per-trial table : layer_timing_hpx_per_trial.csv
+  request rows    : layer_timing_hpx_all_requests.csv
+

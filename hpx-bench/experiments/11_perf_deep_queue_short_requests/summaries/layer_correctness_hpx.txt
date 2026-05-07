@@ -1,0 +1,51 @@
+LAYER: correctness_trace_on
+BACKEND: hpx
+N_TRIALS_SCHEDULED: 11
+N_TRIALS_PASS: 11
+N_TRIALS_PRESENT: 11
+LAYER_OVERALL: PASS
+N_TRIALS_WITH_MULTISET_MISMATCH: 0
+N_MEASURED_TRIALS: 0
+PLAN_LEN: 200
+PLAN_UNIQUE: 8
+PLAN_MULTISET: {"8": 200}
+CROSS_TRIAL_HASH_INCONSISTENT_BUDGETS: none
+# END HEADER
+
+layer=correctness_trace_on  backend=hpx  n_trials_scheduled=11  n_trials_pass=11
+
+Per-trial gate results:
+  trial  present  pass  n_rows  multiset_delta            failed_gates
+      0  True     True     200  -                          -
+      1  True     True     200  -                          -
+      2  True     True     200  -                          -
+      3  True     True     200  -                          -
+      4  True     True     200  -                          -
+      5  True     True     200  -                          -
+      6  True     True     200  -                          -
+      7  True     True     200  -                          -
+      8  True     True     200  -                          -
+      9  True     True     200  -                          -
+     10  True     True     200  -                          -
+
+Failed-gate details (per trial):
+  (none)
+
+Per-budget hash observed in this (layer, backend):
+  budget=  8  hash=0x0619d4d1900c2365
+
+Descriptive timing aggregates (measured trials only):
+  measured trials   : 0
+  ----- per-request short-class pool (deep queue) -----
+  short  total_ms                      n=0
+  short  ttft_ms                       n=0
+  short  total_minus_ttft_ms           n=0
+  ----- per-trial trial-level -----
+  makespan_ms                          n=0
+  process_wall_ms                      n=0
+  agg_tok_per_s                        n=0
+
+Outputs:
+  per-trial table : layer_correctness_hpx_per_trial.csv
+  request rows    : layer_correctness_hpx_all_requests.csv
+

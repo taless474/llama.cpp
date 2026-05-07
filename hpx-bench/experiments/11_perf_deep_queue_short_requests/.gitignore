@@ -1,0 +1,9 @@
+# Raw trial artifacts and driver logs are reproducible from the helpers
+# in this directory. Track only the runnable scripts, the docs, and the
+# summarized evidence under summaries/.
+runs/
+
+# Belt-and-suspenders: __pycache__/ is also covered by the repo-level
+# .gitignore; pinning both here keeps this package self-contained.
+__pycache__/
+*.pyc

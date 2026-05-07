@@ -1,0 +1,26 @@
+EXPERIMENT_OVERALL: PASS
+CORRECTNESS_CONDITION: PASS
+TIMING_CONDITION: PASS
+DELTA_PCT_SHORT_TOTAL_MED: +1.9967
+DELTA_PCT_LONG_TOTAL_MED: -0.3258
+DELTA_PCT_MAKESPAN_MED: +0.9998
+BRANCH_LABEL: hpx_short_worse
+# END HEADER
+
+Condition summaries:
+  correctness_trace_on : PASS  (std layer: PASS, hpx layer: PASS, hash equality: PASS)
+  timing_trace_off     : PASS  (std layer: PASS, hpx layer: PASS, hash equality: PASS)
+
+Headline deltas (timing layer):
+  short.total_ms.delta_pct (median) : +1.9967
+  long.total_ms.delta_pct  (median) : -0.3258
+  makespan.delta_pct       (median) : +0.9998
+
+Branch label: hpx_short_worse
+
+Branch rules (see facts.md §10):
+  hpx_short_better : short ≤ −1.0%, makespan ≤ +0.5%, long ≤ +1.0%
+  equivalent       : |short| ≤ 1.0%, |makespan| ≤ 1.0%, |long| ≤ 1.0%
+  hpx_short_worse  : short ≥ +1.0%  (CV-disjoint check left descriptive)
+  mixed            : sign disagrees across classes, or short and makespan disagree
+  incomplete       : EXPERIMENT_OVERALL ≠ PASS or any required delta is NA

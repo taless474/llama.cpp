@@ -1,0 +1,51 @@
+LAYER: timing_trace_off
+BACKEND: std
+N_TRIALS_SCHEDULED: 11
+N_TRIALS_PASS: 11
+N_TRIALS_PRESENT: 11
+LAYER_OVERALL: PASS
+N_TRIALS_WITH_MULTISET_MISMATCH: 0
+N_MEASURED_TRIALS: 10
+PLAN_LEN: 200
+PLAN_UNIQUE: 8
+PLAN_MULTISET: {"8": 200}
+CROSS_TRIAL_HASH_INCONSISTENT_BUDGETS: none
+# END HEADER
+
+layer=timing_trace_off  backend=std  n_trials_scheduled=11  n_trials_pass=11
+
+Per-trial gate results:
+  trial  present  pass  n_rows  multiset_delta            failed_gates
+      0  True     True     200  -                          -
+      1  True     True     200  -                          -
+      2  True     True     200  -                          -
+      3  True     True     200  -                          -
+      4  True     True     200  -                          -
+      5  True     True     200  -                          -
+      6  True     True     200  -                          -
+      7  True     True     200  -                          -
+      8  True     True     200  -                          -
+      9  True     True     200  -                          -
+     10  True     True     200  -                          -
+
+Failed-gate details (per trial):
+  (none)
+
+Per-budget hash observed in this (layer, backend):
+  budget=  8  hash=0x0619d4d1900c2365
+
+Descriptive timing aggregates (measured trials only):
+  measured trials   : 10
+  ----- per-request short-class pool (deep queue) -----
+  short  total_ms                      n= 2000  p50=2787.975  p90=3037.984  p95=3052.074  p99=3081.293  cv=0.2501
+  short  ttft_ms                       n= 2000  p50=2674.247  p90=2913.213  p95=2927.341  p99=2964.980  cv=0.2594
+  short  total_minus_ttft_ms           n= 2000  p50=116.228  p90=126.792  p95=128.533  p99=138.501  cv=0.0974
+  ----- per-trial trial-level -----
+  makespan_ms                          n=   10  p50=3033.740  p90=3091.023  p95=3134.935  p99=3170.065  cv=0.0461
+  process_wall_ms                      n=   10  p50=18218.507  p90=19214.390  p95=19216.466  p99=19218.127  cv=0.0522
+  agg_tok_per_s                        n=   10  p50=90.870  p90=97.385  p95=97.947  p99=98.398  cv=0.0556
+
+Outputs:
+  per-trial table : layer_timing_std_per_trial.csv
+  request rows    : layer_timing_std_all_requests.csv
+

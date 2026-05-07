@@ -1187,3 +1187,44 @@ larger or more varied prompts
 ```
 
 More fixed-shape TinyLlama sweeps are no longer likely to change the central conclusion.
+
+## 4. Bench: add serving-bench closeout evidence
+
+Added the final serving-bench evidence for the HPX-vs-std FIFO context-pool comparison.
+
+This package adds two runnable experiment directories:
+
+- `hpx-bench/experiments/10_perf_heterogeneous_budgets/`
+- `hpx-bench/experiments/11_perf_deep_queue_short_requests/`
+
+Experiment 10 tested mixed request budgets under mild waiter pressure:
+
+- `EXPERIMENT_OVERALL: PASS`
+- branch label: `hpx_short_worse`
+- 44 / 44 invocations completed
+- 0 token-count multiset mismatches
+- std-vs-HPX per-budget hash equality passed
+- short-request median `total_ms`: HPX +1.9967%
+- trial makespan median: HPX +1.00%
+- queue-drain median: HPX +28.06 ms, but noisy and small relative to total makespan
+
+Experiment 11 tested a deep queue of uniform short requests to amplify request wake/queue overhead:
+
+- `EXPERIMENT_OVERALL: PASS`
+- branch label: `hpx_worse`
+- 44 / 44 invocations passed
+- budget-8 hash equality passed: `0x0619d4d1900c2365`
+- HPX correctness traces matched the expected 403 lifecycle/pool lines in 11 / 11 correctness trials
+- short-request median `total_ms`: HPX +2.07%
+- short-request p99 `total_ms`: HPX +1.20%, inside the configured +2.0% p99 threshold
+- trial makespan median: HPX -0.14%
+
+Together with the earlier matrix and thread-sweep experiments, these results support a conservative closeout conclusion: the HPX serving backend is correct and robust, but the current FIFO context-pool design does not outperform the simpler std backend on the tested CPU-only TinyLlama workloads.
+
+The old design-only heterogeneous-budget package was removed because the runnable experiment package supersedes it.
+
+A closeout note was added at:
+
+- `docs/hpx/serving_fifo_pool_closeout.md`
+
+The closeout is intentionally scoped to the current FIFO context-pool design. It does not claim that HPX cannot help LLM serving in designs that use HPX-native capabilities such as cancellation, priority scheduling, richer future composition, or distributed execution.

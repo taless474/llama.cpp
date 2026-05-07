@@ -1,0 +1,67 @@
+LAYER: timing_trace_off
+STD_LAYER_OVERALL: PASS
+HPX_LAYER_OVERALL: PASS
+PLAN_UNIQUE: 8
+N_BUDGETS_TOTAL: 1
+N_BUDGETS_EQUAL: 1
+N_BUDGETS_UNEQUAL: 0
+N_BUDGETS_MISSING: 0
+N_BUDGETS_INCONSISTENT: 0
+HASH_EQUALITY: PASS
+CONDITION_OVERALL: PASS
+DELTA_PCT_SHORT_TOTAL_MED: +2.0660
+DELTA_PCT_SHORT_TOTAL_P90: +0.1324
+DELTA_PCT_SHORT_TOTAL_P95: +0.4347
+DELTA_PCT_SHORT_TOTAL_P99: +1.2036
+DELTA_PCT_MAKESPAN_MED: -0.1444
+# END HEADER
+
+layer=timing_trace_off
+std layer overall: PASS  hpx layer overall: PASS
+
+Per-budget cross-backend hash equality:
+  budget  status        std_hash(es)                    hpx_hash(es)
+       8  EQUAL          0x0619d4d1900c2365                  0x0619d4d1900c2365
+  HASH_EQUALITY summary: 1/1 EQUAL  unequal=0  missing=0  inconsistent=0
+
+Short-class request pool (measured trials only):
+  std view:
+  short  total_ms                      n= 2000  p50=2787.975  p90=3037.984  p95=3052.074  p99=3081.293  cv=0.2501
+  short  ttft_ms                       n= 2000  p50=2674.247  p90=2913.213  p95=2927.341  p99=2964.980  cv=0.2594
+  short  total_minus_ttft_ms           n= 2000  p50=116.228  p90=126.792  p95=128.533  p99=138.501  cv=0.0974
+  hpx view:
+  short  total_ms                      n= 2000  p50=2845.574  p90=3042.006  p95=3065.341  p99=3118.378  cv=0.2431
+  short  ttft_ms                       n= 2000  p50=2728.997  p90=2917.198  p95=2938.705  p99=2989.950  cv=0.2527
+  short  total_minus_ttft_ms           n= 2000  p50=119.608  p90=127.390  p95=128.786  p99=134.207  cv=0.0861
+
+HPX-vs-std deltas at p50, p90, p95, p99:
+  short  total_ms                     
+      p50: std=2787.975 hpx=2845.574 d=+57.600 (+2.07%)
+      p90: std=3037.984 hpx=3042.006 d=+4.022 (+0.13%)
+      p95: std=3052.074 hpx=3065.341 d=+13.267 (+0.43%)
+      p99: std=3081.293 hpx=3118.378 d=+37.086 (+1.20%)
+  short  ttft_ms                      
+      p50: std=2674.247 hpx=2728.997 d=+54.750 (+2.05%)
+      p90: std=2913.213 hpx=2917.198 d=+3.985 (+0.14%)
+      p95: std=2927.341 hpx=2938.705 d=+11.363 (+0.39%)
+      p99: std=2964.980 hpx=2989.950 d=+24.969 (+0.84%)
+  short  total_minus_ttft_ms          
+      p50: std=116.228 hpx=119.608 d=+3.379 (+2.91%)
+      p90: std=126.792 hpx=127.390 d=+0.599 (+0.47%)
+      p95: std=128.533 hpx=128.786 d=+0.252 (+0.20%)
+      p99: std=138.501 hpx=134.207 d=-4.294 (-3.10%)
+
+Per-trial trial-level metrics (measured trials only):
+  std view:
+  makespan_ms                          n=   10  p50=3033.740  p90=3091.023  p95=3134.935  p99=3170.065  cv=0.0461
+  process_wall_ms                      n=   10  p50=18218.507  p90=19214.390  p95=19216.466  p99=19218.127  cv=0.0522
+  agg_tok_per_s                        n=   10  p50=90.870  p90=97.385  p95=97.947  p99=98.398  cv=0.0556
+  hpx view:
+  makespan_ms                          n=   10  p50=3029.360  p90=3121.777  p95=3146.904  p99=3167.006  cv=0.0430
+  process_wall_ms                      n=   10  p50=18964.651  p90=19284.534  p95=19500.272  p99=19672.862  cv=0.0525
+  agg_tok_per_s                        n=   10  p50=88.050  p90=96.766  p95=96.838  p99=96.896  cv=0.0543
+  delta (hpx - std):
+  makespan_ms                          std.med=3033.740 hpx.med=3029.360  delta=-4.380 (-0.14%)
+  process_wall_ms                      std.med=18218.507 hpx.med=18964.651  delta=+746.144 (+4.10%)
+  agg_tok_per_s                        std.med=90.870 hpx.med=88.050  delta=-2.820 (-3.10%)
+

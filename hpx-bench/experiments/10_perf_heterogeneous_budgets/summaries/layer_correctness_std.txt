@@ -1,0 +1,63 @@
+LAYER: correctness_trace_on
+BACKEND: std
+N_TRIALS_SCHEDULED: 11
+N_TRIALS_PASS: 11
+N_TRIALS_PRESENT: 11
+LAYER_OVERALL: PASS
+N_TRIALS_WITH_MULTISET_MISMATCH: 0
+N_MEASURED_TRIALS: 0
+PLAN: 64,8,16,8,64,16,8,64,8,16,8,32
+PLAN_MAX: 64
+PLAN_BUDGETS_SORTED_UNIQUE: 8,16,32,64
+CROSS_TRIAL_HASH_INCONSISTENT_BUDGETS: none
+# END HEADER
+
+layer=correctness_trace_on  backend=std  n_trials_scheduled=11  n_trials_pass=11
+
+Per-trial gate results:
+  trial  present  pass  n_rows  multiset_delta            failed_gates
+      0  True     True      12  -                          -
+      1  True     True      12  -                          -
+      2  True     True      12  -                          -
+      3  True     True      12  -                          -
+      4  True     True      12  -                          -
+      5  True     True      12  -                          -
+      6  True     True      12  -                          -
+      7  True     True      12  -                          -
+      8  True     True      12  -                          -
+      9  True     True      12  -                          -
+     10  True     True      12  -                          -
+
+Failed-gate details (per trial):
+  (none)
+
+Per-budget hash observed in this (layer, backend):
+  budget=  8  hash=0x0619d4d1900c2365
+  budget= 16  hash=0x833045f1e2ebf49f
+  budget= 32  hash=0x6794e47fe0f84af1
+  budget= 64  hash=0x7efcc69b4edadb70
+
+Descriptive timing aggregates (measured trials only):
+  measured trials   : 0
+  ----- per-class request pools -----
+  short  total_ms                      n=0
+  short  ttft_ms                       n=0
+  short  total_minus_ttft_ms           n=0
+  medium total_ms                      n=0
+  medium ttft_ms                       n=0
+  medium total_minus_ttft_ms           n=0
+  long   total_ms                      n=0
+  long   ttft_ms                       n=0
+  long   total_minus_ttft_ms           n=0
+  ----- per-trial trial-level -----
+  makespan_ms                          n=0
+  queue_drain_ms                       n=0
+  process_wall_ms                      n=0
+  agg_tok_per_s                        n=0
+
+Canonical per-budget hashes recorded to summaries/canonical_hashes_by_budget.json
+
+Outputs:
+  per-trial table : layer_correctness_std_per_trial.csv
+  request rows    : layer_correctness_std_all_requests.csv
+

@@ -1,0 +1,78 @@
+LAYER: correctness_trace_on
+STD_LAYER_OVERALL: PASS
+HPX_LAYER_OVERALL: PASS
+PLAN_BUDGETS: 8,16,32,64
+N_BUDGETS_TOTAL: 4
+N_BUDGETS_EQUAL: 4
+N_BUDGETS_UNEQUAL: 0
+N_BUDGETS_MISSING: 0
+N_BUDGETS_INCONSISTENT: 0
+HASH_EQUALITY: PASS
+CONDITION_OVERALL: PASS
+DELTA_PCT_SHORT_TOTAL_MED: NA
+DELTA_PCT_LONG_TOTAL_MED: NA
+DELTA_PCT_MED_TOTAL_MED: NA
+DELTA_PCT_MAKESPAN_MED: NA
+# END HEADER
+
+layer=correctness_trace_on
+std layer overall: PASS  hpx layer overall: PASS
+
+Per-budget cross-backend hash equality:
+  budget  status        std_hash(es)                    hpx_hash(es)
+       8  EQUAL          0x0619d4d1900c2365                  0x0619d4d1900c2365
+      16  EQUAL          0x833045f1e2ebf49f                  0x833045f1e2ebf49f
+      32  EQUAL          0x6794e47fe0f84af1                  0x6794e47fe0f84af1
+      64  EQUAL          0x7efcc69b4edadb70                  0x7efcc69b4edadb70
+  HASH_EQUALITY summary: 4/4 EQUAL  unequal=0  missing=0  inconsistent=0
+
+Per-class request pools (measured trials only):
+  std view:
+  short  total_ms                      n=0
+  short  ttft_ms                       n=0
+  short  total_minus_ttft_ms           n=0
+  medium total_ms                      n=0
+  medium ttft_ms                       n=0
+  medium total_minus_ttft_ms           n=0
+  long   total_ms                      n=0
+  long   ttft_ms                       n=0
+  long   total_minus_ttft_ms           n=0
+  hpx view:
+  short  total_ms                      n=0
+  short  ttft_ms                       n=0
+  short  total_minus_ttft_ms           n=0
+  medium total_ms                      n=0
+  medium ttft_ms                       n=0
+  medium total_minus_ttft_ms           n=0
+  long   total_ms                      n=0
+  long   ttft_ms                       n=0
+  long   total_minus_ttft_ms           n=0
+
+HPX-vs-std deltas (median, p95):
+  short  total_ms                      (insufficient data)
+  short  ttft_ms                       (insufficient data)
+  short  total_minus_ttft_ms           (insufficient data)
+  medium total_ms                      (insufficient data)
+  medium ttft_ms                       (insufficient data)
+  medium total_minus_ttft_ms           (insufficient data)
+  long   total_ms                      (insufficient data)
+  long   ttft_ms                       (insufficient data)
+  long   total_minus_ttft_ms           (insufficient data)
+
+Per-trial trial-level metrics (measured trials only):
+  std view:
+  makespan_ms                          n=0
+  queue_drain_ms                       n=0
+  process_wall_ms                      n=0
+  agg_tok_per_s                        n=0
+  hpx view:
+  makespan_ms                          n=0
+  queue_drain_ms                       n=0
+  process_wall_ms                      n=0
+  agg_tok_per_s                        n=0
+  delta (hpx - std):
+  makespan_ms                          (insufficient data)
+  queue_drain_ms                       (insufficient data)
+  process_wall_ms                      (insufficient data)
+  agg_tok_per_s                        (insufficient data)
+

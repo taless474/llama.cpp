@@ -1,0 +1,15 @@
+{
+  "canonical_hash_by_budget": {
+    "16": "0x833045f1e2ebf49f",
+    "32": "0x6794e47fe0f84af1",
+    "64": "0x7efcc69b4edadb70",
+    "8": "0x0619d4d1900c2365"
+  },
+  "comment": "Per-budget canonical hash from the std correctness layer. At greedy/argmax with a fixed prompt, every row of a given budget value shares one hash. This file is a regression aid; the primary gate is the per-budget cross-backend hash equality enforced by _summarize_condition.py.",
+  "plan_budgets_sorted_unique": [
+    8,
+    16,
+    32,
+    64
+  ]
+}
