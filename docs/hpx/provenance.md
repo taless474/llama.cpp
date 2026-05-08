@@ -788,7 +788,7 @@ Still not useful as final evidence:
 - comparing runs after source changes between std and HPX
 - making broad speedup claims from this TinyLlama / short-decode matrix
 
-## 3. bench: package HPX serving-bench evidence
+## 3. Bench: package HPX serving-bench evidence
 
 This section packages the benchmark evidence produced after the HPX serving backend became functional.
 
@@ -1228,3 +1228,526 @@ A closeout note was added at:
 - `docs/hpx/serving_fifo_pool_closeout.md`
 
 The closeout is intentionally scoped to the current FIFO context-pool design. It does not claim that HPX cannot help LLM serving in designs that use HPX-native capabilities such as cancellation, priority scheduling, richer future composition, or distributed execution.
+
+## 5. Packaging HPX continuous-batching gate and cancellation evidence
+
+This section packages the HPX continuous-batching direction and its evidence.
+
+It records the move from the older FIFO serving-bench path to the current continuous-batching orchestration path, and it adds the prototype tools and documents that prove the current correctness/lifecycle gates.
+
+
+### 5.1 What changed in this package
+
+This package adds or updates the main documentation and prototype artifacts for the current HPX serving direction:
+
+```text
+docs/hpx/provenance.md
+tools/CMakeLists.txt
+docs/hpx/continuous_batching_gate_closeout.md
+docs/hpx/continuous_batching_live_admission_design.md
+docs/hpx/continuous_batching_phase3_target.md
+docs/hpx/continuous_batching_simulator_design.md
+docs/hpx/continuous_batching_upstream_notes.md
+docs/hpx/continuous_batching_cancellation_design.md
+docs/hpx/continuous_batching_prototype_design.md
+docs/hpx/ggml_cgraph_dump_repro.md
+docs/hpx/multiseq_llama_batch_gate.md
+hpx-bench/sim/
+tools/hpx-continuous-batch-gate/
+tools/multiseq-batch-gate/
+```
+
+The package includes:
+
+```text
+continuous-batching simulator work
+pure llama.cpp multi-seq shared-batch reference gate
+HPX continuous-batch orchestration gate
+cooperative cancellation design and results
+closeout notes for the current HPX continuous-batching gate
+design-only live-admission notes for later work
+```
+
+This is a correctness/lifecycle package, not a performance claim.
+
+---
+
+### 5.2 FIFO serving-bench path is closed out
+
+The earlier serving-level HPX path used HPX as a FIFO context-pool replacement around opaque `llama_decode` calls.
+
+The result was:
+
+```text
+Correct and robust, but no reliable HPX latency benefit.
+```
+
+Evidence came from the serving-bench experiments, especially:
+
+```text
+hpx-bench/experiments/10_perf_heterogeneous_budgets/
+hpx-bench/experiments/11_perf_deep_queue_short_requests/
+```
+
+Experiment 10 result:
+
+```text
+EXPERIMENT_OVERALL: PASS
+branch label: hpx_short_worse
+
+short total_ms median: HPX +1.9967%
+medium total_ms median: HPX +1.59%
+long total_ms median: HPX -0.33%
+trial makespan median: HPX +1.00%
+```
+
+Experiment 11 result:
+
+```text
+EXPERIMENT_OVERALL: PASS
+branch label: hpx_worse
+
+short.total_ms median: HPX +2.07%
+short.total_ms p90:    HPX +0.13%
+short.total_ms p95:    HPX +0.43%
+short.total_ms p99:    HPX +1.20%
+makespan median:       HPX -0.14%
+```
+
+Interpretation:
+
+```text
+The FIFO context-pool backend preserved correctness, but it did not show a useful latency advantage.
+That path is closed out as a performance direction.
+```
+
+---
+
+### 5.3 Continuous-batching simulator selected the next target
+
+The simulator work lives under:
+
+```text
+hpx-bench/sim/continuous_batching/
+```
+
+Supporting design/results docs include:
+
+```text
+docs/hpx/continuous_batching_simulator_design.md
+hpx-bench/sim/continuous_batching/results.md
+hpx-bench/sim/continuous_batching/phase2b_mixed_workload.md
+```
+
+The simulator is a scheduling model only:
+
+```text
+No HPX.
+No llama.cpp.
+No real logits, KV cache, HTTP, or GPU behavior.
+```
+
+Simulator result:
+
+```text
+Static and continuous batching mostly tie on symmetric all-short workloads.
+Continuous batching separates on mixed or bursty workloads.
+```
+
+The first useful real target selected from the simulator was:
+
+```text
+mixed_decode_only
+prompt_tokens = 6
+decode budget mix = {8, 64, 256}
+round-robin class assignment
+all requests admitted at t = 0
+```
+
+Reason:
+
+```text
+This isolates decode-length heterogeneity without adding long-prompt prefill complexity.
+```
+
+---
+
+### 5.4 Pure llama.cpp multi-seq gate proved the execution primitive
+
+The pure llama.cpp reference gate lives under:
+
+```text
+tools/multiseq-batch-gate/
+```
+
+Supporting doc:
+
+```text
+docs/hpx/multiseq_llama_batch_gate.md
+tools/multiseq-batch-gate/results.md
+```
+
+The purpose was to prove the real llama.cpp primitive before adding HPX orchestration.
+
+Final Step-5 shape:
+
+```text
+n_seqs = 99
+budget mix = {8, 64, 256}
+33 seqs per budget class
+prompt_tokens = 6
+one llama_model
+one llama_context
+one shared llama_batch
+shared prefill
+shared decode loop
+per-seq KV clear
+```
+
+Result:
+
+```text
+GATE_STEP5: PASS
+```
+
+Observed capacity:
+
+```text
+actual n_ctx = 50688
+actual n_seq_max = 99
+actual n_batch = 1024
+```
+
+Hashes:
+
+```text
+budget 8   -> 0x0619d4d1900c2365
+budget 64  -> 0x88a4dc75a31d4325
+budget 256 -> 0x8a1a3bd01360aada
+```
+
+Lifecycle anchors:
+
+```text
+done_iter:
+  8   -> {7}
+  64  -> {63}
+  256 -> {255}
+
+pos_max_at_clear:
+  8   -> {12}
+  64  -> {68}
+  256 -> {260}
+```
+
+Other gates:
+
+```text
+1 unique hash per budget class
+residual KV empty at end
+no sibling cross-talk on KV clear
+every llama_decode returned 0
+--repeat 2 passed
+```
+
+Important caveat:
+
+```text
+Budget-64 and budget-256 hashes are batch-shape dependent.
+Do not compare long-budget hashes across different batch shapes.
+Use same-shape repeat determinism and within-run same-class hash equality.
+```
+
+---
+
+### 5.5 HPX continuous-batch gate proved request lifecycle ownership
+
+The HPX prototype lives under:
+
+```text
+tools/hpx-continuous-batch-gate/
+```
+
+Supporting docs:
+
+```text
+docs/hpx/hpx_continuous_batching_prototype_design.md
+tools/hpx-continuous-batch-gate/results.md
+docs/hpx/continuous_batching_gate_closeout.md
+```
+
+Question:
+
+```text
+Can HPX own request lifecycle around the proven llama.cpp multi-seq continuous-batching primitive?
+```
+
+Result:
+
+```text
+Yes, at correctness/lifecycle level.
+No performance claim.
+```
+
+Slice results:
+
+```text
+HPX_CB_STEP1: PASS
+HPX_CB_STEP2: PASS
+HPX_CB_STEP3: PASS
+HPX_CB_STEP4: PASS
+HPX_CB_PROTO: PASS
+```
+
+What the slices proved:
+
+```text
+Slice 1:
+  HPX runtime starts/stops cleanly with libllama.
+  Model/context load works.
+  99 metadata-only request objects can be built.
+
+Slice 2:
+  One HPX engine task can own the proven Step-5 loop.
+  Only the engine task touches llama_context, llama_batch, llama_decode, llama_get_logits_ith, and llama_memory_seq_*.
+
+Slice 3:
+  Each request/seq can be represented by an HPX promise/future.
+  The engine fulfills each promise after KV clear and cross-talk checks.
+  Main waits on futures and validates request_result snapshots only.
+
+Slice 4:
+  Env-gated lifecycle traces and descriptive metrics were added.
+
+Slice 5:
+  Same-shape HPX-off vs HPX-on correctness equivalence passed.
+```
+
+Slice 3 counters:
+
+```text
+futures_created = 99
+promises_fulfilled = 99
+futures_completed = 99
+engine_task_count = 1
+decode_failures = 0
+```
+
+Same-shape HPX-off vs HPX-on equivalence:
+
+```text
+budget 8:   0x0619d4d1900c2365 == 0x0619d4d1900c2365
+budget 64:  0x88a4dc75a31d4325 == 0x88a4dc75a31d4325
+budget 256: 0x8a1a3bd01360aada == 0x8a1a3bd01360aada
+```
+
+Lifecycle equivalence:
+
+```text
+done_iter:
+  8   -> {7}
+  64  -> {63}
+  256 -> {255}
+
+pos_max_at_clear:
+  8   -> {12}
+  64  -> {68}
+  256 -> {260}
+```
+
+Interpretation:
+
+```text
+HPX orchestration matched the pure llama.cpp same-shape reference on correctness fields.
+This was not a performance comparison.
+```
+
+---
+
+### 5.6 Cooperative cancellation proved the first real HPX serving capability
+
+Cooperative cancellation is documented in:
+
+```text
+docs/hpx/hpx_continuous_batching_cancellation_design.md
+tools/hpx-continuous-batch-gate/results.md
+docs/hpx/continuous_batching_gate_closeout.md
+```
+
+Question:
+
+```text
+Can HPX add a real serving lifecycle feature beyond run-to-completion?
+```
+
+Result:
+
+```text
+Yes.
+Cooperative cancellation passed through Cancel Slice 4.
+```
+
+Cancellation semantics:
+
+```text
+No interruption inside llama_decode.
+Cancellation is observed at iteration boundaries.
+Cancelled seqs leave future decode batches.
+Cancelled seq KV is cleared by the engine task.
+Cancelled futures complete with status = cancelled.
+Non-cancelled seqs continue.
+```
+
+Cancellation smoke:
+
+```text
+n_seqs = 99
+budget mix = {8,64,256}
+cancel seqs {1,4,7} from budget 64
+cancel seqs {2,5,8} from budget 256
+cancel_after_decoded_tokens = 16
+budget 8 is not cancelled
+```
+
+Final result:
+
+```text
+HPX_CB_CANCEL_STEP4: PASS
+```
+
+Outcome:
+
+```text
+completed_count = 93
+cancelled_count = 6
+
+budget 8:
+  completed = 33
+  cancelled = 0
+
+budget 64:
+  completed = 30
+  cancelled = 3
+
+budget 256:
+  completed = 30
+  cancelled = 3
+```
+
+Cancellation anchors:
+
+```text
+cancel_observed_iter_set = {16}
+n_decoded_at_cancel_set = {16}
+wasted_decode_rows_after_cancel = 0
+residual_kv_empty = true
+decode_failures = 0
+```
+
+Future/promise counters:
+
+```text
+futures_created = 99
+promises_fulfilled = 99
+futures_completed = 99
+engine_task_count = 1
+```
+
+Cancellation trace counts:
+
+```text
+engine_start             = 1
+engine_stop              = 1
+request_admitted         = 99
+seq_prefilled            = 99
+decode_row               = 9861
+seq_complete             = 93
+kv_cleared               = 93
+promise_fulfilled        = 93
+cancel_requested         = 6
+cancel_observed          = 6
+cancel_kv_cleared        = 6
+cancel_future_fulfilled  = 6
+```
+
+Interpretation:
+
+```text
+Cooperative cancellation is the first real HPX-native serving capability in this prototype.
+It proves futures can complete with status = completed or status = cancelled, while the engine preserves KV safety and non-cancelled siblings continue.
+This is still correctness/lifecycle evidence, not a performance claim.
+```
+
+---
+
+### 5.7 Live admission is design-only next work
+
+Live admission design lives at:
+
+```text
+docs/hpx/continuous_batching_live_admission_design.md
+```
+
+Status:
+
+```text
+Design only.
+Not implemented.
+```
+
+Reason for next feature:
+
+```text
+Cancellation proved that an active request can leave the active batch early.
+Live admission should prove that a waiting request can enter freed capacity while the engine loop is already running.
+```
+
+Important design caveat before implementation:
+
+```text
+The first live-admission smoke must reuse only cancellation-freed seq_ids {1,2,4,5,7,8}.
+It must not use generic lowest-numbered free seq_id, because budget-8 seqs naturally finish early and would otherwise create earlier free slots such as 0,3,6,...
+```
+
+Required first-smoke policy:
+
+```text
+Maintain a free_due_to_cancel queue.
+Append seq_id only after cancellation KV clear succeeds.
+At the admission boundary, pop from free_due_to_cancel deterministically.
+Bind waiting requests FIFO to those seq_ids.
+Ignore naturally completed budget-8 free slots for this slice.
+```
+
+Expected first live-admission smoke after cleanup:
+
+```text
+n_active = 93
+n_waiting = 6
+waiting requests 93..98
+waiting budget = 64
+cancel seqs {1,4,7,2,5,8}
+admit waiting requests into seq_ids {1,2,4,5,7,8}
+```
+
+
+---
+
+### 5.8 Overall conclusion
+
+This package records the current HPX continuous-batching evidence.
+
+What was proven:
+
+```text
+The FIFO context-pool path was correct but did not show a latency benefit.
+The simulator identified mixed decode lengths as a better target.
+Pure llama.cpp can run the 99-seq shared-batch target shape.
+HPX can own the engine-task lifecycle around that primitive.
+HPX futures/promises can represent per-request completion.
+HPX-on and HPX-off matched on same-shape correctness fields.
+Cooperative cancellation works as a real serving lifecycle feature.
+Cancelled and completed requests both resolve through request_result snapshots.
+KV cleanup remains engine-owned and residual KV is empty.
+```
+

@@ -1,0 +1,9 @@
+# Generated simulator runs.
+# Each run is reproducible from its config.json; ignore them by default.
+# To commit specific evidence: `git add -f results/<run_id>/`
+results/*
+!results/.gitkeep
+
+# Python bytecode.
+__pycache__/
+*.pyc

@@ -11,6 +11,9 @@ find_package(Threads REQUIRED)
 llama_add_compile_flags()
 
 option(LLAMA_BUILD_SERVING_BENCH "Build the serving benchmark harness" OFF)
+option(LLAMA_BUILD_MULTISEQ_GATE  "Build the multi-seq llama_batch gate" OFF)
+option(LLAMA_BUILD_HPX_CONTINUOUS_BATCH_GATE
+       "Build the HPX continuous-batching prototype" OFF)
 
 # tools
 
@@ -43,5 +46,11 @@ else()
     add_subdirectory(results)
     if (LLAMA_BUILD_SERVING_BENCH)
         add_subdirectory(serving-bench)
+    endif()
+    if (LLAMA_BUILD_MULTISEQ_GATE)
+        add_subdirectory(multiseq-batch-gate)
+    endif()
+    if (LLAMA_BUILD_HPX_CONTINUOUS_BATCH_GATE)
+        add_subdirectory(hpx-continuous-batch-gate)
     endif()
 endif()

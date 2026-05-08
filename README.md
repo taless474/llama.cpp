@@ -16,21 +16,28 @@ Across the branches, the work moved through three levels:
 3. HPX outside ggml, at the serving request-orchestration layer
 ```
 
-The current evidence suggests that HPX is useful for building and validating runtime ideas, but simply inserting HPX as a replacement scheduler around the existing `llama.cpp` execution path does not automatically create a speedup. The most promising future direction is adding a capability the baseline does not have.
+The current evidence suggests that HPX is useful for building and validating serving-runtime ideas, but simply inserting HPX as a replacement scheduler around an existing `llama.cpp` path does not automatically create a speedup.
+
+The promising direction is to let HPX own **serving lifecycle capabilities** around llama.cpp:
+
+```text
+request futures
+engine ownership
+traceable lifecycle events
+cooperative cancellation
+future live admission
+future priority / scheduling policies
+```
+
+`llama.cpp` remains the model execution layer.
+
+HPX owns orchestration around it.
 
 ## Branch map
 
 ### `hpx-threadpool-experiment`
 
-First exploration branch.
-
-URL:
-
-```text
-https://github.com/taless474/llama.cpp/tree/hpx-threadpool-experiment
-```
-
-This branch explored early HPX/thread-pool ideas around llama.cpp execution. It was the first attempt to understand where external runtime orchestration could fit and what kinds of overheads appear when llama.cpp work is wrapped by another scheduling layer.
+First exploration branch. This branch explored early HPX/thread-pool ideas around llama.cpp execution. It was the first attempt to understand where external runtime orchestration could fit and what kinds of overheads appear when llama.cpp work is wrapped by another scheduling layer.
 
 Main lesson:
 
@@ -64,23 +71,16 @@ HPX could execute some lowered or packetized regions correctly, but the tested C
 
 ### `hpx-run-level-analyzer`
 
-Current evidence branch.
+This branch moved HPX out of ggml graph execution and into serving/runtime orchestration.
 
-This branch moved HPX out of ggml graph execution and evaluated it at the serving orchestration layer.
-
-The serving design is:
+It contains two serving-level lines of work:
 
 ```text
-shared llama_model
-multiple prewarmed llama_context objects
-one leased context per active request
-normal llama_decode inside the leased context
-std backend vs hpx backend
-token-hash correctness checks
-trace-based lifecycle and context-pool validation
+1. FIFO context-pool serving-bench line
+2. Continuous-batching request-lifecycle line
 ```
 
-The main comparison is:
+The FIFO serving-bench line compared:
 
 ```text
 llama-serving-bench --backend std
@@ -88,15 +88,35 @@ vs.
 llama-serving-bench --backend hpx
 ```
 
-Both backends use the same model, prompt, request shape, context-pool shape, greedy decoding, and `llama_decode` path.
+That path was correct and robust, but it did not show a useful HPX latency advantage. It is now closed out.
+
+The current successful direction is the continuous-batching line:
+
+```text
+pure llama.cpp multi-seq shared-batch gate
+HPX continuous-batching orchestration gate
+per-request HPX futures/promises
+traceable lifecycle events
+cooperative cancellation
+```
 
 Main lesson:
 
 ```text
-The HPX serving backend is correct and robust, but the current HPX design does not outperform the simpler std backend on the tested CPU-only TinyLlama serving workloads.
+HPX becomes more meaningful when it owns a serving lifecycle capability, not when it merely replaces a FIFO queue around opaque llama_decode calls.
 ```
+## Current result in one paragraph
 
-The reason is structural: both backends are FIFO context-pool orchestrators around the same opaque `llama_decode` path. The HPX backend changes the orchestration mechanism, but it does not yet add a new HPX-native capability such as cancellation, priority scheduling, richer future composition, work stealing, or distributed execution.
+The current branch proves that a real `llama.cpp` multi-sequence shared-batch shape can run with 99 active `seq_id`s and mixed decode budgets `{8,64,256}`. It then proves that HPX can wrap that primitive with a single engine task, per-request futures/promises, lifecycle traces, descriptive metrics, and cooperative cancellation. The HPX prototype matches the pure llama.cpp reference on same-shape correctness fields. No HPX speedup is claimed.
+
+---
+
+## Upstream llama.cpp sketch
+
+This is the simplified mental model used in the HPX design notes.
+
+![Upstream llama.cpp sketch](docs/hpx/figures/llama_cpp_architecture_v1_manual_sketch.png)
+
 
 ## What this repository is studying
 
@@ -104,28 +124,31 @@ This repository is not trying to replace `llama.cpp` kernels.
 
 The main questions are:
 
-```text
-Where can HPX sit around llama.cpp without breaking correctness?
-What granularity is too fine for HPX to help?
-When does HPX orchestration become overhead instead of useful scheduling?
-What evidence is needed before claiming a runtime-level improvement?
-What HPX-native features could create a real functional advantage?
-```
-
-The project has deliberately kept correctness checks central:
-
-```text
-same prompt
-same model
-same request shape
-same decoding path
-same token hashes
-trace-based lifecycle checks
-repeatable benchmark protocols
-trial-0 excluded from timing aggregation
-```
+- Where can HPX sit around llama.cpp without breaking correctness?
+- What granularity is too fine for HPX to help?
+- When does HPX orchestration become overhead instead of useful scheduling?
+- What evidence is needed before claiming a runtime-level improvement?
+- What HPX-native serving features can create a real functional advantage?
 
 
+The project keeps correctness checks central:
+
+- same model
+- same prompt
+- same batch shape when comparing hashes
+- same decoding policy
+- token-hash checks
+- per-seq KV cleanup checks
+- trace-based lifecycle checks
+- repeatable benchmark protocols
+
+Important hash rule:
+
+Long-budget hashes can depend on batch shape.
+Do not compare budget-64 or budget-256 hashes across different batch shapes.
+Use same-shape repeat determinism and within-run same-class hash equality.
+
+---
 ## Repository guide
 
 ### HPX design and notes
@@ -136,60 +159,114 @@ HPX-related design notes and reports live under:
 docs/hpx/
 ```
 
-Useful documents include design notes, benchmark protocols, result summaries, executor contracts, provenance notes, and closeout notes.
+Useful current documents include:
 
-Start here when you want the reasoning and conclusions.
+```text
+docs/hpx/provenance.md
+docs/hpx/continuous_batching_upstream_notes.md
+docs/hpx/continuous_batching_simulator_design.md
+docs/hpx/continuous_batching_phase3_target.md
+docs/hpx/multiseq_llama_batch_gate.md
+docs/hpx/hpx_continuous_batching_prototype_design.md
+docs/hpx/hpx_continuous_batching_cancellation_design.md
+docs/hpx/continuous_batching_gate_closeout.md
+docs/hpx/continuous_batching_live_admission_design.md
+```
 
-### Benchmark evidence package
+`continuous_batching_live_admission_design.md` is design-only next work. Live admission is not implemented yet.
 
-Benchmark evidence lives under:
+---
+
+### Benchmark and simulator evidence
+
+Benchmark and simulator evidence lives under:
 
 ```text
 hpx-bench/
 ```
 
-This directory contains packaged experiments, scripts, schedules, summaries, and reproducible evidence for the serving-bench work.
-
-Important subdirectory:
+Important subdirectories:
 
 ```text
 hpx-bench/experiments/
+hpx-bench/sim/
 ```
 
-Examples of packaged serving experiments include:
+The `experiments/` tree contains serving-bench evidence packages such as:
 
 ```text
-08_perf_hpx_vs_std_matrix/
-09_perf_thread_sweep/
 10_perf_heterogeneous_budgets/
 11_perf_deep_queue_short_requests/
 ```
 
-Each experiment directory is intended to contain:
+These support the FIFO context-pool closeout.
+
+The `sim/` tree contains the continuous-batching simulator and workload analysis that led to the mixed-decode target.
+
+---
+
+### Pure llama.cpp multi-seq reference gate
+
+The pure llama.cpp reference gate lives under:
 
 ```text
-readme.md        experiment purpose, protocol, and compact result
-facts.md         stable design facts and validation rules
-results.md       post-run interpretation, when available
-summaries/       shareable summarized evidence
-runs/            raw local trial artifacts, ignored by git
-scripts          schedule generation, trial runner, and summarizers
+tools/multiseq-batch-gate/
 ```
 
-### Serving benchmark source
+It proves the target execution primitive without HPX:
 
-The serving benchmark source lives under:
+- one llama_model
+- one llama_context
+- many seq_ids
+- one shared llama_batch
+- mixed decode budgets {8,64,256}
+- per-seq KV clear
+- repeat determinism
+
+
+This tool is the correctness reference for the HPX continuous-batching prototype.
+
+---
+
+### HPX continuous-batch gate
+
+The HPX orchestration prototype lives under:
+
+```text
+tools/hpx-continuous-batch-gate/
+```
+
+It proves:
+
+- one HPX engine task owns the llama.cpp execution loop
+- one HPX future/promise pair per request
+- main validates request_result snapshots only
+- trace events are env-gated
+- cooperative cancellation completes futures with status=cancelled
+
+
+This is the current HPX-native serving prototype.
+
+It is correctness-first and lifecycle-first.
+
+It is not a benchmark and does not claim speedup.
+
+---
+
+### Earlier serving benchmark source
+
+The earlier serving benchmark source lives under:
 
 ```text
 tools/serving-bench/
 ```
 
-This is where the std and hpx serving backends, request harness, and benchmark CLI live.
+This contains the std and hpx FIFO context-pool backends, request harness, and benchmark CLI.
 
-The key benchmark comparison remains:
+The historical comparison was:
 
-```text
 llama-serving-bench --backend std
 llama-serving-bench --backend hpx
-```
 
+
+That line is now evidence for the FIFO closeout, not the current active direction.

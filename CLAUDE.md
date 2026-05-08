@@ -1,185 +1,202 @@
-# Claude Guidance for HPX / llama.cpp Serving Work
+# Claude Guidance for HPX / llama.cpp Continuous-Batching Work
 
 ## Intent
 
-This branch explores HPX-based orchestration for llama.cpp inference workloads.
+This branch studies HPX-owned orchestration around llama.cpp continuous-batching execution.
 
-The direction is: HPX serving-level orchestration around opaque llama.cpp work.
+The old FIFO `llama-serving-bench` context-pool path is closed. It remains evidence and reference only. Do not continue tuning that design by default.
 
-Focus on context ownership, request lifecycle, scheduling policy, cancellation, and later request-level concurrency / batching / pipelining.
+## Active tool
 
-Current active slice: HPX-on `llama-serving-bench` structural-correctness comparison against the already-green std baseline.
+Current implementation target:
 
-This is not a performance slice yet.
+tools/hpx-continuous-batch-gate/
 
-Current HPX-on shape:
 
-```text
-model: tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-prompt: "Hello, my name is"
-n_contexts=1
-n_concurrent=1
-n_threads=4
-expected HPX runtime carriers=1
-canonical generated-token hash=0x833045f1e2ebf49f
-```
+Pure llama.cpp reference gate:
 
-The immediate goal is correctness and lifecycle:
+tools/multiseq-batch-gate/
 
-```text
---backend hpx produces the canonical hash
-HPX starts once
-engine_hpx becomes ready
-each request acquires/releases ctx=0 exactly once
-HPX stops once
-```
 
-The old HPX branch is evidence and reference only. Do not continue the old design by default.
+## Read first
 
-## Reading
+Read these before working on the current slice:
 
-Read first:
+local/ahandoff.md
+docs/hpx/hpx_continuous_batching_prototype_design.md
+tools/hpx-continuous-batch-gate/README.md
+tools/multiseq-batch-gate/results.md
 
-- `local/handoff.md`
-- `local/baselines/comparison_hpx_vs_std/FACTS.md`
 
-Use them as current session context. Do not treat them as permanent historical truth.
+## Background only
 
-For the current HPX-on comparison slice, also read if needed:
+Read these only if needed:
 
-- `local/baselines/comparison_hpx_vs_std/_run_hpx.py`
-- `local/baselines/comparison_aligned/bench/`
-- `docs/hpx/serving_bench_acceptance.md`
+docs/hpx/multiseq_llama_batch_gate.md
+docs/hpx/continuous_batching_upstream_notes.md
+docs/hpx/continuous_batching_simulator_design.md
+docs/hpx/continuous_batching_phase3_target.md
+hpx-bench/sim/continuous_batching/phase2b_mixed_workload.md
+docs/hpx/serving_fifo_pool_closeout.md
 
-Do not read broad project history by default.
 
-## Reference docs
 
-Use these when relevant:
+## Ownership boundary
 
-- `docs/hpx/serving_bench_acceptance.md`
-- `docs/hpx/executor_contract.md`
-- `docs/hpx/benchmark_protocol.md`
-- `docs/hpx/cpu_repack_baseline_notes.md`
-- `docs/hpx/prefill_branch_summary.md`
-- `docs/hpx/selective_graph_map_reference.txt`
+HPX owns orchestration:
 
-These are evidence and review context. They are not the current implementation plan.
+request metadata
+slot/request lifecycle state
+one engine task
+later: futures/promises, traces, cancellation, priority hooks
 
-## Source of truth
 
-Use current code, current git state, and the current handoff as the source of truth.
+llama.cpp owns model execution:
 
-Do not use provenance as design truth.
+llama_model
+llama_context
+llama_batch
+llama_decode
+llama_memory_seq_*
+logits access
+tokenizer
 
-Do not treat old docs as implementation instructions unless the handoff explicitly points to them.
+Hard rule:
 
-## Architecture principles
+Only the engine task may touch llama_context, llama_batch, llama_decode, or llama_memory_seq_*.
+No parallel llama_decode.
 
-Prefer serving-level orchestration around opaque llama.cpp execution:
+## General correctness invariants
 
-```text
-one shared llama_model
-prewarmed llama_context objects
-exclusive llama_context ownership per active request
-normal llama_decode inside each leased context
-backend-owned work remains opaque
-```
+Correctness is token/lifecycle correctness, not speed.
 
-The validated baseline should be simple and understandable before HPX-specific behavior is added.
+Every submitted request/sequence must either complete successfully or fail with an explicit reason.
 
-HPX designs should be HPX-native where appropriate:
+Every sequence must reach its requested decode budget unless the current slice explicitly tests cancellation.
 
-```text
-async request state machines
-future-based resource pools
-RAII ownership for leased resources
-continuations for readiness
-clear lifecycle boundaries
-```
+Generated-token hashes are correctness fingerprints, not performance metrics.
 
-Avoid designs that merely rename a std::thread worker pool with HPX types unless that is explicitly the experiment being run.
+Hash comparisons must use the same model, prompt, decode policy, batch shape, and scheduling policy.
+
+Do not use cross-shape long-budget hash equality as a correctness invariant.
+Budget-64 and budget-256 hashes may differ between N=3 and N=99 because batch shape can change floating-point behavior.
+
+Safe invariants:
+  within-shape repeat determinism
+  within-run same-budget-class hash equality
+  expected token counts
+  expected done_iter / completion step
+  expected KV position behavior
+  every llama_decode returns 0
+  no residual KV for completed sequences
+  no cross-talk when clearing one seq_id
+
+Budget-8 canonical hash for the current TinyLlama / "Hello, my name is" / greedy shape:
+  0x0619d4d1900c2365
+
+Budget-16 canonical hash for the same shape:
+  0x833045f1e2ebf49f
+
+Do not make performance claims from correctness gates.
+
+## HPX continuous-batching implementation invariants
+
+HPX owns orchestration only.
+
+llama.cpp owns model execution.
+
+There must be exactly one owner of a llama_context at a time.
+
+Only the engine task may touch:
+  llama_context
+  llama_batch
+  llama_decode
+  llama_memory_seq_*
+  llama_get_logits_ith
+
+Never run parallel llama_decode calls on the same llama_context.
+
+The engine task builds the shared llama_batch, calls llama_decode, reads logits, updates per-seq state, and performs KV cleanup.
+
+Other HPX tasks may own request metadata, futures/promises, result collection, traces, or future cancellation/priority plumbing, but they must not touch llama.cpp context/batch/KV objects.
+
+Per-request futures/promises, when used, are fulfilled only after:
+  the sequence reaches its requested budget
+  generated-token state is finalized
+  per-seq KV clear has succeeded
+  the result snapshot is independent of llama_context internals
+
+HPX scheduling must not change correctness anchors accidentally.
+If batch composition, seq ordering, prompt/decode mixing, or scheduling policy changes, regenerate same-shape reference results before comparing hashes.
+
+HPX runtime startup/shutdown is process-level.
+Engine objects do not start or stop HPX.
+
+Fail closed on HPX/runtime/model/decode errors.
+Do not silently fall back to a non-HPX path unless the slice explicitly defines that as the experiment.
 
 ## HPX runtime invariants
 
-- HPX runtime startup must be process-wide and one-shot.
-- The program entry/lifecycle layer owns HPX startup and shutdown.
-- Individual engines must not start or stop HPX.
-- Non-HPX backends must not start HPX.
-- Fail closed when HPX is unavailable or not built.
-- Keep the HPX runtime API narrow.
-- Keep runtime diagnostics and lifecycle traces env-gated unless they are errors.
+HPX runtime startup is process-wide and one-shot.
+Program entry owns HPX startup/shutdown.
+Individual engine objects do not start or stop HPX.
+Fail closed if HPX is unavailable.
+Runtime traces are env-gated unless they are errors.
 
-## Serving correctness invariants
 
-- Preserve exclusive access to each `llama_context`.
-- Do not run concurrent `llama_decode` calls on the same context.
-- Reset per-request context state deliberately.
-- Use the same tokenization path for fit checks and real request execution.
-- Keep timing semantics explicit; queue wait should not be accidentally excluded.
-- Treat generated-token hashes or equivalent fingerprints as correctness signals, not performance metrics.
-- Do not make performance claims before correctness and lifecycle gates pass.
+## Working style
 
-For generated-token hashes:
+Define the contract first.
+Implement in small slices.
+Run only the relevant slice checks.
+Stop after each slice.
+Do not proceed to the next slice without approval.
+Do not commit unless explicitly asked.
+Do not make performance claims from correctness gates.
 
-```text
-0x833045f1e2ebf49f
-```
 
-is the canonical hash only for the current TinyLlama / `"Hello, my name is"` / 16-token greedy shape. It is not a model checksum or universal correctness proof.
-
-## Preferred working style
-
-- Define the problem first.
-- Define contracts before implementation.
-- Define acceptance gates before `.cpp` work.
-- Implement in small slices.
-- After each slice, run only the relevant checks.
-- Stop on the first correctness failure and fix the narrowest cause.
-- Keep build, test, and result claims separate.
-- Do not interpret smoke tests as performance evidence.
-
-## Layout
-
-Builds stay outside this repo.
+## Paths
 
 Current account paths:
 
-```text
-repo:        /Users/Ashk/Desktop/HPX/llama-hpx
-models:      /Users/Ashk/Desktop/HPX/models
-HPX source:  /Users/Ashk/Desktop/HPX/hpx-master
-HPX build:   /Users/Ashk/Desktop/HPX/hpx-master-build
-HPX install: /Users/Ashk/Desktop/HPX/hpx-install
-```
+repo:        /Users/unick/Desktop/hpx/llama-hpx
+models:      /Users/unick/Desktop/hpx/models
+HPX install: /Users/unick/Desktop/hpx/hpx-install
+
 
 Build directories:
 
-```text
-HPX-OFF baseline: /Users/Ashk/Desktop/HPX/builds/llama-base
-HPX-ON build:     /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on
-```
+HPX-OFF reference build:
+  /Users/unick/Desktop/HPX/builds/llama-base
 
-Current HPX-on binary:
+HPX-ON build:
+  /Users/unick/Desktop/HPX/builds/llama-hpx-hpx-on
 
-```text
-/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on/bin/llama-serving-bench
-```
 
-## Saving results
+Current HPX binary:
+
+/Users/unick/Desktop/HPX/builds/llama-hpx-hpx-on/bin/llama-hpx-continuous-batch-gate
+
+
+Pure llama.cpp reference binary:
+
+/Users/unick/Desktop/HPX/builds/llama-base/bin/llama-multiseq-batch-gate
+
+
+## Saving outputs
 
 Do not write outputs to `/tmp`.
 
-For committed or shareable benchmark evidence, use:
-
-```text
-hpx-bench/results/<date>-<slug>/
-```
-
-For local-only notes, use:
+For current correctness-gate captures, use:
 
 ```text
 local/
 ```
 
-Correctness/lifecycle checks do not need benchmark result directories unless explicitly requested.
+For simulator-generated outputs, use the simulator's own gitignored result directory:
+
+```text
+hpx-bench/sim/continuous_batching/results/<run-id>/
+```
+
+For committed/shareable reports, use explicit docs/results files only when requested.
