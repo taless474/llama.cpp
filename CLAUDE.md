@@ -159,28 +159,28 @@ Do not make performance claims from correctness gates.
 
 Current account paths:
 
-repo:        /Users/unick/Desktop/hpx/llama-hpx
-models:      /Users/unick/Desktop/hpx/models
-HPX install: /Users/unick/Desktop/hpx/hpx-install
+repo:        /Users/Ashk/Desktop/HPX/llama-hpx
+models:      /Users/Ashk/Desktop/HPX/models
+HPX install: /Users/Ashk/Desktop/HPX/hpx-install
 
 
 Build directories:
 
 HPX-OFF reference build:
-  /Users/unick/Desktop/HPX/builds/llama-base
+  /Users/Ashk/Desktop/HPX/builds/llama-base
 
 HPX-ON build:
-  /Users/unick/Desktop/HPX/builds/llama-hpx-hpx-on
+  /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on
 
 
 Current HPX binary:
 
-/Users/unick/Desktop/HPX/builds/llama-hpx-hpx-on/bin/llama-hpx-continuous-batch-gate
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on/bin/llama-hpx-continuous-batch-gate
 
 
 Pure llama.cpp reference binary:
 
-/Users/unick/Desktop/HPX/builds/llama-base/bin/llama-multiseq-batch-gate
+/Users/Ashk/Desktop/HPX/builds/llama-base/bin/llama-multiseq-batch-gate
 
 
 ## Saving outputs

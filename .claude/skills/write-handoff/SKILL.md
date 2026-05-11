@@ -9,7 +9,7 @@ allowed-tools: Read, Write, Edit, Bash(git status*), Bash(git branch*), Bash(git
 
 Write or update:
 
-`local/handoff.md`
+`local/ahandoff.md`
 
 This handoff is for the next fresh Claude Code session. Keep it short, current, and useful.
 

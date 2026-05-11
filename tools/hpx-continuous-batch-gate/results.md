@@ -457,3 +457,1910 @@ The `ttc_ms_cancelled[budget=*]` numbers reflect the wall time
 at which the cancelled futures were fulfilled (driven by the
 shared engine loop reaching iter 16, not by any per-seq
 optimization) and are descriptive only.
+
+---
+
+## Live Admission Slice 1 results — data model only
+
+Slice 1 extends the HPX serving-gate result schema with
+live-admission metadata while preserving baseline Metal
+execution, canonical output hashes, cancel-gate behavior, and
+repeat-run determinism. The current HPX request orchestrator is
+building the outer serving/runtime layer first: request
+identity, sequence identity, admission metadata, cancellation
+accounting, and deterministic result routing. It still
+delegates model execution to upstream llama.cpp.
+
+Implementation reference:
+[`docs/hpx/continuous_batching_live_admission_design.md`](../../docs/hpx/continuous_batching_live_admission_design.md)
+(§9 Slice 1 — data model only, no behavior change).
+
+### Build configuration
+
+A separate Metal-enabled build directory was used so the
+recorded canonical hashes (which were captured against a
+Metal-offloaded run) remain reproducible. The CPU-only build
+directory at `/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on`
+was left untouched.
+
+```sh
+cmake -S /Users/Ashk/Desktop/HPX/llama-hpx \
+      -B /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal \
+      -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+      -DGGML_ACCELERATE=ON -DGGML_LLAMAFILE=ON -DGGML_NATIVE=ON \
+      -DLLAMA_BUILD_TOOLS=ON \
+      -DLLAMA_BUILD_HPX_CONTINUOUS_BATCH_GATE=ON \
+      -DLLAMA_BUILD_SERVING_BENCH=ON \
+      -DLLAMA_BUILD_MULTISEQ_GATE=OFF \
+      -DLLAMA_CURL=OFF \
+      -DHPX_DIR=/Users/Ashk/Desktop/HPX/hpx-install/lib/cmake/HPX
+```
+
+CMakeCache assertions:
+
+```
+GGML_METAL:BOOL=ON
+LLAMA_BUILD_HPX_CONTINUOUS_BATCH_GATE:BOOL=ON
+HPX_DIR:UNINITIALIZED=/Users/Ashk/Desktop/HPX/hpx-install/lib/cmake/HPX
+```
+
+Exact target built:
+
+```sh
+cmake --build /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal \
+      --target llama-hpx-continuous-batch-gate
+```
+
+Backend confirmation (every run's stderr):
+
+```
+ggml_metal_device_init: GPU name:   MTL0 (Apple M4)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9 (1009)
+load_tensors: offloading 23/23 layers to GPU
+load_tensors:  MTL0_Mapped model buffer size = 636.18 MiB
+llama_kv_cache:       MTL0 KV buffer size  = 1089.00 MiB
+```
+
+No `CPU_REPACK` lines appear; offload is full-model.
+
+### Run commands
+
+```sh
+# Clean-HEAD baseline against the Metal build (Cancel Slice 4
+# regression check — the gate at this commit emits the
+# HPX_CB_CANCEL_STEP4 label when the cpp WIP is not in the tree).
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_cancel_step4_metal_repro.stdout \
+  2> local/hpx_cb_cancel_step4_metal_repro.stderr
+
+# Slice 1 compact (cpp WIP restored; binary now emits
+# HPX_CB_ADMIT_STEP1).
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step1_metal.stdout \
+  2> local/hpx_cb_admit_step1_metal.stderr
+
+# Slice 1 --repeat 2.
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 --repeat 2 \
+  > local/hpx_cb_admit_step1_metal_repeat2.stdout \
+  2> local/hpx_cb_admit_step1_metal_repeat2.stderr
+```
+
+`LLAMA_HPX_CB_TRACE` was unset for every run.
+
+### Final stdout lines
+
+| Run                       | Final line                       |
+|---------------------------|----------------------------------|
+| Clean Metal baseline      | `HPX_CB_CANCEL_STEP4: PASS`      |
+| Slice 1 compact           | `HPX_CB_ADMIT_STEP1: PASS`       |
+| Slice 1 `--repeat 2`      | `HPX_CB_ADMIT_STEP1: PASS`       |
+
+### Canonical hashes (preserved against Cancel Slice 4)
+
+The same-shape Slice-5 / Cancel-Slice-4 anchors reproduce
+exactly on this Metal build, both with and without the Slice 1
+WIP applied:
+
+| Budget | Count | Unique hashes (completed) | Canonical hash         | `done_iter` set | `pos_max_at_clear` set |
+|--------|-------|---------------------------|------------------------|-----------------|------------------------|
+| 8      | 33    | 1                         | `0x0619d4d1900c2365`   | `{7}`           | `{12}`                 |
+| 64     | 30 / 3 (completed / cancelled) | 1            | `0x88a4dc75a31d4325`   | `{63}`          | `{68}`                 |
+| 256    | 30 / 3 (completed / cancelled) | 1            | `0x8a1a3bd01360aada`   | `{255}`         | `{260}`                |
+
+Cancellation invariants from Cancel Slice 4 also hold:
+`completed_count = 93`, `cancelled_count = 6`,
+`cancel_observed_iter_set = {16}`,
+`n_decoded_at_cancel_set = {16}`,
+`wasted_decode_rows_after_cancel = 0`,
+`residual_kv_empty = true`, `decode_failures = 0`.
+
+### Slice 1 field-gate evidence
+
+The compact run's per-iter audit line:
+
+```
+iter[0] admit_step1: all 99 results carry
+   admitted_at_iter=-1 reused_seq_id=-1
+   previous_request_id=-1 admission_source=none
+   request_id==seq_id; free_due_to_cancel_violations=0
+```
+
+The `--repeat 2` run prints the same audit line for both
+`iter[0]` and `iter[1]`, plus
+`iter[1] determinism: matches iter 0` from the determinism
+gate (now extended with the five new admission fields).
+
+| Gate                                                              | Compact | `--repeat 2` |
+|-------------------------------------------------------------------|:-------:|:------------:|
+| every result `admitted_at_iter == -1`                             | PASS    | PASS         |
+| every result `reused_seq_id == -1`                                | PASS    | PASS         |
+| every result `previous_request_id == -1`                          | PASS    | PASS         |
+| every result `admission_source == none`                           | PASS    | PASS         |
+| every result `request_id == seq_id`                               | PASS    | PASS         |
+| `free_due_to_cancel` placeholder empty/unused (`free_due_to_cancel_violations == 0`) | PASS | PASS |
+| All Cancel Slice 4 gates still pass (engine_task_count, futures_created/promises_fulfilled/futures_completed = 99, residual KV empty, decode_failures = 0, etc.) | PASS | PASS |
+| Determinism tuple includes `request_id`, `admitted_at_iter`, `reused_seq_id`, `previous_request_id`, `admission_src` | n/a | PASS |
+
+### Captures
+
+```text
+local/hpx_cb_admit_step1_wip.diff
+local/hpx_cb_cancel_step4_metal_repro.stdout
+local/hpx_cb_cancel_step4_metal_repro.stderr
+local/hpx_cb_admit_step1_metal.stdout
+local/hpx_cb_admit_step1_metal.stderr
+local/hpx_cb_admit_step1_metal_repeat2.stdout
+local/hpx_cb_admit_step1_metal_repeat2.stderr
+```
+
+`hpx_cb_admit_step1_wip.diff` is the cpp working-tree diff
+preserved before the diagnostic stash dance; it matches the
+restored working tree byte-for-byte (298 lines).
+
+### Working-tree state at slice closeout
+
+```text
+M  tools/hpx-continuous-batch-gate/hpx-continuous-batch-gate.cpp
+M  docs/hpx/continuous_batching_live_admission_design.md
+M  tools/hpx-continuous-batch-gate/README.md
+M  tools/hpx-continuous-batch-gate/results.md
+```
+
+Not committed. Out-of-scope edits in the working tree
+(`CLAUDE.md` path renames; `.claude/skills/write-handoff/SKILL.md`)
+are unrelated to Slice 1 and originate outside this slice's
+work.
+
+### Interpretation
+
+Slice 1 plumbs the live-admission data model end-to-end —
+engine-internal state, the `request_result` snapshot, the
+deterministic output gate, and the placeholder reuse queue —
+without changing decode behavior or batch shape. Every value
+the model produces is identical to Cancel Slice 4 on the
+recorded Metal anchors, every new field carries its
+slice-1-default, and the placeholder reuse queue is wired but
+provably empty. Slice 3 will activate the queue and bind
+admitted requests to its head; Slice 1 only proves that the
+schema, the engine guard, the snapshot copy, and the
+determinism contract all work without surprising the existing
+correctness gates.
+
+---
+
+## Live Admission Slice 2 results — waiting queue, no admission
+
+Slice 2 introduces a construction-time waiting queue that lives
+beside the active population. The engine receives a read-only
+handle, samples its size at run start and run end, and fails
+closed if the size changes. Active decode/cancel behavior is
+unchanged; the canonical Cancel-Slice-4 hashes still hold for
+the active subset on the Metal build.
+
+Implementation reference:
+[`docs/hpx/continuous_batching_live_admission_design.md`](../../docs/hpx/continuous_batching_live_admission_design.md)
+(§9 Slice 2 — waiting queue, no admission yet).
+
+### Build configuration
+
+The Metal-enabled build directory established for Slice 1 is
+reused (canonical hashes were captured against this build):
+
+- Metal build directory:
+  `/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal`
+
+Build command:
+
+```sh
+cmake --build /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal \
+      --target llama-hpx-continuous-batch-gate
+```
+
+Configure flags (unchanged from Slice 1; `GGML_METAL=ON`,
+`LLAMA_BUILD_HPX_CONTINUOUS_BATCH_GATE=ON`,
+`HPX_DIR=/Users/Ashk/Desktop/HPX/hpx-install/lib/cmake/HPX`).
+
+`LLAMA_HPX_CB_TRACE` was unset for every run (no new trace
+events were added by Slice 2).
+
+### Run commands
+
+```sh
+# 1. Default-mode regression — no Slice 2 flags.
+#    n_active resolves to n_seqs (= 99); n_waiting = 0.
+#    Behavior must match Slice 1 except for the relabel and the
+#    new header / audit / metric lines (all additive output).
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step2_default.stdout \
+  2> local/hpx_cb_admit_step2_default.stderr
+
+# 2. Slice 2 compact smoke — n_active=93, n_waiting=6.
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+  --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step2.stdout \
+  2> local/hpx_cb_admit_step2.stderr
+
+# 3. Slice 2 --repeat 2.
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+  --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 --repeat 2 \
+  > local/hpx_cb_admit_step2_repeat2.stdout \
+  2> local/hpx_cb_admit_step2_repeat2.stderr
+```
+
+### Final stdout lines
+
+| Run                          | Final line                       |
+|------------------------------|----------------------------------|
+| Default-mode regression      | `HPX_CB_ADMIT_STEP2: PASS`       |
+| Slice 2 compact              | `HPX_CB_ADMIT_STEP2: PASS`       |
+| Slice 2 `--repeat 2`         | `HPX_CB_ADMIT_STEP2: PASS`       |
+
+### Default-mode regression — counts
+
+`--n-active` unset → resolves to `n_seqs = 99`; `--n-waiting`
+defaults to `0`. The run is behaviorally identical to Slice 1.
+
+| Field                        | Value                  |
+|------------------------------|------------------------|
+| `n_active`                   | 99                     |
+| `n_waiting`                  | 0                      |
+| `completed_count`            | 93                     |
+| `cancelled_count`            | 6                      |
+| `queued_count`               | 0                      |
+| `waiting_queue_size_at_engine_end` | 0                |
+| budget=8 unique hash         | `0x0619d4d1900c2365`   |
+| budget=64 unique hash        | `0x88a4dc75a31d4325`   |
+| budget=256 unique hash       | `0x8a1a3bd01360aada`   |
+| `done_iter` sets             | `{7}/{63}/{255}`       |
+| `pos_max_at_clear` sets      | `{12}/{68}/{260}`      |
+| `residual_kv_empty`          | true (sweep over 99 slots) |
+| `decode_failures`            | 0                      |
+
+Canonical hashes match the Cancel-Slice-4 / Slice-1 anchors
+exactly; no FP drift from threading the bound population
+through the new active/`n_seq_max` split.
+
+### Slice 2 compact smoke — counts
+
+| Field                              | Value |
+|------------------------------------|-------|
+| `n_active`                         | 93    |
+| `n_waiting`                        | 6     |
+| `results.size()`                   | 93    |
+| `futures_created`                  | 93    |
+| `promises_fulfilled`               | 93    |
+| `futures_completed`                | 93    |
+| `completed_count`                  | 87    |
+| `cancelled_count`                  | 6     |
+| `queued_count`                     | 6     |
+| `waiting_queue_size_at_engine_end` | 6     |
+
+Per-budget split (across the 93-active population):
+
+| Budget | completed | cancelled | unique hash | sample hash             |
+|--------|-----------|-----------|-------------|-------------------------|
+| 8      | 31        | 0         | 1           | `0x0619d4d1900c2365`    |
+| 64     | 28        | 3         | 1           | `0x88a4dc75a31d4325`    |
+| 256    | 28        | 3         | 1           | `0x8a1a3bd01360aada`    |
+
+Same canonical hashes as the default mode and the recorded
+Cancel Slice 4 anchors — proving that removing the inactive 6
+slots from the bound population does not change FP order on
+Metal.
+
+### Slice 1 + 2 field-gate evidence
+
+Per-iter audit line:
+
+```
+iter[0] admit_step2: all 93 results carry
+   admitted_at_iter=-1 reused_seq_id=-1
+   previous_request_id=-1 admission_source=none
+   request_id==seq_id; free_due_to_cancel_violations=0;
+   queued_count=6 waiting_queue_size_at_engine_end=6
+```
+
+`--repeat 2` emits the same audit line at `iter[0]` and
+`iter[1]`, plus `iter[1] determinism: matches iter 0`.
+
+| Gate                                                                                            | Default | Compact | `--repeat 2` |
+|-------------------------------------------------------------------------------------------------|:-------:|:-------:|:------------:|
+| every result `request_id == seq_id`                                                             | PASS    | PASS    | PASS         |
+| every result `admitted_at_iter == -1`                                                           | PASS    | PASS    | PASS         |
+| every result `reused_seq_id == -1`                                                              | PASS    | PASS    | PASS         |
+| every result `previous_request_id == -1`                                                        | PASS    | PASS    | PASS         |
+| every result `admission_source == none`                                                         | PASS    | PASS    | PASS         |
+| `free_due_to_cancel_violations == 0`                                                            | PASS    | PASS    | PASS         |
+| `queued_count == n_waiting`                                                                     | 0/0 ✓   | 6/6 ✓   | 6/6 ✓        |
+| `waiting_queue_size_at_engine_end == n_waiting` (no consumption)                                | 0/0 ✓   | 6/6 ✓   | 6/6 ✓        |
+| `results.size() == n_active`                                                                    | 99 ✓    | 93 ✓    | 93 ✓         |
+| `futures_created` / `promises_fulfilled` / `futures_completed == n_active`                      | 99 ✓    | 93 ✓    | 93 ✓         |
+| Cancel-Slice-4 carry-over (`cancel_observed_iter_set={16}`, `n_decoded_at_cancel_set={16}`, `wasted_decode_rows_after_cancel=0`, `decode_failures=0`) | PASS | PASS | PASS |
+
+### Residual KV
+
+The engine-side residual-KV-empty sweep now covers the full
+`n_seq_max` range, not just the bound population:
+
+```
+iter[N] residual_kv: all 99 seqs cleared (pos_min=-1, pos_max=-1)
+residual_kv_empty       = true
+```
+
+Slots `[93, 99)` are valid llama `seq_id`s that the engine
+never wrote to in the Slice 2 smoke; they nonetheless appear in
+the sweep with `pos_min == pos_max == -1`. This rules out any
+leftover state on the not-yet-bound slots and prepares the
+engine for Slice-3 admission, which will bind into exactly
+those slots.
+
+### `--repeat 2` determinism
+
+`iter[1] determinism: matches iter 0` — the per-result tuple
+`(seq_id, request_id, n_decoded, generated_tokens, hash,
+done_iter, pos_max_at_clear, admitted_at_iter, reused_seq_id,
+previous_request_id, admission_src)` is byte-identical between
+the two repeats. Engine-side queue size samples are also
+byte-identical (`queued_count = 6`,
+`waiting_queue_size_at_engine_end = 6` in both repeats), and
+the cancel-plan + admission-field defaults all match.
+
+### Captures
+
+```text
+local/hpx_cb_admit_step2_default.stdout
+local/hpx_cb_admit_step2_default.stderr
+local/hpx_cb_admit_step2.stdout
+local/hpx_cb_admit_step2.stderr
+local/hpx_cb_admit_step2_repeat2.stdout
+local/hpx_cb_admit_step2_repeat2.stderr
+```
+
+### Caveat
+
+Slice 2 does not prove live admission yet. It only proves that
+a waiting queue can exist beside the active population without
+changing active decode/cancel behavior — the data path is
+plumbed, the engine sees the queue but does not consume from
+it, and every Slice-1 field default still holds. Slice 3 is
+where the engine will pop the FIFO head at the admission
+boundary, bind the popped request to a cancel-freed slot, and
+turn the queue into a real serving primitive.
+
+## Live Admission Slice 3 results — cancel-freed-slot admission
+
+Live Admission Slice 3 turns the Slice 2 waiting queue into a real
+serving primitive. The engine now consumes the FIFO head at each
+admission boundary, binds it to a slot freed by cooperative
+cancellation, prefills it in a mixed prefill+decode batch, and
+fulfills the admitted request's promise after KV clear and
+cross-talk verification — exactly like a completed original
+active request.
+
+### Build
+
+```sh
+cmake --build /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal \
+  --target llama-hpx-continuous-batch-gate
+```
+
+(Metal-enabled build dir, matching the recorded canonical-hash
+baseline. The CPU-only build would not reproduce the
+`0x88a4dc75a31d4325` / `0x8a1a3bd01360aada` surviving-active
+hashes — a Metal vs CPU/CPU_REPACK divergence noted for the
+Cancel Slice 4 evidence and carried over here.)
+
+### Runs
+
+Default-mode regression — same default plan as Cancel Slice 4,
+with `--n-active` defaulted to `n_seqs` and `--n-waiting=0` so
+no admission can fire:
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step3_default.stdout \
+  2> local/hpx_cb_admit_step3_default.stderr
+```
+
+Slice 3 compact smoke — the canonical cancel-freed-slot admission
+shape (`n_active=93`, `n_waiting=6`, `waiting_budget=64`, default
+cancel plan):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+  --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step3.stdout \
+  2> local/hpx_cb_admit_step3.stderr
+```
+
+Slice 3 repeat 2 — same shape, two engine iterations, validates
+determinism over the extended admission tuple:
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+  --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 --repeat 2 \
+  > local/hpx_cb_admit_step3_repeat2.stdout \
+  2> local/hpx_cb_admit_step3_repeat2.stderr
+```
+
+### Final lines
+
+| Run                     | Final stdout line             |
+|-------------------------|-------------------------------|
+| Default-mode regression | `HPX_CB_ADMIT_STEP3: PASS`    |
+| Slice 3 compact smoke   | `HPX_CB_ADMIT_STEP3: PASS`    |
+| Slice 3 repeat 2        | `HPX_CB_ADMIT_STEP3: PASS`    |
+
+### Slice 3 smoke counts
+
+```text
+orig completed     = 87
+original cancelled = 6
+admitted completed = 6
+completed total    = 93   (87 original + 6 admitted)
+cancelled total    = 6
+total results      = 99
+queued             = 6
+waiting_end        = 0
+```
+
+`admit_step3` audit line (from `local/hpx_cb_admit_step3.stdout`):
+
+```text
+iter[0] admit_step3: orig completed=87 cancelled=6, admitted=6,
+        total_results=99, queued=6 waiting_end=0
+iter[0] status_summary: completed=93 cancelled=6 total=99
+        (orig_completed=87 admitted_completed=6)
+```
+
+### Reused slot set
+
+```text
+reused_seq_id_set = {1,2,4,5,7,8}
+```
+
+The set equals the cancellation plan in ascending `seq_id`
+order. No naturally completed budget-8 slot
+(`{0, 3, 6, 9, …, 90}`) is reused — the engine consumes from
+`free_due_to_cancel` only, and `free_due_to_cancel` is
+populated only by `cancel_and_fulfill` after a successful
+cancellation KV clear.
+
+### Admission mapping
+
+The waiting queue is consumed FIFO; cancel-freed slots are
+consumed in ascending `seq_id`. With waiting requests
+`{93, 94, 95, 96, 97, 98}` and ascending cancel-freed slots
+`{1, 2, 4, 5, 7, 8}`:
+
+| waiting request_id | bound to seq_id | previous_request_id |
+|--------------------|-----------------|---------------------|
+| 93                 | 1               | 1                   |
+| 94                 | 2               | 2                   |
+| 95                 | 4               | 4                   |
+| 96                 | 5               | 5                   |
+| 97                 | 7               | 7                   |
+| 98                 | 8               | 8                   |
+
+`previous_request_id == reused_seq_id` because the original
+active set has `request_id == seq_id` (no admission rebinds
+that mapping).
+
+### Partitioned hash table
+
+Hash uniqueness, `done_iter`, and `pos_max_at_clear` are
+validated within `(admission_src, decode_budget)` partitions:
+
+| `admission_src` | budget | completed | cancelled | hash                   | `done_iter` | `pos_max_at_clear` |
+|-----------------|--------|-----------|-----------|------------------------|-------------|--------------------|
+| `none`          | 8      | 31        | 0         | `0x0619d4d1900c2365`   | 7           | 12                 |
+| `none`          | 64     | 28        | 3         | `0x88a4dc75a31d4325`   | 63          | 68                 |
+| `none`          | 256    | 28        | 3         | `0x8a1a3bd01360aada`   | 255         | 260                |
+| `cancel_freed`  | 64     | 6         | 0         | `0x3b15a0474dfe11be`   | 80          | 68                 |
+
+The admitted budget-64 hash `0x3b15a0474dfe11be` differs from
+the surviving-active budget-64 hash `0x88a4dc75a31d4325`
+because iter 17 is now a mixed prefill+decode batch (36
+prefill rows for the 6 admitted seqs + 56 decode rows for the
+surviving-active budget-64/256 seqs). Floating-point order is
+batch-shape-dependent, so any seq whose KV is updated in iter
+17 sees a different micro-result. Within-partition uniqueness
+still holds: all 6 admitted budget-64 hashes are identical to
+each other, and all 28 surviving-active budget-64 hashes are
+identical to each other; the two values are not required to
+match.
+
+The budget-8 canonical anchor `0x0619d4d1900c2365` is
+preserved because budget-8 slots are never cancelled and never
+admitted — their iter-17 batch shape is unchanged from the
+cancellation-only run. The surviving-active budget-256 hash
+`0x8a1a3bd01360aada` matches the Cancel Slice 4 anchor for the
+same reason this prototype's design predicts: surviving
+budget-256 seqs ride iter 17 as a single decode row each, so
+their per-row composition is identical to the
+cancellation-only path… up to the iter-17 mixed batch's
+floating-point side effects on co-resident rows. (The match
+above is the empirical outcome on this Metal build; it is not
+gated as an across-shape anchor and is reported descriptively.)
+
+`done_iter == 80` for the admitted budget-64 partition equals
+`admitted_at_iter (17) + decode_budget (64) − 1`, matching the
+design's expected anchor exactly. `pos_max_at_clear == 68`
+equals `n_prompt (6) + decode_budget (64) − 2`.
+
+### Cancellation gates (still hold)
+
+```text
+cancelled budget=64  count=3 cancel_observed_iter_set={16}
+                     n_decoded_at_cancel_set={16}
+cancelled budget=256 count=3 cancel_observed_iter_set={16}
+                     n_decoded_at_cancel_set={16}
+```
+
+Cancellation fires at iter 16 for the 6 cancel-plan seqs;
+their KV is cleared in the same iter; `free_due_to_cancel`
+gains `{1, 2, 4, 5, 7, 8}` after these clears succeed; the
+engine snapshots `free_due_to_cancel.size() = 6` at the top
+of iter 17 (before iter 17's no-op cancellation pass) and
+admits all 6 waiting requests. `wasted_decode_rows_after_cancel`
+remains structurally `0` and `decode_failures = 0`.
+
+### Determinism (`--repeat 2`)
+
+```text
+iter[1] determinism: matches iter 0
+```
+
+The per-result tuple `(seq_id, request_id, n_decoded,
+generated_tokens, hash, done_iter, pos_max_at_clear,
+admitted_at_iter, reused_seq_id, previous_request_id,
+admission_src)` is byte-identical between iter 0 and iter 1.
+`admitted_count = 6`, `reused_seq_id_set = {1,2,4,5,7,8}`,
+`waiting_queue_size_at_engine_end = 0`, and the
+admitted-result mapping all repeat verbatim.
+
+### Residual KV
+
+```text
+iter[N] residual_kv: all 99 seqs cleared (pos_min=-1, pos_max=-1)
+residual_kv_empty       = true
+```
+
+The engine-side sweep covers all 99 `seq_id`s — the 6
+cancel-freed slots that were re-used by admitted requests, the
+87 still-mapped original active slots, and the
+budget-8-completed slots that were never re-used in this
+smoke. Every slot ends the run with `pos_min == pos_max ==
+-1`.
+
+### Default mode and `free_due_to_cancel` residue
+
+In the default-mode run (`--n-waiting=0`), the cancellation
+plan still fires for `{1, 4, 7, 2, 5, 8}` and pushes those
+`seq_id`s into `free_due_to_cancel`. With no waiting requests
+to consume them, the deque holds `cancel_plan.size()` entries
+at end of run. **This is expected in Slice 3 and not a gate
+violation:** the Slice 1 / Slice 2 "must remain empty" guard
+is retired, and `run_body()` resets `free_due_to_cancel`,
+`waiting_queue_consumable_`, and `admitted_futures_` at the
+start of every repeat so residue never leaks between repeats.
+
+Default-mode partitioned table (no admitted partition exists
+because `admitted_count = 0`):
+
+```text
+iter[0] partition src=none budget=8   completed=33 cancelled=0
+        hash=0x0619d4d1900c2365 done_iter_set={7}   pos_max_at_clear_set={12}
+iter[0] partition src=none budget=64  completed=30 cancelled=3
+        hash=0x88a4dc75a31d4325 done_iter_set={63}  pos_max_at_clear_set={68}
+iter[0] partition src=none budget=256 completed=30 cancelled=3
+        hash=0x8a1a3bd01360aada done_iter_set={255} pos_max_at_clear_set={260}
+iter[0] admit_step3: orig completed=93 cancelled=6, admitted=0,
+        total_results=99, queued=0 waiting_end=0
+```
+
+### Captures
+
+```text
+local/hpx_cb_admit_step3_default.stdout
+local/hpx_cb_admit_step3_default.stderr
+local/hpx_cb_admit_step3.stdout
+local/hpx_cb_admit_step3.stderr
+local/hpx_cb_admit_step3_repeat2.stdout
+local/hpx_cb_admit_step3_repeat2.stderr
+```
+
+### Caveat
+
+Slice 3 is correctness-only. No new trace event names are
+emitted (`request_queued`, `request_admitted_live`,
+`seq_reused`, `admitted_prefilled`, `admitted_decode_row`,
+`admitted_complete`) — the existing `decode_row`,
+`seq_complete`, `kv_cleared`, `promise_fulfilled` lifecycle
+events fire for admitted seqs through the same paths. The
+admission-specific traces and the extended descriptive
+metrics (`admission_iter_set`, `reused_seq_id_count`,
+`admitted_ttc_ms[budget=*]`,
+`waiting_queue_depth_per_iter`) are deferred to Slice 4.
+
+## Live Admission Slice 4 results — traces and metrics closeout
+
+Live Admission Slice 4 wires the admission-specific trace events
+and descriptive metrics promised by the live-admission design
+(§7, §8). **Slice 4 did not change admission behavior; it only
+added observability.** Every Slice 3 anchor (87 orig completed,
+6 cancelled, 6 admitted, total 99, residual KV empty,
+partitioned hashes including the admitted-budget-64 anchor
+`0x3b15a0474dfe11be`) reproduces exactly. Trace-off captures
+remain byte-quiet: zero `[hpx-cb-gate] event=` lines on stderr
+in default, compact, and repeat-2 trace-off runs.
+
+### Build
+
+```sh
+cmake --build /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal \
+  --target llama-hpx-continuous-batch-gate
+```
+
+### Runs
+
+Default-mode regression (trace off):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step4_default.stdout \
+  2> local/hpx_cb_admit_step4_default.stderr
+```
+
+Compact smoke (trace off):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+  --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step4.stdout \
+  2> local/hpx_cb_admit_step4.stderr
+```
+
+Compact smoke (`LLAMA_HPX_CB_TRACE=1`):
+
+```sh
+LLAMA_HPX_CB_TRACE=1 \
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+  --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+  > local/hpx_cb_admit_step4_trace.stdout \
+  2> local/hpx_cb_admit_step4_trace.stderr
+```
+
+Repeat 2 (trace off):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+  --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+  --decode-budget-mix 8,64,256 \
+  --ctx-size 32768 --n-batch 1024 --n-threads 2 --repeat 2 \
+  > local/hpx_cb_admit_step4_repeat2.stdout \
+  2> local/hpx_cb_admit_step4_repeat2.stderr
+```
+
+### Final lines
+
+| Run                       | Final stdout line             |
+|---------------------------|-------------------------------|
+| Default-mode trace-off    | `HPX_CB_ADMIT_STEP4: PASS`    |
+| Compact smoke trace-off   | `HPX_CB_ADMIT_STEP4: PASS`    |
+| Compact smoke trace-on    | `HPX_CB_ADMIT_STEP4: PASS`    |
+| Repeat 2 trace-off        | `HPX_CB_ADMIT_STEP4: PASS`    |
+
+### Trace-off quietness
+
+```text
+$ grep -c "[hpx-cb-gate] event=" local/hpx_cb_admit_step4_default.stderr
+0
+$ grep -c "[hpx-cb-gate] event=" local/hpx_cb_admit_step4.stderr
+0
+$ grep -c "[hpx-cb-gate] event=" local/hpx_cb_admit_step4_repeat2.stderr
+0
+```
+
+All three trace-off captures emit zero `[hpx-cb-gate] event=`
+lines on stderr (the 145 lines per stderr are the standard
+llama.cpp / Metal init noise). Trace gating is preserved from
+prior slices.
+
+### Trace event counts (compact, `LLAMA_HPX_CB_TRACE=1`)
+
+| Event                        | Expected | Observed | Note         |
+|------------------------------|----------|----------|--------------|
+| `engine_start`               | 1        | 1        |              |
+| `engine_stop`                | 1        | 1        |              |
+| `request_admitted`           | 93       | 93       | original active set |
+| `request_queued`             | 6        | 6        | main, pre-engine |
+| `request_admitted_live`      | 6        | 6        | admission boundary |
+| `seq_reused`                 | 6        | 6        | admission boundary |
+| `seq_prefilled`              | 93       | 93       | original active prefill |
+| `admitted_prefilled`         | 6        | 6        | iter-17 post-decode argmax |
+| `decode_row`                 | derived  | 9589     | descriptive (high-cardinality) |
+| `admitted_decode_row`        | 378      | 378      | 6 admitted × 63 decode iters |
+| `seq_complete`               | 93       | 93       | every completion path |
+| `admitted_complete`          | 6        | 6        | admitted completion path only |
+| `kv_cleared`                 | 93       | 93       | every successful KV clear |
+| `promise_fulfilled`          | 93       | 93       | every completion fulfillment |
+| `cancel_requested`           | 6        | 6        | engine-start cancel-plan emit |
+| `cancel_observed`            | 6        | 6        | iter-16 cancel pass |
+| `cancel_kv_cleared`          | 6        | 6        | cancel path |
+| `cancel_future_fulfilled`    | 6        | 6        | cancel path |
+
+### Trace event examples
+
+`seq_reused` carries the prior owner (captured before
+`rseq.request_id` is overwritten) and the new owner:
+
+```text
+[hpx-cb-gate] event=seq_reused seq_id=1 previous_owner=1 new_owner=93 iter=17
+```
+
+`admitted_complete` mirrors `seq_complete` and carries the
+budget / done_iter / hash — the hash matches the admitted
+budget-64 anchor `0x3b15a0474dfe11be`:
+
+```text
+[hpx-cb-gate] event=admitted_complete request=93 seq_id=1 budget=64 done_iter=80 hash=0x3b15a0474dfe11be
+```
+
+### Structural gate (independent of trace flag)
+
+`admitted_prefill_events == admitted_count` per repeat. The
+counter is incremented next to the `admitted_prefilled` trace
+site, gated on a predicate captured BEFORE `n_decoded` is
+mutated, so it fires exactly once per admitted request even
+when trace is disabled:
+
+| Run               | admitted_prefill_events | admitted_count | OK |
+|-------------------|-------------------------|----------------|----|
+| Default trace-off | 0                       | 0              | ✓  |
+| Compact trace-off | 6                       | 6              | ✓  |
+| Repeat 2 iter[0]  | 6                       | 6              | ✓  |
+| Repeat 2 iter[1]  | 6                       | 6              | ✓  |
+
+### Slice 4 metric lines (compact smoke)
+
+```text
+admitted_count          = 6
+reused_seq_id_set       = {1,2,4,5,7,8}
+reused_seq_id_count     = 6
+admitted_prefill_events = 6
+admission_iter_set      = {17}
+waiting_queue_depth_after_admission_per_iter p50=0 p95=6 max=6 (samples=255)
+admitted_ttc_ms[budget=64]  mean=29610.24 p95=29610.43
+```
+
+### Queue-depth metric explanation
+
+`waiting_queue_depth_after_admission_per_iter` is sampled
+**after** each decode iter's admission loop completes. One
+sample per decode iter (255 samples for the smoke shape, equal
+to `update_iterations`):
+
+- iters 1..16: depth = 6 — admission has not yet had a freed
+  slot to consume (cancellation fires at iter 16's top, but the
+  freeze-count snapshot delays admission by one iter).
+- iter 17: depth = 0 — admission consumed all 6 waiters this
+  iter.
+- iters 18..255: depth = 0 — queue stays empty.
+
+That gives `max = 6` (the 16 pre-admission iters), `p50 = 0`
+(most iters are post-admission), and `p95 = 6` (16/255 ≈ 6.3%
+of samples are 6, fitting the upper tail). The "after
+admission" sampling point is the design's intent: at iter 17,
+the engine consumed the queue, so the engine-end depth at iter
+17 is `0`, not `6`.
+
+### Repeat determinism
+
+```text
+iter[1] determinism: matches iter 0
+```
+
+The per-result tuple `(seq_id, request_id, n_decoded,
+generated_tokens, hash, done_iter, pos_max_at_clear,
+admitted_at_iter, reused_seq_id, previous_request_id,
+admission_src)` is byte-identical between iter 0 and iter 1.
+Every Slice 4 metric is also stable across repeats:
+`admitted_count = 6`, `reused_seq_id_set = {1,2,4,5,7,8}`,
+`reused_seq_id_count = 6`, `admitted_prefill_events = 6`,
+`admission_iter_set = {17}`,
+`waiting_queue_depth_after_admission_per_iter p50=0 p95=6 max=6
+(samples=255)` — all observed verbatim in both repeats.
+
+### Captures
+
+```text
+local/hpx_cb_admit_step4_default.stdout
+local/hpx_cb_admit_step4_default.stderr
+local/hpx_cb_admit_step4.stdout
+local/hpx_cb_admit_step4.stderr
+local/hpx_cb_admit_step4_trace.stdout
+local/hpx_cb_admit_step4_trace.stderr
+local/hpx_cb_admit_step4_repeat2.stdout
+local/hpx_cb_admit_step4_repeat2.stderr
+```
+
+### Caveat
+
+Slice 4 is observability-only. No admission-behavior change, no
+new CLI flags, no scheduling-policy change, no batch-shape
+change. The Slice 3 admission flow is intact end-to-end; the
+new traces and metrics are descriptive surfaces over the same
+underlying engine state.
+
+---
+
+## Live Admission Slice 5 results — completion-freed slot reuse
+
+Slice 5 adds completion-freed-slot admission on top of the
+Slice 3 cancel-freed-slot path. A new default-OFF CLI flag
+`--reuse-completed` enables the second admission source; a
+new engine deque `free_due_to_completion` is filled under a
+**demand gate** (push only while the waiting queue still has
+unadmitted entries); and admission source priority is
+`cancel_freed` → `completion_freed`. Slice 3 cancel-freed
+behavior is preserved semantically when `--reuse-completed`
+is OFF. Slice 5 does **not** test combined cancel + completion
+source admission in one run — that is a future mixed-source
+slice and is out of scope here.
+
+Implementation reference:
+[`docs/hpx/continuous_batching_live_admission_design.md`](../../docs/hpx/continuous_batching_live_admission_design.md)
+(§9 Slice 5 — completion-freed-slot admission).
+
+### Build
+
+Same Metal-enabled build as Slice 1–4:
+
+```sh
+cmake --build /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal \
+  --target llama-hpx-continuous-batch-gate
+```
+
+Result: clean rebuild, `[2/2] Linking CXX executable
+bin/llama-hpx-continuous-batch-gate`. The binary embeds
+`HPX_CB_ADMIT_STEP5`, `completion_freed`, and
+`--reuse-completed` strings (verified via `strings`).
+
+### Run commands
+
+1. Default regression (no `--n-active/--n-waiting`, no
+   `--reuse-completed`, default cancel plan):
+
+   ```bash
+   /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+     --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+     --n-seqs 99 --decode-budget-mix 8,64,256 \
+     --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+     > local/hpx_cb_admit_step5_default.stdout \
+     2> local/hpx_cb_admit_step5_default.stderr
+   ```
+
+2. Slice 3 semantic regression with `--reuse-completed` OFF
+   (compact shape, default cancel plan):
+
+   ```bash
+   /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+     --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+     --n-seqs 99 --n-active 93 --n-waiting 6 --waiting-budget 64 \
+     --decode-budget-mix 8,64,256 \
+     --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+     > local/hpx_cb_admit_step5_slice3_regression.stdout \
+     2> local/hpx_cb_admit_step5_slice3_regression.stderr
+   ```
+
+3. Slice 5 compact smoke (completion-freed, explicit empty
+   cancel plan):
+
+   ```bash
+   /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+     --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+     --n-seqs 99 --n-active 90 --n-waiting 9 --waiting-budget 8 \
+     --decode-budget-mix 8,64,256 \
+     --cancel-plan none --reuse-completed \
+     --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+     > local/hpx_cb_admit_step5.stdout \
+     2> local/hpx_cb_admit_step5.stderr
+   ```
+
+4. Slice 5 trace-on compact:
+
+   ```bash
+   LLAMA_HPX_CB_TRACE=1 \
+   /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+     --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+     --n-seqs 99 --n-active 90 --n-waiting 9 --waiting-budget 8 \
+     --decode-budget-mix 8,64,256 \
+     --cancel-plan none --reuse-completed \
+     --ctx-size 32768 --n-batch 1024 --n-threads 2 \
+     > local/hpx_cb_admit_step5_trace.stdout \
+     2> local/hpx_cb_admit_step5_trace.stderr
+   ```
+
+5. Slice 5 repeat 2:
+
+   ```bash
+   /Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+     --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+     --n-seqs 99 --n-active 90 --n-waiting 9 --waiting-budget 8 \
+     --decode-budget-mix 8,64,256 \
+     --cancel-plan none --reuse-completed \
+     --ctx-size 32768 --n-batch 1024 --n-threads 2 --repeat 2 \
+     > local/hpx_cb_admit_step5_repeat2.stdout \
+     2> local/hpx_cb_admit_step5_repeat2.stderr
+   ```
+
+### Final stdout lines
+
+| Run | Final line |
+|---|---|
+| 1. Default regression | `HPX_CB_ADMIT_STEP5: PASS` |
+| 2. Slice 3 semantic regression (`--reuse-completed` OFF) | `HPX_CB_ADMIT_STEP5: PASS` |
+| 3. Slice 5 compact smoke | `HPX_CB_ADMIT_STEP5: PASS` |
+| 4. Slice 5 trace-on compact | `HPX_CB_ADMIT_STEP5: PASS` |
+| 5. Slice 5 repeat 2 | `HPX_CB_ADMIT_STEP5: PASS` |
+
+### Slice 5 smoke evidence (run 3)
+
+```text
+iter[0] admit_step5: orig completed=90 cancelled=0, admitted=9
+        (cancel_freed=0 completion_freed=9), total_results=99,
+        queued=9 waiting_end=0, completion_pool_residual=21
+iter[0] residual_kv: all 99 seqs cleared (pos_min=-1, pos_max=-1)
+  reused_seq_id_set       = {0,3,6,9,12,15,18,21,24}
+  admission_iter_set      = {8}
+  completion_freed_pool_size_at_run_end = 21
+```
+
+Key counts:
+
+```text
+orig completed                          = 90
+cancelled                               = 0
+admitted                                = 9
+total_results                           = 99
+queued                                  = 9
+waiting_end                             = 0
+reused_seq_id_set                       = {0,3,6,9,12,15,18,21,24}
+admission_iter_set                      = {8}
+completion_freed_pool_size_at_run_end   = 21
+residual KV empty (all 99 seq_ids)      = yes
+```
+
+### Slice 5 admission mapping (from trace-on, run 4)
+
+| request_id | reused seq_id | admission_source | iter |
+|---:|---:|:---|---:|
+| 90 | 0  | completion_freed | 8 |
+| 91 | 3  | completion_freed | 8 |
+| 92 | 6  | completion_freed | 8 |
+| 93 | 9  | completion_freed | 8 |
+| 94 | 12 | completion_freed | 8 |
+| 95 | 15 | completion_freed | 8 |
+| 96 | 18 | completion_freed | 8 |
+| 97 | 21 | completion_freed | 8 |
+| 98 | 24 | completion_freed | 8 |
+
+Every admitted `request_result`: `budget=8`,
+`admitted_at_iter=8`, `done_iter=15`,
+`pos_max_at_clear=12` (= `n_prompt + budget − 2 = 6 + 8 − 2`),
+`admission_src=completion_freed`,
+`previous_request_id == reused_seq_id`.
+
+### Slice 5 partition hashes (run 3)
+
+```text
+iter[0] partition src=none             budget=8   completed=30
+                  unique_completed_hashes=1
+                  hash=0x0619d4d1900c2365
+                  done_iter_set={7}  pos_max_at_clear_set={12}
+
+iter[0] partition src=completion_freed budget=8   completed=9
+                  unique_completed_hashes=1
+                  hash=0x0619d4d1900c2365
+                  done_iter_set={15} pos_max_at_clear_set={12}
+
+iter[0] partition src=none             budget=64  completed=30
+                  unique_completed_hashes=1
+                  hash=0x88a4dc75a31d4325
+                  done_iter_set={63} pos_max_at_clear_set={68}
+
+iter[0] partition src=none             budget=256 completed=30
+                  unique_completed_hashes=1
+                  hash=0x8a1a3bd01360aada
+                  done_iter_set={255} pos_max_at_clear_set={260}
+```
+
+Hash-gating policy applied in this run:
+
+- **Natural budget-8 partition** (`src=none, budget=8`,
+  30 results) completes entirely before admission iter 8.
+  Its canonical Metal anchor `0x0619d4d1900c2365` is **gated
+  strictly**.
+- **Surviving budget-64 and budget-256 partitions**
+  (`src=none, budget={64,256}`, 30 results each) cross
+  iter 8's mixed prefill+decode batch shape. They matched
+  canonical anchors `0x88a4dc75a31d4325` and
+  `0x8a1a3bd01360aada` in this run, but per the approved
+  plan they are **not** gated against canonical — only
+  against within-run uniqueness (one hash per partition) and
+  `--repeat 2` determinism. The canonical matches are
+  recorded here as observed, not required.
+- **Admitted `completion_freed` budget-8 partition**
+  (9 results) is **descriptive only**: the observed hash
+  `0x0619d4d1900c2365` is recorded for reference but is not
+  canonical-gated. Within-run uniqueness (single hash across
+  the 9 admitted) IS gated.
+
+### Slice 3 semantic regression (run 2)
+
+With `--reuse-completed` OFF and the default cancel plan
+`{1,4,7,2,5,8}` / `cancel_after=16`, the Slice 3 / 4
+cancel-freed behavior is preserved. The four observed
+partition lines:
+
+```text
+iter[0] partition src=none         budget=8   completed=31
+                  hash=0x0619d4d1900c2365  done_iter_set={7}
+                  pos_max_at_clear_set={12}
+
+iter[0] partition src=none         budget=64  completed=28
+                  cancelled=3   hash=0x88a4dc75a31d4325
+                  done_iter_set={63}  pos_max_at_clear_set={68}
+
+iter[0] partition src=cancel_freed budget=64  completed=6
+                  hash=0x3b15a0474dfe11be  done_iter_set={80}
+                  pos_max_at_clear_set={68}
+
+iter[0] partition src=none         budget=256 completed=28
+                  cancelled=3   hash=0x8a1a3bd01360aada
+                  done_iter_set={255} pos_max_at_clear_set={260}
+```
+
+The cancel-freed admitted budget-64 hash
+`0x3b15a0474dfe11be`, the `reused_seq_id_set =
+{1,2,4,5,7,8}`, and `admission_iter_set = {17}` reproduce
+exactly. `completion_freed_pool_size_at_run_end = 0` (engine
+never touched the pool) and `cancel_freed=6
+completion_freed=0` on the audit line. Comparison to Slice 4
+is semantic, not byte-for-byte: only the label
+(`HPX_CB_ADMIT_STEP4` → `HPX_CB_ADMIT_STEP5`) and the audit
+line name (`admit_step3:` → `admit_step5:` with the new
+source-split / pool-residual fields appended) differ.
+
+### Trace counts (run 4, trace-on)
+
+```text
+engine_start              1
+engine_stop               1
+request_admitted         90
+request_queued            9
+request_admitted_live     9
+seq_reused                9     payload: admission_source=completion_freed
+seq_prefilled            90
+admitted_prefilled        9     payload: admission_source=completion_freed
+decode_row             9813     descriptive
+admitted_decode_row      63     payload: admission_source=completion_freed
+seq_complete             99
+admitted_complete         9     payload: admission_source=completion_freed
+kv_cleared               99
+promise_fulfilled        99
+cancel_requested          0
+cancel_observed           0
+cancel_kv_cleared         0
+cancel_future_fulfilled   0
+```
+
+Notes:
+
+- `seq_complete = 99` (all 99 completions: 90 originals + 9
+  admitted) and `admitted_complete = 9` (admitted subset) are
+  distinct counters, not redundant — same naming convention as
+  `request_admitted = 90` (generic) vs `request_admitted_live
+  = 9` (admission-source-aware) from Slice 4.
+- `admitted_decode_row = 63` is 9 admitted × 7 post-prefill
+  decode rows. The first row of each admitted seq is a prefill
+  row (counted by `admitted_prefilled`, not `admitted_decode_row`)
+  and the post-decode argmax of iter 8 produces the first
+  generated token; the remaining 7 decode iters each emit one
+  `admitted_decode_row` per admitted seq.
+- Cancel-family event counts are `0` (Slice 5 smoke uses
+  `--cancel-plan none`).
+
+### Trace-off quietness
+
+All four trace-off captures emit zero `[hpx-cb-gate] event=`
+lines on stderr:
+
+```text
+local/hpx_cb_admit_step5_default.stderr            0
+local/hpx_cb_admit_step5_slice3_regression.stderr  0
+local/hpx_cb_admit_step5.stderr                    0
+local/hpx_cb_admit_step5_repeat2.stderr            0
+```
+
+### Repeat determinism (run 5)
+
+```text
+iter[0] admit_step5: … admitted=9 (cancel_freed=0 completion_freed=9)
+                       total_results=99 queued=9 waiting_end=0
+                       completion_pool_residual=21
+  reused_seq_id_set       = {0,3,6,9,12,15,18,21,24}
+  admission_iter_set      = {8}
+  completion_freed_pool_size_at_run_end = 21
+
+iter[1] admit_step5: … admitted=9 (cancel_freed=0 completion_freed=9)
+                       total_results=99 queued=9 waiting_end=0
+                       completion_pool_residual=21
+  reused_seq_id_set       = {0,3,6,9,12,15,18,21,24}
+  admission_iter_set      = {8}
+  completion_freed_pool_size_at_run_end = 21
+
+iter[1] determinism: matches iter 0
+```
+
+The per-result tuple `(seq_id, request_id, n_decoded,
+generated_tokens, hash, done_iter, pos_max_at_clear,
+admitted_at_iter, reused_seq_id, previous_request_id,
+admission_src)` is byte-identical across iter 0 and iter 1.
+`reused_seq_id_set`, `admission_iter_set`, and
+`completion_freed_pool_size_at_run_end` are stable across
+repeats.
+
+### Captures
+
+```text
+local/hpx_cb_admit_step5_default.stdout
+local/hpx_cb_admit_step5_default.stderr
+local/hpx_cb_admit_step5_slice3_regression.stdout
+local/hpx_cb_admit_step5_slice3_regression.stderr
+local/hpx_cb_admit_step5.stdout
+local/hpx_cb_admit_step5.stderr
+local/hpx_cb_admit_step5_trace.stdout
+local/hpx_cb_admit_step5_trace.stderr
+local/hpx_cb_admit_step5_repeat2.stdout
+local/hpx_cb_admit_step5_repeat2.stderr
+```
+
+### Scope
+
+Slice 5 proves completion-freed-slot reuse (the
+`waiting → queued → naturally completed slot freed → KV
+cleared → seq_id pooled → waiting request admitted →
+prefilled in a mixed batch → decoded to completion → future
+fulfilled → residual KV empty` path), and it preserves the
+Slice 3 cancel-freed-slot reuse semantics with
+`--reuse-completed` OFF.
+
+Slice 5 does **not** prove **mixed cancel + completion source
+admission in one run** — that is a future mixed-source slice.
+Slice 5 deliberately exercises exactly one admission source
+per smoke so the failure-mode space remains separable.
+
+---
+
+## Live Admission Slice 6 results — async external arrivals
+
+Closeout for the Live Admission Slice 6 surface. Adds
+deterministic async external arrivals on top of the existing
+Slice 3 cancel-freed admission path: a single scripted HPX
+submitter task pushes external arrivals into an engine-owned
+inbox under a release+ack barrier, the engine drains the
+inbox at the top of the next iter, and the arrivals admit
+through the existing cancel-freed FIFO admission path with
+`arrival_source = external` on every snapshot.
+
+### Build
+
+- Clean build, one unused warning, zero errors.
+- Build dir: `/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal`.
+- Binary:
+  `/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate`.
+- HPX-native correctness check confirmed at build time: the
+  inbox lock uses **`hpx::spinlock`** (not
+  `hpx::lcos::local::spinlock`, which is not the public alias
+  exported by this HPX install). No `std::thread`, no
+  `std::condition_variable`, no `std::this_thread::sleep_for`,
+  no new `std::mutex`.
+
+### Smoke shape
+
+```text
+n_seq_max               = 99
+n_active                = 93
+n_waiting               = 0
+n_external_arrivals     = 6
+external_arrival_budget = 64
+external_release_iter   = 8
+cancel_plan             = 1,4,7,2,5,8
+cancel_after            = 16
+--reuse-completed       = OFF
+admission source under test = cancel_freed (external arrivals
+                              bound to cancel-freed slots)
+```
+
+Derived deterministic timing:
+
+```text
+release_iter = 8       (engine end-of-iter-8 release set,
+                        submitter pushes 6-block, sets ack)
+drain_iter   = 9       (engine drains inbox at top of iter 9)
+admit_iter   = 17      (cancel_after + 1; 6 cancelled slots
+                        freed at iter 16 admit external arrivals)
+```
+
+External request IDs: `93, 94, 95, 96, 97, 98`
+(`n_active + n_waiting + i` for `i = 0..5`).
+
+### Captures
+
+```text
+local/slice6_default.stdout
+local/slice6_default.stderr
+local/slice6_smoke.stdout
+local/slice6_smoke.stderr
+local/slice6_trace.stdout
+local/slice6_trace.stderr
+local/slice6_repeat2.stdout
+local/slice6_repeat2.stderr
+```
+
+### Run commands
+
+Default regression (no Slice 6 args; verifies the inert path):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    > local/slice6_default.stdout 2> local/slice6_default.stderr
+```
+
+Slice 6 compact smoke:
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    --n-seqs 99 --n-active 93 --n-waiting 0 \
+    --n-external-arrivals 6 --external-arrival-budget 64 \
+    --external-release-iter 8 \
+    --cancel-plan 1,4,7,2,5,8 --cancel-after 16 \
+    > local/slice6_smoke.stdout 2> local/slice6_smoke.stderr
+```
+
+Slice 6 trace-on compact:
+
+```sh
+LLAMA_HPX_CB_TRACE=1 \
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    --n-seqs 99 --n-active 93 --n-waiting 0 \
+    --n-external-arrivals 6 --external-arrival-budget 64 \
+    --external-release-iter 8 \
+    --cancel-plan 1,4,7,2,5,8 --cancel-after 16 \
+    > local/slice6_trace.stdout 2> local/slice6_trace.stderr
+```
+
+Slice 6 repeat 2 (determinism):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    --n-seqs 99 --n-active 93 --n-waiting 0 \
+    --n-external-arrivals 6 --external-arrival-budget 64 \
+    --external-release-iter 8 \
+    --cancel-plan 1,4,7,2,5,8 --cancel-after 16 --repeat 2 \
+    > local/slice6_repeat2.stdout 2> local/slice6_repeat2.stderr
+```
+
+### Final-line table
+
+```text
+default regression  HPX_CB_ADMIT_STEP6: PASS
+compact smoke       HPX_CB_ADMIT_STEP6: PASS
+trace-on compact    HPX_CB_ADMIT_STEP6: PASS
+repeat 2            HPX_CB_ADMIT_STEP6: PASS
+```
+
+### External-arrival gates (smoke + repeat 2; per iter)
+
+```text
+arrival_drained_count       = 6
+external_admitted_count     = 6
+first_external_drain_iter   = 9
+iter_release_fired_set      = {8}
+submitter_ack_set           = {8}
+```
+
+The per-iter `admit_step6:` audit line confirms this directly:
+
+```text
+iter[0] admit_step6: external arrivals drained=6 admitted=6 first_drain_iter=9 release_set_size=1 ack_set_size=1
+iter[1] admit_step6: external arrivals drained=6 admitted=6 first_drain_iter=9 release_set_size=1 ack_set_size=1
+```
+
+### Request → seq mapping (FIFO over sorted cancel-plan)
+
+```text
+request 93 -> seq 1
+request 94 -> seq 2
+request 95 -> seq 4
+request 96 -> seq 5
+request 97 -> seq 7
+request 98 -> seq 8
+```
+
+Source for this evidence (from `local/slice6_trace.stderr`):
+
+```text
+[hpx-cb-gate] event=request_admitted_live request=93 reused_seq_id=1 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=94 reused_seq_id=2 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=95 reused_seq_id=4 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=96 reused_seq_id=5 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=97 reused_seq_id=7 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=98 reused_seq_id=8 iter=17 admission_source=cancel_freed arrival_source=external
+```
+
+### Per-result snapshot state (every external arrival)
+
+```text
+arrival_source       = external
+admission_source     = cancel_freed
+admitted_at_iter     = 17
+admitted budget      = 64
+admitted budget-64 hash = 0x3b15a0474dfe11be
+```
+
+The hash is the same anchor recorded by Slice 3 / Slice 4 /
+Slice 5 for the cancel-freed admitted budget-64 partition,
+proving that routing the same payload through the async
+external-arrival surface yields a byte-identical completed
+hash.
+
+### Trace counts (trace-on smoke; per repeat)
+
+```text
+event=request_submitted_external                          = 6
+event=arrival_drained                                     = 6
+event=iter_release_fired                                  = 1
+event=submitter_ack_observed                              = 1
+event=request_admitted_live arrival_source=external       = 6
+```
+
+### Trace-off quietness
+
+```text
+local/slice6_smoke.stderr     [hpx-cb-gate] event=     0
+local/slice6_default.stderr   [hpx-cb-gate] event=     0
+local/slice6_repeat2.stderr   [hpx-cb-gate] event=     0
+```
+
+Default and trace-off runs emit zero `[hpx-cb-gate] event=`
+lines; the trace path stays one atomic load + early return
+per call site when `LLAMA_HPX_CB_TRACE` is unset.
+
+### Residual / inbox cleanup
+
+```text
+residual_kv_empty = true   (default, smoke, trace-on, repeat 2 — both repeats)
+```
+
+The engine asserts both `inbox_.empty()` and
+`external_promises_.empty()` BEFORE the residual-KV sweep at
+the end of `run_body()`; the run fails closed with an
+explicit reason if either is non-empty. Across all four
+captures both checks pass on every repeat.
+
+### Repeat determinism
+
+```text
+iter[0] admit_step6: external arrivals drained=6 admitted=6 first_drain_iter=9 release_set_size=1 ack_set_size=1
+iter[1] admit_step6: external arrivals drained=6 admitted=6 first_drain_iter=9 release_set_size=1 ack_set_size=1
+iter[1] determinism: matches iter 0
+```
+
+The per-result determinism tuple `(seq_id, request_id,
+n_decoded, generated_tokens, hash, done_iter,
+pos_max_at_clear, admitted_at_iter, reused_seq_id,
+previous_request_id, admission_src)` is byte-identical
+across iter 0 and iter 1, including for every external
+arrival. The new Slice 6 counters
+(`arrival_drained_count`, `external_admitted_count`,
+`first_external_drain_iter`, `iter_release_fired_set`,
+`submitter_ack_set`) are also stable across repeats.
+
+### Inert path (default regression, no Slice 6 flags)
+
+With `--n-external-arrivals` left at its default of 0:
+
+```text
+arrival_drained_count       = 0
+external_admitted_count     = 0
+first_external_drain_iter   = -1
+iter_release_fired_set      = {}
+submitter_ack_set           = {}
+```
+
+No submitter task is spawned, no release/ack handle is
+registered, the inbox is never written, and the run is
+semantically equivalent to Slice 5 with `--reuse-completed`
+OFF. `HPX_CB_ADMIT_STEP6: PASS` confirms the inert-path gate
+fires correctly when the external surface is not exercised.
+
+### Scope
+
+Slice 6 proves the `external HPX submitter task -> release/ack
+barrier -> engine inbox (hpx::spinlock) -> drain at iter K+1 ->
+waiting queue -> existing cancel_freed admission -> external
+future fulfilled` path under deterministic (non-wall-clock)
+timing, with `arrival_source = external` propagated end-to-end
+on every snapshot, and with the engine remaining the sole
+owner of `llama_context`, `llama_batch`, `llama_decode`,
+`llama_memory_seq_*`, and `llama_get_logits_ith`.
+
+Slice 6 does **not** exercise:
+
+- Multiple distinct release iters in a single run (the smoke
+  uses one release barrier at iter 8).
+- External arrivals admitted via `completion_freed` (the
+  smoke shape's `--reuse-completed` is OFF; this is left for
+  a later mixed-source slice).
+- Wall-clock arrival schedules / streaming.
+- More than one engine task per process (the single-engine-
+  task invariant still holds end-to-end).
+
+---
+
+## Live Admission Slice 7 results — mixed-source admission priority
+
+Closeout for the Live Admission Slice 7 surface. Proves the
+engine's source-priority rule end-to-end: when
+`free_due_to_cancel_` and `free_due_to_completion_` are
+**both** non-empty at the same admission boundary, admission
+drains **cancel-freed first, completion-freed second**, and
+the residual completion-freed pool stays untouched.
+
+### Build
+
+- Clean build, zero errors. Source-only edits, four targeted
+  changes: STEP bump to `HPX_CB_ADMIT_STEP7`, soften the
+  reused-seq-id ordering gate (global no-duplicate +
+  per-`(admitted_at_iter, admission_src)` strictly ascending),
+  add `slice7_strict` gate, add `admit_step7:` audit line.
+- No new CLI flags, no new trace event names, no new HPX
+  primitives. The Slice 6 `hpx::spinlock` inbox and release+ack
+  barrier are reused unchanged.
+- Build dir:
+  `/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal`.
+- Binary:
+  `/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate`.
+
+### Smoke shape
+
+```text
+n_seq_max               = 99
+n_active                = 84
+n_waiting               = 9
+waiting_budget          = 8
+n_external_arrivals     = 6
+external_arrival_budget = 64
+external_release_iter   = 16
+--reuse-completed       = ON
+cancel_plan             = 1,4,7,2,5,8
+cancel_after            = 16
+active budgets          = round-robin {8,64,256}
+```
+
+Active slot partition (per the round-robin):
+
+```text
+budget-8   slots: 0,3,6,9,12,15,18,21,24,27,30,33,36,39,42,45,48,51,54,57,60,63,66,69,72,75,78,81   (28 slots)
+budget-64  slots: 1,4,7,10,13,16,19,22,25,28,31,34,37,40,43,46,49,52,55,58,61,64,67,70,73,76,79,82  (28 slots)
+budget-256 slots: 2,5,8,11,14,17,20,23,26,29,32,35,38,41,44,47,50,53,56,59,62,65,68,71,74,77,80,83  (28 slots)
+```
+
+cancel_plan `{1,4,7,2,5,8}` ⊂ budget-64 ∪ budget-256, all in
+`[0, 84)`.
+
+Derived deterministic timing:
+
+```text
+phase 1 admission iter = 8     (min_active_budget)
+release_iter           = 16
+drain_iter             = 17    (top of release_iter + 1)
+phase 2 admission iter = 17    (cancel_after + 1)
+admitted budget-64 done_iter   = 80   (17 + 64 − 1)
+```
+
+### Captures
+
+```text
+local/slice7_default.stdout
+local/slice7_default.stderr
+local/slice7_smoke.stdout
+local/slice7_smoke.stderr
+local/slice7_trace.stdout
+local/slice7_trace.stderr
+local/slice7_repeat2.stdout
+local/slice7_repeat2.stderr
+```
+
+### Run commands
+
+Default regression (no Slice 7 args; verifies the rest of the
+pipeline is unaffected):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    > local/slice7_default.stdout 2> local/slice7_default.stderr
+```
+
+Slice 7 compact smoke:
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    --n-seqs 99 --n-active 84 --n-waiting 9 --waiting-budget 8 \
+    --n-external-arrivals 6 --external-arrival-budget 64 \
+    --external-release-iter 16 \
+    --reuse-completed \
+    --cancel-plan 1,4,7,2,5,8 --cancel-after 16 \
+    > local/slice7_smoke.stdout 2> local/slice7_smoke.stderr
+```
+
+Slice 7 trace-on compact:
+
+```sh
+LLAMA_HPX_CB_TRACE=1 \
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    --n-seqs 99 --n-active 84 --n-waiting 9 --waiting-budget 8 \
+    --n-external-arrivals 6 --external-arrival-budget 64 \
+    --external-release-iter 16 \
+    --reuse-completed \
+    --cancel-plan 1,4,7,2,5,8 --cancel-after 16 \
+    > local/slice7_trace.stdout 2> local/slice7_trace.stderr
+```
+
+Slice 7 repeat 2 (determinism):
+
+```sh
+/Users/Ashk/Desktop/HPX/builds/llama-hpx-hpx-on-metal/bin/llama-hpx-continuous-batch-gate \
+    --model /Users/Ashk/Desktop/HPX/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    --n-seqs 99 --n-active 84 --n-waiting 9 --waiting-budget 8 \
+    --n-external-arrivals 6 --external-arrival-budget 64 \
+    --external-release-iter 16 \
+    --reuse-completed \
+    --cancel-plan 1,4,7,2,5,8 --cancel-after 16 --repeat 2 \
+    > local/slice7_repeat2.stdout 2> local/slice7_repeat2.stderr
+```
+
+### Final-line table
+
+```text
+default regression  HPX_CB_ADMIT_STEP7: PASS
+compact smoke       HPX_CB_ADMIT_STEP7: PASS
+trace-on compact    HPX_CB_ADMIT_STEP7: PASS
+repeat 2            HPX_CB_ADMIT_STEP7: PASS
+```
+
+### Phase 1 mapping (iter 8, completion_freed, preloaded)
+
+```text
+req 84 -> seq  0
+req 85 -> seq  3
+req 86 -> seq  6
+req 87 -> seq  9
+req 88 -> seq 12
+req 89 -> seq 15
+req 90 -> seq 18
+req 91 -> seq 21
+req 92 -> seq 24
+```
+
+Every phase-1 admitted result snapshot has
+`admission_source = completion_freed`,
+`arrival_source = preloaded`, `admitted_at_iter = 8`,
+`decode_budget = 8`, `done_iter = 15`,
+`pos_max_at_clear = 12`.
+
+Trace evidence (from `local/slice7_trace.stderr`):
+
+```text
+[hpx-cb-gate] event=request_admitted_live request=84 reused_seq_id=0  iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=85 reused_seq_id=3  iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=86 reused_seq_id=6  iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=87 reused_seq_id=9  iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=88 reused_seq_id=12 iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=89 reused_seq_id=15 iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=90 reused_seq_id=18 iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=91 reused_seq_id=21 iter=8 admission_source=completion_freed arrival_source=preloaded
+[hpx-cb-gate] event=request_admitted_live request=92 reused_seq_id=24 iter=8 admission_source=completion_freed arrival_source=preloaded
+```
+
+### Phase 2 mapping (iter 17, cancel_freed, external)
+
+```text
+req 93 -> seq 1
+req 94 -> seq 2
+req 95 -> seq 4
+req 96 -> seq 5
+req 97 -> seq 7
+req 98 -> seq 8
+```
+
+Every phase-2 admitted result snapshot has
+`admission_source = cancel_freed`,
+`arrival_source = external`, `admitted_at_iter = 17`,
+`decode_budget = 64`, `done_iter = 80`,
+`pos_max_at_clear = 68`.
+
+Trace evidence:
+
+```text
+[hpx-cb-gate] event=request_admitted_live request=93 reused_seq_id=1 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=94 reused_seq_id=2 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=95 reused_seq_id=4 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=96 reused_seq_id=5 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=97 reused_seq_id=7 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=request_admitted_live request=98 reused_seq_id=8 iter=17 admission_source=cancel_freed arrival_source=external
+```
+
+### Priority proof
+
+At the discriminating iter 17 boundary, both pools are
+non-empty (`free_due_to_cancel_` = 6 entries,
+`free_due_to_completion_` = 19 entries) and the waiting queue
+has exactly 6 entries (the just-drained external arrivals).
+The engine must consume cancel-freed first; the smoke records:
+
+```text
+iter 8  admissions: completion_freed = 9   cancel_freed = 0
+iter 17 admissions: cancel_freed     = 6   completion_freed = 0
+
+iter 17 reused_seq_id set = {1, 2, 4, 5, 7, 8}
+                         == sorted(cancel_plan)
+
+no iter-17 admission has reused_seq_id in the residual
+completion-freed pool:
+    {27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66,
+     69, 72, 75, 78, 81}
+```
+
+If the priority were reversed (completion-freed first), the
+smoke would instead admit the 6 externals onto
+`{27, 30, 33, 36, 39, 42}` and `free_due_to_cancel_` would
+end with 6 residual entries. The slice7_strict gate fails
+closed against both shapes.
+
+`admit_step7:` audit line (smoke + both repeats):
+
+```text
+iter[r] admit_step7: phase1@iter=8 completion_freed=9 phase2@iter=17 cancel_freed=6 pool_residual=19 admission_iter_set={8,17} first_external_drain_iter=17
+```
+
+### Residual completion-freed pool
+
+```text
+completion_freed_pool_size_at_run_end = 19
+```
+
+Computed from the engine and asserted both by the generic
+gate (Slice 5) and by `slice7_strict` (Slice 7). The 19 slots
+are the 28 budget-8 actives minus the 9 consumed at iter 8;
+the demand gate stops subsequent pushes from naturally
+completing admitted-budget-8 (iter 15) and from later
+budget-64 / budget-256 actives (iter 63 / 255) because the
+waiting queue is empty at those iters.
+
+The 19 residual seq_ids stay KV-empty under the existing
+all-`n_seq_max`-slots residual sweep at engine end.
+
+### Engine counters (smoke + both repeats)
+
+| Counter | Expected | Observed |
+|---|---|---|
+| `admitted_count` | 15 | 15 |
+| `completion_freed_admissions` | 9 | 9 |
+| `cancel_freed_admissions` | 6 | 6 |
+| `external_admitted_count` | 6 | 6 |
+| `arrival_drained_count` | 6 | 6 |
+| `first_external_drain_iter` | 17 | 17 |
+| `iter_release_fired_set` | `{16}` | `{16}` |
+| `submitter_ack_set` | `{16}` | `{16}` |
+| `admission_iter_set` | `{8, 17}` | `{8, 17}` |
+| `waiting_queue_size_at_engine_end` | 0 | 0 |
+| `promises_fulfilled` | 99 | 99 |
+| `results.size()` | 99 | 99 |
+| `completion_freed_pool_size_at_run_end` | 19 | 19 |
+| `cancelled_count` | 6 | 6 |
+| `residual_kv_empty` | true | true |
+
+Status / audit split:
+
+```text
+orig_completed_total      = 78   (28 b-8 + 25 b-64 + 25 b-256)
+orig_cancelled_total      = 6
+admitted_completed_total  = 15   (9 completion_freed + 6 cancel_freed)
+completed_total           = 93   (orig + admitted)
+cancelled_total           = 6
+```
+
+### Trace counts (trace-on capture)
+
+```text
+event=request_queued   arrival_source=preloaded   =  9
+event=request_queued   arrival_source=external    =  6
+event=request_submitted_external                  =  6
+event=arrival_drained                             =  6
+event=iter_release_fired                          =  1
+event=submitter_ack_observed                      =  1
+event=request_admitted_live (total)               = 15
+event=seq_complete                                = 93
+event=admitted_complete                           = 15
+event=kv_cleared                                  = 93
+event=promise_fulfilled                           = 93
+event=cancel_requested                            =  6
+event=cancel_observed                             =  6
+event=cancel_kv_cleared                           =  6
+event=cancel_future_fulfilled                     =  6
+```
+
+All 15 trace-count expectations match the design exactly. The
+generic completion-trace family (`seq_complete`, `kv_cleared`,
+`promise_fulfilled` at 93 each) covers both the 78 original
+completions and the 15 admitted completions; the cancel-family
+events fire only on the cancellation path (6 each).
+
+### Trace-off quietness
+
+```text
+local/slice7_default.stderr    [hpx-cb-gate] event=    0
+local/slice7_smoke.stderr      [hpx-cb-gate] event=    0
+local/slice7_repeat2.stderr    [hpx-cb-gate] event=    0
+```
+
+Every trace-off capture emits zero `[hpx-cb-gate] event=`
+lines; the trace path stays one atomic load + early return
+per call site when `LLAMA_HPX_CB_TRACE` is unset.
+
+### Residual KV
+
+`residual_kv_empty = true` across default, smoke, trace-on,
+and both iters of the repeat-2 run. The Slice 6 engine-side
+gate ensures `inbox_` and `external_promises_` are also
+asserted empty BEFORE the residual-KV sweep.
+
+### Repeat determinism
+
+```text
+iter[0] admit_step7: phase1@iter=8 completion_freed=9 phase2@iter=17 cancel_freed=6 pool_residual=19 admission_iter_set={8,17} first_external_drain_iter=17
+iter[1] admit_step7: phase1@iter=8 completion_freed=9 phase2@iter=17 cancel_freed=6 pool_residual=19 admission_iter_set={8,17} first_external_drain_iter=17
+iter[1] determinism: matches iter 0
+```
+
+The per-result determinism tuple `(seq_id, request_id,
+n_decoded, generated_tokens, hash, done_iter,
+pos_max_at_clear, admitted_at_iter, reused_seq_id,
+previous_request_id, admission_src)` is byte-identical
+across iter 0 and iter 1, including for every phase-1
+completion-freed admission and every phase-2 cancel-freed
+external admission. The Slice 6/7 counters
+(`arrival_drained_count`, `external_admitted_count`,
+`first_external_drain_iter`, `iter_release_fired_set`,
+`submitter_ack_set`, `admission_iter_set`,
+`completion_freed_pool_size_at_run_end`) are stable across
+repeats.
+
+### Hash observations
+
+The following hashes are recorded **descriptively** for the
+Slice 7 batch shape. Per the agreed hash policy they are
+gated only by within-partition uniqueness (1 unique hash per
+admitted partition) and `--repeat 2` determinism (iter 1
+matches iter 0); they are **not** strict-gated against a
+canonical anchor.
+
+```text
+src=completion_freed  budget=8   hash=0x0619d4d1900c2365   done_iter={15}  pos_max_at_clear={12}
+src=cancel_freed      budget=64  hash=0x3b15a0474dfe11be   done_iter={80}  pos_max_at_clear={68}
+```
+
+The completion-freed admitted budget-8 hash happens to equal
+the canonical budget-8 anchor `0x0619d4d1900c2365`. The
+cancel-freed admitted budget-64 hash happens to equal the
+Slice 6 observed value `0x3b15a0474dfe11be`. Both equalities
+are *observed, not required* — the Slice 7 batch shape (84
+actives, `--reuse-completed` ON, mixed-source admission at
+iter 17) is not a strict anchor for any of the prior slice
+hashes; the equalities are recorded as evidence rather than
+gated.
+
+### Scope
+
+Slice 7 proves the **mixed-source admission priority**
+invariant under a deterministic two-phase smoke. After
+Slice 7, the prototype demonstrates every pairwise
+combination of the three admission feed-in sources
+(preloaded waiters, cancel-freed slots, completion-freed
+slots, external arrivals) that the v1 admission loop is
+designed to handle.
+
+Slice 7 deliberately does **not** exercise:
+
+- More than one release barrier in a single run (single
+  `release_iter` only; multi-K release schedules left for
+  a later slice).
+- External arrivals admitted via `completion_freed` (the
+  smoke binds externals to cancel-freed slots; an external
+  arrival admitted via completion-freed is left for a
+  future surface).
+- Wall-clock arrival schedules or streaming.
+- More than one engine task per process (the single-engine-
+  task invariant still holds end-to-end).
+- Any per-request priority queue; admission within each
+  source is FIFO by request_id.
+- Performance comparisons; Slice 7 is correctness-only.

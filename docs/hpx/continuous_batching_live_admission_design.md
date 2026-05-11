@@ -15,45 +15,39 @@ performance claims and none are planned for this track.
 
 ## 0. Architecture we are building on
 
-Slices 1–5 plus Cancel Slices 1–4 are landed and PASS. The
-current shape (do not change in this design):
+Slices 1–5 plus Cancel Slices 1–4 are landed and PASS. Live
+admission must preserve every invariant they established. The
+load-bearing ones:
 
-- one `llama_model`, one `llama_context`, one shared `llama_batch`
-- one HPX engine task per repeat iteration, scheduled via
-  `hpx::async([&eng]{eng.run();})`
-- one `hpx::promise<request_result>` per seq; futures handed out
-  before the engine task starts
-- the engine fulfills each promise only after per-seq KV clear
-  and a cross-talk-against-still-active-siblings check
-- main calls `hpx::wait_all` on the per-request futures, then
-  `engine_fut.get()`, then validates correctness exclusively from
-  `request_result` snapshots
-- only the engine task touches `llama_context` / `llama_batch` /
-  `llama_decode` / `llama_memory_seq_*` / `llama_get_logits_ith`
-- residual-KV-empty check is performed inside the engine task
-- cooperative cancellation observed at iteration boundaries:
-  cancelled seqs are removed from later decode batches, KV is
-  cleared by the engine, futures are fulfilled with
-  `status = cancelled` only after KV clear, non-cancelled seqs
-  continue to completion, residual KV is empty for all seq_ids
-  at end of run
-
-Live admission must respect every one of those invariants.
+- one `llama_model`, one `llama_context`, one shared
+  `llama_batch`, one HPX engine task per repeat iteration; only
+  the engine task touches `llama_context` / `llama_batch` /
+  `llama_decode` / `llama_memory_seq_*` /
+  `llama_get_logits_ith`.
+- one `hpx::promise<request_result>` per seq; futures handed
+  out before the engine task starts; each promise is fulfilled
+  only after per-seq KV clear and a cross-talk check.
+- main does `hpx::wait_all` on the per-request futures, then
+  `engine_fut.get()`, then validates correctness exclusively
+  from `request_result` snapshots.
+- cooperative cancellation at iteration boundaries: cancelled
+  seqs are removed from later decode batches, KV is cleared by
+  the engine, futures fulfilled with `status = cancelled` only
+  after KV clear; residual KV empty for all seq_ids at end of
+  run.
 
 ---
 
 ## 1. Why live admission is next
 
-Cancellation proved that an active request can leave the active
-set:
+Cancellation proved the leave path:
 
 ```
 active seq → cancel observed → KV cleared → future fulfilled
 ```
 
-Live admission proves the symmetric other half of dynamic
-continuous batching — that a waiting request can enter the
-active set:
+Live admission proves the symmetric enter path — a waiting
+request enters the active set:
 
 ```
 waiting request → admitted into freed capacity →
@@ -61,23 +55,12 @@ prefilled at iteration boundary → joins later decode batches →
 future fulfilled
 ```
 
-Until live admission lands, the prototype runs a fixed set of
-requests admitted only at `t = 0`. Admission is the precondition
-for every subsequent serving capability:
-
-- arrival-driven workloads (mixed start times);
-- priority scheduling (priority is a no-op axis until requests
-  can saturate batch capacity over time);
-- an orchestration pool / resource partitioner becoming
-  meaningful (it earns its keep once HPX has ≥ 2 concurrent task
-  kinds, e.g. engine + admission watcher);
-- streaming partial-result emission as admitted requests stay in
-  the system longer than the original cohort.
-
-Admission also forces the prototype to make explicit something
-the cancellation design only modeled implicitly — that a `seq_id`
-is a *slot* that can be reused after KV clear, not a permanent
-identity bound to a single request.
+This also forces the prototype to make explicit what
+cancellation modeled implicitly: a `seq_id` is a *slot* that
+can be reused after KV clear, not a permanent identity bound
+to a single request. (Post-v1 capabilities — arrival
+schedules, priority, streaming, an orchestration pool —
+depend on this slot model and are out of scope here; see §10.)
 
 ---
 
@@ -117,6 +100,41 @@ Vocabulary defined for this design:
   In v1 the future is created at admission time, not at
   request-queueing time, and is handed out to main before the
   engine binds the request to a `seq_id`.
+- **free_due_to_cancel** — an ordered list (deterministic
+  ascending `seq_id`) of slots that became reusable
+  specifically because a cancellation KV clear succeeded. A
+  `seq_id` is appended to this list only after its
+  cancel-KV-clear step returns successfully. This is **not**
+  the global free-slot list: naturally completed
+  (e.g. budget-8) `seq_id`s are excluded from
+  `free_due_to_cancel` and are not eligible for reuse in the
+  first smoke. For the first smoke this set is exactly
+  `{1, 2, 4, 5, 7, 8}` and is consumed in ascending `seq_id`
+  order at the admission boundary.
+- **admission_source** — a `request_result` field that records
+  why the slot used by an admitted request became eligible.
+  Allowed values in v1:
+    - `none` — non-admitted / original active request (default
+      for every result that was not produced by live
+      admission).
+    - `cancel_freed` — admitted request that reused a slot
+      taken from `free_due_to_cancel`. This is the only
+      admission source used in the first smoke (Slice 3).
+    - `completion_freed` — admitted request that reused a
+      slot taken from `free_due_to_completion`. Added in
+      Live Admission Slice 5 behind the default-OFF
+      `--reuse-completed` CLI flag; see §9 Slice 5 for the
+      full data-model, demand-gate, source-priority, smoke
+      shape, mapping, and gate definitions.
+- **reused_seq_id** — for an admitted request, the `seq_id`
+  the engine bound it to after the KV-empty verification
+  (`pos_min == pos_max == -1`) succeeded. `-1` for
+  non-admitted results.
+- **previous_request_id** — for an admitted request, the
+  `request_id` that previously owned the reused `seq_id` (the
+  cancelled or completed prior owner whose KV clear made the
+  slot eligible). `-1` for non-admitted results and for slots
+  that have never been used before.
 
 Flow on the smoke shape:
 
@@ -206,11 +224,17 @@ every one of these.
 
 ---
 
-## 4. First smoke shape
+## 4. First smoke shape — cancel-freed-slot live admission smoke
 
 Deterministic, self-contained, no external arrival schedule
 needed. Reuses the existing cancellation plan to free the
 admission slots.
+
+This first smoke is explicitly named the **cancel-freed-slot
+live admission smoke**: admission intentionally reuses *only*
+slots freed by the cancellation plan, not every free seq_id.
+Naturally completed budget-8 free slots are ignored for this
+smoke.
 
 ```text
 n_seq_max:           99
@@ -243,13 +267,22 @@ waiting requests:
 admission rule:
                      at the top of each decode iter, after cancellation
                      observation has run, the engine binds up to K waiting
-                     requests to up to K freed seq_ids (K = min(waiting_queue
-                     size, free_seq_id count)). The pairing is deterministic:
-                     pop the FIFO head of the waiting queue, assign it to the
-                     lowest-numbered free seq_id, repeat until either side
-                     is empty. Each admitted request's prefill rows are
-                     added to the SAME llama_batch as decode rows for
-                     surviving active seqs in this iter (mixed batch).
+                     requests to up to K cancel-freed seq_ids (K =
+                     min(waiting_queue size, free_due_to_cancel size)).
+                     The eligible reuse set for this smoke is the
+                     deterministic cancel-freed set: {1, 2, 4, 5, 7, 8}.
+                     Naturally completed budget-8 free slots are NOT
+                     eligible and must be ignored.
+
+                     The engine maintains a free_due_to_cancel queue.
+                     A seq_id is appended to that queue only after its
+                     cancellation KV clear succeeds. At the admission
+                     boundary the engine pops from free_due_to_cancel in
+                     deterministic order (ascending seq_id) and binds the
+                     FIFO head of the waiting queue to it. Each admitted
+                     request's prefill rows are added to the SAME
+                     llama_batch as decode rows for surviving active
+                     seqs in this iter (mixed batch).
 ```
 
 Round-robin layout means seq_id % 3 maps to budget {8, 64, 256}:
@@ -273,6 +306,18 @@ slots were freed), the engine admits the 6 waiting requests:
 | request_id 96     | seq_id 5            |
 | request_id 97     | seq_id 7            |
 | request_id 98     | seq_id 8            |
+
+Rationale for the cancel-freed-only rule: with `n_active = 93`,
+budget-8 active seqs finish around `done_iter = 7`, so by iter
+17 their slots `{0, 3, 6, 9, ...}` are already free. A generic
+"lowest-numbered free seq_id among all free seqs" rule would
+silently bind waiting requests to those completed-budget-8
+slots instead of the cancel-freed slots, turning this smoke
+into a reuse-after-completion smoke instead of the intended
+reuse-after-cancellation smoke. This first smoke therefore
+restricts reuse to `free_due_to_cancel` only; reuse-after-
+natural-completion is out of scope here and belongs to a
+later smoke.
 
 Iter 17's `llama_batch` therefore contains:
 
@@ -337,12 +382,14 @@ Per-result invariants (these become validation gates):
   `pos_max_at_clear == n_prompt + decode_budget − 2`,
   `kv_cleared == true`, `cancel_observed_iter == -1`,
   `n_decoded_at_cancel == -1`, `admitted_at_iter == -1`,
-  `reused_seq_id == -1`.
+  `reused_seq_id == -1`, `admission_source == none`,
+  `previous_request_id == -1`.
 - **original cancelled**: `status == cancelled`,
   `n_decoded == 16`, `n_decoded_at_cancel == 16`,
   `cancel_observed_iter == 16`, `kv_cleared == true`,
   `pos_max_at_clear == n_prompt + 16 − 2 == 20`,
-  `admitted_at_iter == -1`, `reused_seq_id == -1`.
+  `admitted_at_iter == -1`, `reused_seq_id == -1`,
+  `admission_source == none`, `previous_request_id == -1`.
 - **admitted completed**: `status == completed`,
   `n_decoded == decode_budget` (= 64 in the smoke),
   `done_iter == admitted_at_iter + decode_budget − 1` (= 80 in
@@ -350,11 +397,19 @@ Per-result invariants (these become validation gates):
   (= 68 for budget-64 admitted), `kv_cleared == true`,
   `cancel_observed_iter == -1`, `n_decoded_at_cancel == -1`,
   `admitted_at_iter == 17` (in the smoke), `reused_seq_id ∈
-  {1, 2, 4, 5, 7, 8}` and is unique among admitted results.
+  {1, 2, 4, 5, 7, 8}` and is unique among admitted results,
+  `admission_source == cancel_freed`,
+  `request_id ∈ {93, 94, 95, 96, 97, 98}`,
+  `previous_request_id` equals the original cancelled
+  `request_id` that owned the reused slot (in this smoke each
+  cancelled `request_id` matches its own `seq_id`, so for
+  `reused_seq_id == s`, `previous_request_id == s`).
 
-`admitted_at_iter` and `reused_seq_id` are new
-`request_result` fields; their default values for non-admitted
-results are both `-1`.
+`admitted_at_iter`, `reused_seq_id`, `admission_source`, and
+`previous_request_id` are new `request_result` fields. Default
+values for non-admitted results: `admitted_at_iter == -1`,
+`reused_seq_id == -1`, `admission_source == none`,
+`previous_request_id == -1`.
 
 ---
 
@@ -373,6 +428,27 @@ The smoke shape above must satisfy all of:
   values form the set `{1, 2, 4, 5, 7, 8}`
 - the multiset of `reused_seq_id` over admitted results has no
   duplicates (no slot is bound twice in the same run)
+- cancel-freed-slot reuse only: admitted requests must reuse
+  only seq_ids `{1, 2, 4, 5, 7, 8}`; no naturally completed
+  budget-8 seq_id (i.e. any of `{0, 3, 6, 9, ..., 90}`) may be
+  reused in this smoke
+- `reused_seq_id` set equality: the set of `reused_seq_id`
+  values across the 6 admitted results must equal
+  `{1, 2, 4, 5, 7, 8}` exactly (every cancel-freed slot is
+  reused exactly once and no other slot is reused)
+- `admission_source == cancel_freed` for every admitted result
+  (the only valid v1 admission source for this smoke)
+- `admission_source == none` for every original completed and
+  every original cancelled result (no admission ever occurred
+  for the original active set)
+- `previous_request_id` mapping for admitted results matches
+  the cancel plan exactly:
+    request 93 → previous_request_id 1, reused_seq_id 1
+    request 94 → previous_request_id 2, reused_seq_id 2
+    request 95 → previous_request_id 4, reused_seq_id 4
+    request 96 → previous_request_id 5, reused_seq_id 5
+    request 97 → previous_request_id 7, reused_seq_id 7
+    request 98 → previous_request_id 8, reused_seq_id 8
 - every admitted result has
   `kv_cleared == true`,
   `n_decoded == decode_budget`,
@@ -539,10 +615,13 @@ Per repeat iteration:
   the admission boundary; that is the same convention used by
   the existing `ttc_ms_completed[budget=*]` field for original
   active requests, kept consistent for grep-friendly comparison.
-- `waiting_queue_depth_per_iter` — distribution of queue depth
-  observed at the top of each decode iteration (p50 / p95 / max).
-  For the smoke this is `6` for iters 0..16 and `0` for iters
-  17..255.
+- `waiting_queue_depth_after_admission_per_iter` — distribution
+  of queue depth (p50 / p95 / max) sampled **after** each decode
+  iteration's admission loop completes, so iters where admission
+  fired record the post-consumption depth. For the smoke this
+  yields `p50=0 p95=6 max=6 samples=255`: the 16 pre-admission
+  iters (1..16) record `6`, iter 17 records `0` because admission
+  consumed all 6 waiters that iter, and iters 18..255 record `0`.
 - `active_seqs_per_iter` (existing) will show a different curve
   with admission. The metric stays unchanged in name and shape;
   its value reflects active + admitted.
@@ -575,19 +654,43 @@ explicit approval. No commits without explicit approval.
     - `int32_t admitted_at_iter        = -1`
     - `int32_t previous_request_id     = -1`  (last owner of
       the slot; `-1` if the slot has never been used)
+    - `admission_source                = none`  (enum or
+      string field; allowed values per §2 are `none` and
+      `cancel_freed`; Slice 1 only ever sets `none`)
 - Add to `request_result`:
     - `int32_t request_id              = <copied from seq_state>`
     - `int32_t admitted_at_iter        = -1`
     - `int32_t reused_seq_id           = -1`
-- Engine writes `admitted_at_iter = -1` and `reused_seq_id = -1`
-  on every completion path (and continues to write
-  `cancel_observed_iter == -1` etc. on completion as today).
+    - `int32_t previous_request_id     = -1`
+    - `admission_source                = none`
+- `reused_seq_id` lives only on `request_result` (it is the
+  field consumers read), not on `seq_state`. The engine has
+  enough information from `seq_state.request_id` plus the
+  current `seq_id` index to populate `reused_seq_id` at the
+  fulfillment boundary in Slice 3.
+- Add an engine-level `free_due_to_cancel` placeholder data
+  structure (e.g. a `std::deque<int32_t>` member of the engine
+  object). In Slice 1 it must remain **empty and unused**. The
+  cancellation path is **not** modified in Slice 1: it does
+  not push into `free_due_to_cancel`, and nothing pops from
+  it. The placeholder exists only to prepare the data model
+  for Slice 3 wiring.
+- Engine writes `admitted_at_iter = -1`, `reused_seq_id = -1`,
+  `previous_request_id = -1`, and `admission_source = none` on
+  every completion path AND every cancellation path (the
+  cancel path stays unchanged in semantics; only the new
+  fields are populated with their defaults).
 - Main validates from `request_result` snapshots that every
   result has:
     - `admitted_at_iter == -1`
     - `reused_seq_id == -1`
+    - `previous_request_id == -1`
+    - `admission_source == none`
     - `request_id == seq_id` (no admission, no slot reuse, so
-      request_id and seq_id stay 1:1 in this slice)
+      `request_id` and `seq_id` stay 1:1 in this slice)
+- Engine-side validation also checks:
+    - `free_due_to_cancel` is empty at end of every iteration
+      and at end of run (Slice 1 must not append to it)
 - Cancel Slice 4 metrics block unchanged.
 - All Cancel Slice 4 / Slice-3 / Slice-4 / Slice-5 gates still
   pass on the 99-seq / `{8,64,256}` shape.
@@ -684,7 +787,7 @@ explicit approval. No commits without explicit approval.
   (`queued_count` already present; add `admitted_count`,
   `admission_iter_set`, `reused_seq_id_count`,
   `reused_seq_id_set`, `admitted_ttc_ms[budget=*]`,
-  `waiting_queue_depth_per_iter`).
+  `waiting_queue_depth_after_admission_per_iter`).
 - Update `tools/hpx-continuous-batch-gate/results.md` with a
   *Live admission results* section: smoke shape, expected
   outcome, observed vs expected anchors, trace counts, and the
@@ -698,11 +801,740 @@ explicit approval. No commits without explicit approval.
 - Final stdout line: `HPX_CB_ADMIT_STEP4: PASS` /
   `FAIL: <reason>`.
 
-After Live Admission Slice 4 the prototype demonstrates the
-other half of dynamic continuous batching. Anything beyond that
-(arrival schedules with non-zero start times, priority on the
-waiting queue, multi-cycle slot reuse, async-submitted waiting
-requests, streaming partial responses) is a separate design doc.
+### Live Admission Slice 5 — completion-freed-slot admission
+
+Slice 5 adds the **second** admission source on top of the
+Slice 3 cancel-freed-slot path: naturally completed slots can
+also be reused by waiting requests. The data model from Slice 1
+is extended (one new enum value), the engine grows a second
+deque with a deliberate **demand gate**, and the admission loop
+gains a **source priority** ordering. No new trace event names
+and no new event counts — only payload enrichment.
+
+CLI:
+
+- New default-OFF flag `--reuse-completed`. With the flag OFF
+  the engine never reads or writes `free_due_to_completion`,
+  no `completion_freed` admissions occur, and
+  `completion_freed_pool_size_at_run_end` is `0`. Slice 3 / 4
+  semantics (Slice 3 cancel-freed mapping byte-for-byte: same
+  `reused_seq_id_set = {1,2,4,5,7,8}`, same `admission_iter_set
+  = {17}`, same admitted-budget-64 hash `0x3b15a0474dfe11be`)
+  are preserved. The label advances to
+  `HPX_CB_ADMIT_STEP5` and the per-iter audit line is renamed
+  `admit_step5:` (with new fields appended); regression
+  evidence between Slice 4 and Slice 5 default-OFF runs is
+  therefore compared **semantically**, not byte-for-byte.
+- `--cancel-plan none` (existing sentinel from Cancel Slice 2)
+  is used to make the no-cancellation smoke explicit; the
+  smoke does not rely on an implicit empty plan.
+
+Data model extension (`admission_source` enum):
+
+```text
+admission_source ::= none | cancel_freed | completion_freed
+```
+
+`completion_freed` joins the existing values. It is carried
+through `seq_state`, `request_result`, and the trace payloads
+(see below). `previous_request_id == reused_seq_id` is the
+Slice-1 invariant on the original-active set (since prior
+owners have `request_id == seq_id`), and it continues to hold
+for both `cancel_freed` and `completion_freed` admissions.
+
+New engine deque and demand gate:
+
+- `std::deque<int32_t> free_due_to_completion_` lives on the
+  engine alongside `free_due_to_cancel_`.
+- Push site: inside `finalize_and_fulfill`, **after**
+  `clear_and_check` succeeds (so the slot is truly KV-empty at
+  queue-entry time), under two conjunctive conditions:
+  1. `--reuse-completed` is ON.
+  2. `waiting_queue_consumable_` is non-empty.
+  This is the **demand gate**: a naturally completed slot is
+  pooled only while there is at least one outstanding waiting
+  request that has not yet been admitted. Once the waiting
+  queue is drained, subsequent natural completions stop pooling
+  for the remainder of the run. This keeps the residual pool
+  size a tight invariant — the test focuses on the *first
+  freed wave*, not on a persistent free-slot inventory across
+  the whole run.
+- Pop site: a second loop inside the existing admission
+  boundary at the top of each decode iter, after the cancel
+  queue is drained. No snapshot is needed for the completion
+  queue (pushes happen at end of iter, pops happen at top of
+  the next iter — entries are settled).
+- Reset site: `run_body()` clears `free_due_to_completion_` at
+  the start of every repeat, so residuals never leak across
+  repeats. The residual size at engine end is snapshotted into
+  `engine_result.completion_freed_pool_size_at_run_end` for
+  reporting and gating.
+
+Admission source priority:
+
+```text
+1. free_due_to_cancel       (preserves Slice 3 mapping)
+2. free_due_to_completion   (Slice 5)
+```
+
+Both queues are drained in this order on every admission
+boundary. Slice 5 itself does **not** exercise a combined
+cancel + completion run; a mixed-source smoke is a future
+slice and is out of scope here. The priority ordering exists
+so the future mixed-source slice can land without changing
+the cancel-freed mapping; Slice 5 only proves it on the
+single-source paths.
+
+Trace event payloads (no new event names):
+
+The five existing admission trace events from Slice 4 gain an
+explicit `admission_source=<value>` key:
+
+- `seq_reused seq_id=<id> previous_owner=<request_id>
+  new_owner=<request_id> iter=<int>
+  admission_source=<cancel_freed|completion_freed>`
+- `request_admitted_live request=<id> reused_seq_id=<id>
+  iter=<int> admission_source=<value>`
+- `admitted_prefilled request=<id> seq_id=<id>
+  first_token=<id> admission_source=<value>`
+- `admitted_decode_row request=<id> seq_id=<id> iter=<int>
+  pos=<int> admission_source=<value>`
+- `admitted_complete request=<id> seq_id=<id> budget=<int>
+  done_iter=<int> hash=<hex> admission_source=<value>`
+
+Event *counts* are unchanged in shape; only payloads become
+richer. Slice 3 cancel-freed-slot trace captures now emit
+`admission_source=cancel_freed` on these five events, so the
+Slice 4 trace-on capture must be compared semantically.
+Trace-off captures stay byte-quiet (zero
+`[hpx-cb-gate] event=` lines).
+
+Slice 5 smoke shape (deterministic):
+
+```text
+n_seq_max       = 99
+n_active        = 90
+n_waiting       = 9
+waiting_budget  = 8
+active budgets  = round-robin {8, 64, 256}
+cancel_plan     = none (empty)
+```
+
+This shape is deliberately distinct from the Slice 3 / 4
+shape (which uses `n_active=93`, `n_waiting=6`,
+`waiting_budget=64`, non-empty `cancel_plan`), so both smokes
+coexist and there is no mapping collision.
+
+Admission mapping (FIFO over the first 9 budget-8 round-robin
+slots, in ascending `seq_id` order):
+
+```text
+request 90 -> seq  0
+request 91 -> seq  3
+request 92 -> seq  6
+request 93 -> seq  9
+request 94 -> seq 12
+request 95 -> seq 15
+request 96 -> seq 18
+request 97 -> seq 21
+request 98 -> seq 24
+```
+
+Every admitted request: `budget=8`, `admitted_at_iter=8`,
+`done_iter=15`, `pos_max_at_clear = n_prompt + budget - 2 =
+6 + 8 - 2 = 12`, `admission_src=completion_freed`. The 21
+remaining budget-8 slots (`{27, 30, …, 87}`) remain pooled in
+`free_due_to_completion` and KV-empty for the rest of the run.
+Later natural completions (budget-64 at iter 63, budget-256 at
+iter 255) do **not** push to the pool because the waiting
+queue is empty by then (demand gate).
+
+Hash-gating policy:
+
+- `admission_src=none, budget=8` partition runs entirely
+  before admission iter 8, so its canonical anchor
+  `0x0619d4d1900c2365` is **gated strictly** (same as in
+  Slice 4).
+- `admission_src=none, budget=64` and
+  `admission_src=none, budget=256` surviving partitions cross
+  iter 8's mixed prefill+decode batch shape. They are gated
+  only by within-run uniqueness and `--repeat 2` determinism.
+  If they happen to match canonical anchors `0x88a4dc75a31d4325`
+  and `0x8a1a3bd01360aada`, that is recorded as observed,
+  **not** promoted to a strict gate — to avoid baking in
+  accidental backend-specific hash stability.
+- `admission_src=completion_freed, budget=8` partition:
+  within-run uniqueness gated; the observed hash is recorded
+  descriptively in `results.md`, not canonical-gated.
+
+Correctness gates (in addition to all §6 gates):
+
+- `admission_iter_set == {8}`
+- `reused_seq_id_set == {0,3,6,9,12,15,18,21,24}`
+- `admission_src == completion_freed` for every admitted
+  result
+- `admitted_count == 9`
+- `admitted_prefill_events == 9`
+- `completion_freed_pool_size_at_run_end == 21`
+- `free_due_to_completion` size at end of iter 7 is `30`
+  (implicit via residual `21 = 30 − 9` gate)
+- `free_due_to_completion` size after admission at top of
+  iter 8 is `21` (implicit via residual gate)
+- `free_due_to_completion` remains `21` after the budget-64
+  and budget-256 completion waves (demand-gate guarantee;
+  residual `21` at run end)
+- `free_due_to_cancel` remains empty for the whole Slice 5
+  smoke (no cancel admissions)
+- with `--reuse-completed` OFF: zero `completion_freed`
+  admissions AND `completion_freed_pool_size_at_run_end == 0`
+- cross-source confusion fail-closed: cancel-freed
+  `reused_seq_id` must be in `cancel_plan`; completion-freed
+  `reused_seq_id` must **not** be
+- residual KV empty for all `n_seq_max` slots (existing
+  Slice 1 sweep covers the 21 pooled residual slots too)
+- `--repeat 2` determinism includes
+  `(admission_src, admitted_at_iter, reused_seq_id,
+  previous_request_id)`
+
+Out of scope for Slice 5: a single run that exercises
+cancel + completion admission together. That belongs to a
+later mixed-source slice. Slice 5 keeps the failure-mode
+space small by exercising exactly one source at a time.
+
+- Update `tools/hpx-continuous-batch-gate/results.md` with a
+  *Live Admission Slice 5 results — completion-freed slot
+  reuse* section: smoke shape, capture commands, final lines,
+  audit line, mapping, partition hashes, trace counts, and
+  repeat determinism.
+- Update `tools/hpx-continuous-batch-gate/README.md` with the
+  Live Admission Slice 5 status entry and the new
+  `--reuse-completed` CLI flag.
+- All §6 correctness gates pass.
+- Trace gating remains: with `LLAMA_HPX_CB_TRACE` unset, all
+  Slice 5 captures emit zero `event=` lines.
+- Final stdout line: `HPX_CB_ADMIT_STEP5: PASS` /
+  `FAIL: <reason>`.
+
+After Live Admission Slice 5 the prototype demonstrates both
+the cancel-freed and the completion-freed admission paths.
+Anything beyond that (mixed cancel + completion admission in
+one run, arrival schedules with non-zero start times, priority
+on the waiting queue, multi-cycle slot reuse, async-submitted
+waiting requests, streaming partial responses) is a separate
+design doc.
+
+### Live Admission Slice 6 — async external arrivals
+
+Adds **deterministic async external arrivals** on top of the
+existing Slice 3 cancel-freed admission flow. A single
+scripted HPX submitter task pushes external arrivals into an
+engine-owned inbox under a **release + ack barrier**; the
+engine drains the inbox at the top of the next decode iter
+and admits arrivals via the existing cancel-freed FIFO path.
+
+Path under test:
+
+```text
+external HPX submitter task
+  -> hpx::future<void> release_future           (set by engine at end of iter K)
+  -> engine::submit(arrival_msg)                (acquires hpx::spinlock, push)
+  -> hpx::promise<void> ack_promise.set_value() (submitter)
+  -> engine resumes after ack_future.get()
+  -> drain_external_inbox(iter)                 (engine task only, top of iter K+1)
+  -> waiting_queue_consumable_                  (arrival_source = external)
+  -> existing cancel_freed admission boundary   (cancel_after + 1)
+  -> external future fulfilled with completed status
+```
+
+For the smoke shape with `--external-release-iter 8` and
+`--cancel-after 16`:
+
+```text
+release_iter  = 8
+drain_iter    = 9
+admit_iter    = 17
+```
+
+**HPX-native constraints (hard rules):**
+
+- No `std::thread`. No `std::condition_variable`. No
+  `std::this_thread::sleep_for`. No wall-clock timing. No new
+  `std::mutex`. The only new lock is an **`hpx::spinlock`**
+  (`inbox_mtx_`) guarding the engine inbox. (Note: the public
+  alias exported by the installed HPX is `hpx::spinlock`, not
+  `hpx::lcos::local::spinlock` — the implementation uses
+  `hpx::spinlock`.)
+- Coordination is `hpx::promise<void>` / `hpx::future<void>`
+  only. The engine sets a release promise at end of iter K and
+  suspends on the matching ack future; the submitter awaits the
+  release future, pushes its K-block via `engine::submit()`,
+  and sets the ack promise. There is no "same-iteration
+  release/drain" assumption — drain happens at the top of
+  iter K+1 with no other synchronization.
+- The submitter helper body **must not call any `llama_*` API**.
+  Its allowed surface is: wait on `release_future`, construct
+  `arrival_msg`, move per-arrival promises into it, call
+  `engine::submit()`, and set `ack_promise`. A grep gate at
+  review time scopes this to the submitter helper body, not
+  the whole TU.
+- `engine::submit()` **must not mutate `engine_result`** —
+  Correction 1 of the Slice 6 plan. It only acquires the
+  inbox spinlock and pushes the message; counters are bumped
+  by the engine when it drains. There is no
+  `external_arrival_count` field on `engine_result`.
+- Only the engine task touches llama.cpp state
+  (`llama_context`, `llama_batch`, `llama_decode`,
+  `llama_memory_seq_*`, `llama_get_logits_ith`).
+  `engine::submit()` and the scripted submitter never call
+  any `llama_*` API.
+
+**New types (engine-internal data model):**
+
+```text
+arrival_source         ::= preloaded | external
+arrival_msg            { request_id, decode_budget,
+                         hpx::promise<request_result> promise,
+                         arrival_source src }
+external_release_handle{ hpx::future<void> release_future,
+                         hpx::promise<void> ack_promise }
+scripted_arrival       { request_id, decode_budget,
+                         release_iter }
+```
+
+`arrival_src` is added to `seq_state`, `request_result`,
+and `waiting_request` and is copied through
+`fulfill_promise()` onto every snapshot. Default for every
+initially-bound active seq is `preloaded`. Admission
+overwrites `seq.arrival_src` from the bound
+`waiting_request::src`.
+
+**Engine API additions:**
+
+```text
+engine::submit(arrival_msg msg)
+engine::register_external_release_iter(int32_t K) -> external_release_handle
+```
+
+Both are called from the submitter task only, and both are
+called BEFORE / ALONGSIDE `engine::run()` (registration must
+happen before the engine task is scheduled so the engine
+sees a ready ack future to wait on at end of iter K).
+
+**Engine-internal additions:**
+
+```text
+hpx::spinlock                                inbox_mtx_;
+std::deque<arrival_msg>                      inbox_;
+std::unordered_map<int32_t, hpx::promise<request_result>> external_promises_;
+std::vector<hpx::promise<void>>              iter_release_promises_;
+std::vector<hpx::future<void>>               submitter_ack_futures_;
+std::set<int32_t>                            iter_release_set_;
+int32_t                                      max_decode_iters_;
+```
+
+`drain_external_inbox(iter)` is engine-only; it swaps
+`inbox_` out under the spinlock (O(1) critical section),
+then iterates the local deque without the lock: stashes
+each `arrival_msg::promise` in `external_promises_` keyed by
+`request_id`, pushes a `waiting_request{src=external}` onto
+`waiting_queue_consumable_`, bumps
+`result_.arrival_drained_count`, and latches
+`first_external_drain_iter` on first drain.
+
+`admit_one` (already in Slice 3) is extended so that on
+binding an external waiter it moves the matching promise out
+of `external_promises_` into `promises_[reuse_seq]` (the
+submitter already holds the future, so no admitted-futures
+push happens for external arrivals).
+
+**Engine-result counters (engine-side only):**
+
+```text
+arrival_drained_count
+external_admitted_count
+first_external_drain_iter      (-1 when no external arrivals)
+iter_release_fired_set         (engine-side observation order)
+submitter_ack_set              (engine-side observation order)
+```
+
+`external_arrival_count` is intentionally absent (Correction
+1; submission-side counters are not engine state).
+
+**Trace events (gated on `LLAMA_HPX_CB_TRACE=1`):**
+
+```text
+request_submitted_external request=<id> budget=<int> arrival_source=external
+arrival_drained            request=<id> iter=<int> budget=<int>
+iter_release_fired         iter=<int>
+submitter_ack_observed     iter=<int>
+```
+
+Existing events extended with `arrival_source=<preloaded|external>`:
+
+```text
+request_queued
+request_admitted_live
+```
+
+Trace-on smoke event counts per repeat:
+
+```text
+request_submitted_external = 6
+arrival_drained            = 6
+iter_release_fired         = 1
+submitter_ack_observed     = 1
+request_admitted_live with arrival_source=external = 6
+```
+
+**Smoke shape:**
+
+```text
+n_seq_max               = 99
+n_active                = 93
+n_waiting               = 0
+n_external_arrivals     = 6
+external_arrival_budget = 64
+external_release_iter   = 8
+cancel_plan             = 1,4,7,2,5,8
+cancel_after            = 16
+--reuse-completed       = OFF
+```
+
+External request IDs: `93, 94, 95, 96, 97, 98`
+(`n_active + n_waiting + i` for `i = 0..5`).
+
+**Expected mapping** (FIFO over sorted cancel-plan):
+
+```text
+request 93 -> seq 1
+request 94 -> seq 2
+request 95 -> seq 4
+request 96 -> seq 5
+request 97 -> seq 7
+request 98 -> seq 8
+```
+
+Every external admitted result: `arrival_src = external`,
+`admission_src = cancel_freed`, `admitted_at_iter = 17`,
+`decode_budget = 64`, `done_iter = 17 + 64 - 1 = 80`,
+`pos_max_at_clear = n_prompt_tokens + 64 - 2`, admitted
+budget-64 hash `= 0x3b15a0474dfe11be` (same anchor as the
+Slice 3 cancel-freed budget-64 admission, proving the
+async-external surface routes byte-identically through the
+existing admission and decode paths).
+
+**Required Slice 6 source-side gates** (in addition to all
+Slice 1–5 gates):
+
+- `er.arrival_drained_count == args.n_external_arrivals`
+- `er.external_admitted_count == args.n_external_arrivals`
+- `er.first_external_drain_iter == args.external_release_iter + 1`
+- `er.iter_release_fired_set == {args.external_release_iter}`
+- `er.submitter_ack_set == {args.external_release_iter}`
+- request→seq mapping per sorted cancel-plan FIFO
+- `arrival_src == external` on every admitted result with
+  `request_id ∈ [n_active, n_active + n_external_arrivals)`;
+  `admission_src == cancel_freed` on each; `admitted_at_iter
+  == cancel_after + 1` on each.
+- `arrival_src == preloaded` on every NON-external result
+  (original actives, preloaded waiters).
+- admitted budget-64 hash anchor for the slice 6 smoke
+  (`0x3b15a0474dfe11be`).
+- every external future is fulfilled with
+  `status = completed`; `promises_fulfilled == n_active +
+  admitted_count` (preloaded admissions + external
+  admissions).
+- inbox is empty at engine end, `external_promises_` is empty
+  at engine end. Both are asserted BEFORE the residual-KV
+  sweep; either being non-empty fails closed with an explicit
+  reason.
+- residual KV empty for all `n_seq_max` slots (existing
+  Slice 1 sweep).
+- with `--n-external-arrivals == 0` (the inert path) every
+  Slice 6 counter and set is at its default; no submitter
+  task is spawned and no release/ack handle is registered.
+
+**Required Slice 6 HPX-native review gates:**
+
+- the scripted submitter helper body does not call any
+  `llama_*` API
+- no `std::thread`
+- no `std::condition_variable`
+- no `std::this_thread::sleep_for`
+- no new `std::mutex`
+- the only new lock is `hpx::spinlock inbox_mtx_`
+
+**Quietness / determinism:**
+
+- trace-off runs emit zero `[hpx-cb-gate] event=` lines on
+  stderr
+- `--repeat 2` is deterministic, including the Slice 6
+  counters and the per-external-result snapshot tuple
+
+**CLI flags:**
+
+```text
+--n-external-arrivals <int>      default: 0
+--external-arrival-budget <int>  default: 64
+--external-release-iter <int>    default: 0
+```
+
+With `--n-external-arrivals == 0` the binary's run is
+byte-equivalent to Slice 5 with `--reuse-completed` OFF:
+no submitter task, no release handle, no inbox traffic, no
+admission via the external path.
+
+Closeout evidence is in
+`tools/hpx-continuous-batch-gate/results.md` under the
+*Live Admission Slice 6 results — async external arrivals*
+section.
+
+Final stdout line: `HPX_CB_ADMIT_STEP6: PASS` /
+`FAIL: <reason>`.
+
+After Live Admission Slice 6 the prototype additionally
+demonstrates a deterministic, HPX-native async-arrival
+surface. Out-of-scope items unchanged: multi-K release
+schedules, wall-clock arrivals, completion-freed external
+admission, streaming.
+
+### Live Admission Slice 7 — mixed-source admission priority
+
+Goal: prove the engine's **source-priority** rule end-to-end.
+When `free_due_to_cancel_` and `free_due_to_completion_` are
+both non-empty when an admission step runs, admission must
+drain `cancel_freed` first, then `completion_freed`. Earlier
+slices proved each admission source in isolation (Slice 3
+cancel-only; Slice 5 completion-only; Slice 6 cancel-only
+with external arrivals) but never put both pools on the same
+admission boundary in one deterministic run.
+
+**Smoke shape (forces the mixed boundary):**
+
+```text
+n_seq_max               = 99
+n_active                = 84
+n_waiting               = 9        (preloaded; req_ids 84..92, budget 8)
+waiting_budget          = 8
+n_external_arrivals     = 6        (async;     req_ids 93..98, budget 64)
+external_arrival_budget = 64
+external_release_iter   = 16
+--reuse-completed       = ON
+cancel_plan             = 1,4,7,2,5,8
+cancel_after            = 16
+active budgets          = round-robin {8, 64, 256}
+```
+
+`n_active + n_waiting + n_external_arrivals = 99 = n_seqs`.
+cancel_plan ⊂ budget-64 ∪ budget-256, all in `[0, 84)`.
+
+**Two-phase admission timeline:**
+
+```text
+iter 0       prefill of all 84 actives
+iter 1..7    budget-8 actives decode toward done_iter=7
+iter 7       28 budget-8 actives complete naturally; demand gate
+             pushes ALL 28 onto free_due_to_completion_ (waiting
+             queue still has 9 entries — gate stays open)
+iter 8       admission boundary #1 (Phase 1)
+             cancel_eligible_snapshot = 0  (cancel hasn't fired)
+             completion-freed pass: 9 admissions, FIFO ascending
+                 req 84 -> seq  0
+                 req 85 -> seq  3
+                 req 86 -> seq  6
+                 req 87 -> seq  9
+                 req 88 -> seq 12
+                 req 89 -> seq 15
+                 req 90 -> seq 18
+                 req 91 -> seq 21
+                 req 92 -> seq 24
+             free_due_to_completion_ residual = 19  (28 − 9)
+             waiting_queue_consumable_ empty
+iter 9..15   admitted budget-8 admissions decode
+iter 15      admitted budget-8 admissions complete; demand gate
+             stops (waiting queue empty) — pool stays at 19
+iter 16      cancel observation fires for {1,2,4,5,7,8}
+             (seq_id ascending) — pushes onto free_due_to_cancel_
+             admission_eligible_snapshot taken BEFORE cancel pass = 0
+             (so no iter-16 admissions of cancel-freed)
+             end of iter 16: release+ack barrier — engine sets
+             release[16]; submitter pushes 6 external arrivals; ack;
+             engine resumes
+iter 17      admission boundary #2 (Phase 2) — MIXED-SOURCE
+             drain_external_inbox(17) pushes 6 onto waiting_queue
+             Both pools non-empty:
+                 free_due_to_cancel_     = [1,2,4,5,7,8]   (6)
+                 free_due_to_completion_ = [27,30,…,81]    (19)
+                 waiting_queue           = [93,94,95,96,97,98]
+             Source-priority rule:
+                 cancel pass     -> admits 6
+                     req 93 -> seq 1
+                     req 94 -> seq 2
+                     req 95 -> seq 4
+                     req 96 -> seq 5
+                     req 97 -> seq 7
+                     req 98 -> seq 8
+                 completion pass -> no-op  (waiting queue empty)
+             free_due_to_completion_ residual STAYS AT 19
+iter 18..80  admitted budget-64 (externals) decode
+iter 18..255 surviving budget-64 and budget-256 actives complete;
+             demand gate stops their pool pushes (waiting queue empty)
+```
+
+**Mappings (per phase, per source):**
+
+```text
+Phase 1  iter  8  completion_freed  preloaded
+    req 84 -> seq  0
+    req 85 -> seq  3
+    req 86 -> seq  6
+    req 87 -> seq  9
+    req 88 -> seq 12
+    req 89 -> seq 15
+    req 90 -> seq 18
+    req 91 -> seq 21
+    req 92 -> seq 24
+
+Phase 2  iter 17  cancel_freed  external
+    req 93 -> seq 1
+    req 94 -> seq 2
+    req 95 -> seq 4
+    req 96 -> seq 5
+    req 97 -> seq 7
+    req 98 -> seq 8
+```
+
+**Per-iter source-priority gates (slice7_strict):**
+
+```text
+G7-S1   admission_iter_set == {min_active_budget, cancel_after+1}
+        == {8, 17}
+
+G7-S2   for every admitted result with admitted_at_iter == 8:
+            admission_src == completion_freed
+            arrival_src   == preloaded
+
+G7-S3   for every admitted result with admitted_at_iter == 17:
+            admission_src == cancel_freed
+            arrival_src   == external
+
+G7-S4   Phase 1 mapping (FIFO over the first n_waiting min-budget
+        actives in seq_id ascending order):
+            request n_active + i -> min_budget_slots[i]
+
+G7-S5   Phase 2 mapping (FIFO over sorted cancel_plan):
+            request n_active + n_waiting + i -> sorted(cancel_plan)[i]
+
+G7-S6   No result with admitted_at_iter == 17 has
+        reused_seq_id in the completion-freed residual set
+            min_budget_slots[n_waiting:]
+        — proves cancel-freed priority was respected.
+
+G7-S7   completion_freed_pool_size_at_run_end
+            == first_wave_size − n_waiting
+            == 28 − 9 == 19
+```
+
+**Per-`(admitted_at_iter, admission_src)` reused_seq_id
+ordering gate** (replaces the pre-Slice-7 global "strictly
+ascending" gate):
+
+```text
+G7-O1   reused_seq_id_set.size() == admitted_count
+        (carried over from Slice 3)
+
+G7-O2   No duplicate seq_id appears across the entire
+        reused_seq_id_set (was implied by global ascending
+        in Slice 3..6).
+
+G7-O3   For each pair (K, src) with K in admission_iter_set
+        and src in {cancel_freed, completion_freed}, the
+        sub-sequence of reused_seq_ids drawn from results
+        with admitted_at_iter == K AND admission_src == src,
+        ordered by request_id ascending (waiting-queue FIFO),
+        is strictly ascending.
+```
+
+G7-O3 holds for every prior slice (Slice 3 single iter,
+single source — global ascending implies per-(K, src)
+ascending; Slice 5 same; Slice 6 single iter, single source)
+and now also for the Slice 7 mixed shape, where the engine
+emits two strictly-ascending sub-sequences `{0,3,…,24}` at
+iter 8 and `{1,2,4,5,7,8}` at iter 17.
+
+**Residual completion-freed pool proof:**
+
+The residual gate G7-S7 only holds when **no iter-17 admission
+consumed from the completion pool**, because the engine's pool
+push events are demand-gated and only fire while
+`waiting_queue_consumable_` is non-empty. Concretely:
+
+- 28 budget-8 actives complete at iter 7; all 28 push to the
+  pool (waiting queue size 9 throughout iter 7's finalize phase).
+- 9 are consumed at iter 8.
+- The 9 admitted-budget-8 reqs complete at iter 15; waiting
+  queue is empty by then — demand gate stops pushes.
+- 6 cancel-freed slots are admitted at iter 17 to the 6
+  external arrivals; the completion pool is not touched.
+- Surviving budget-64 actives complete at iter 63 and
+  surviving budget-256 actives at iter 255; waiting queue is
+  still empty — demand gate stops pushes.
+
+So `completion_freed_pool_size_at_run_end == 28 − 9 == 19`
+exactly, and the 19 residual slots stay KV-empty under the
+existing `n_seq_max`-wide residual sweep.
+
+**No new CLI flags / trace event names / HPX primitives.**
+
+- All Slice 7 behavior is exercised through the existing
+  `--n-waiting / --waiting-budget / --n-external-arrivals /
+  --external-arrival-budget / --external-release-iter /
+  --reuse-completed / --cancel-plan / --cancel-after` surface.
+- The Slice 4–6 trace surface already partitions by
+  `admission_source=` and `arrival_source=` on
+  `request_admitted_live`, `admitted_complete`,
+  `admitted_decode_row`, `admitted_prefilled`, `seq_reused`,
+  and `request_queued`. Slice 7 does not add or rename any
+  trace event.
+- The Slice 6 `hpx::spinlock` inbox and release+ack barrier
+  are reused unchanged. No new `std::thread`, no
+  `std::condition_variable`, no wall-clock sleeps, no new
+  `std::mutex`. The HPX-native and llama-cpp-ownership
+  invariants from Slice 6 carry over verbatim.
+
+**No performance claim.** Slice 7 is correctness-only — it
+proves an ordering invariant of the admission loop, not a
+throughput property. Observed admitted hashes are recorded
+descriptively and gated only on within-partition uniqueness
+and `--repeat 2` determinism (the same policy used in Slice 5
+for the completion-freed admitted budget-8 partition).
+
+**New audit line** (`admit_step7:`) on stdout, in addition to
+the existing `admit_step5:` and `admit_step6:` lines:
+
+```text
+iter[r] admit_step7: phase1@iter=8 completion_freed=9
+                    phase2@iter=17 cancel_freed=6
+                    pool_residual=19
+                    admission_iter_set={8,17}
+                    first_external_drain_iter=17
+```
+
+Closeout evidence is in
+`tools/hpx-continuous-batch-gate/results.md` under the
+*Live Admission Slice 7 results — mixed-source admission
+priority* section.
+
+Final stdout line: `HPX_CB_ADMIT_STEP7: PASS` /
+`FAIL: <reason>`.
+
+After Live Admission Slice 7 the prototype additionally
+demonstrates the source-priority rule under a deterministic
+two-phase smoke that puts both pools on the same admission
+boundary. Out-of-scope items unchanged: multi-K release
+schedules, wall-clock arrivals, completion-freed external
+admission, streaming, per-request priority queues, multi-
+cycle slot reuse, multiple engine tasks.
 
 ---
 
@@ -738,11 +1570,10 @@ implement it:
 - interruption inside `llama_decode` (forbidden; admission is
   cooperative at iteration boundaries, exactly like
   cancellation)
-
-Async external admission is *not* modeled in v1's data path.
-Adding it later requires a thread-safe waiting queue (e.g.
-`hpx::lcos::local::channel`) but does not change the engine
-loop or the snapshot boundary.
+- async external admission (v1 uses a construction-time queue
+  only; a thread-safe queue, e.g. `hpx::lcos::local::channel`,
+  can be added later without changing the engine loop or
+  snapshot boundary)
 
 ---
 
@@ -758,23 +1589,15 @@ loop or the snapshot boundary.
    single decode row for that seq), and the post-`llama_decode`
    argmax loop must visit each row exactly once.
 
-2. **`promises_` indexing.** The current Slice-3 implementation
-   indexes `promises_` by `seq_id`. After admission, two
-   distinct requests share a `seq_id` over time. Risk: the
-   admission slice accidentally fulfills the prior owner's
-   future twice, or fulfills the new owner's future against a
-   stale promise. Mitigation: Slice 3 must replace
-   `promises_[seq_id]` with a fresh `hpx::promise<request_result>`
-   at admission time (the prior owner's promise was already
-   fulfilled and its future already moved to main's wait list).
-   The data model in Slice 1 needs to anticipate this — the
-   `promises_` storage may need to migrate from
-   `std::vector<hpx::promise<request_result>>` keyed by
-   `seq_id` to a `std::unordered_map<int32_t, hpx::promise<...>>`
-   keyed by `request_id`, or a per-slot vector with
-   construction-on-binding semantics. Pick the one that
-   minimizes lifetime risk in Slice 3; defer the choice in
-   Slice 1.
+2. **`promises_` indexing.** `promises_` is currently keyed by
+   `seq_id`; after admission two requests share a `seq_id` over
+   time. Risk: double-fulfill of the prior owner or fulfill
+   against a stale promise. Mitigation: Slice 3 replaces the
+   slot's promise with a fresh `hpx::promise<request_result>`
+   at admission time (prior owner already fulfilled and its
+   future already moved to main's wait list). Storage shape
+   (vector re-keyed at admission vs. map keyed by `request_id`)
+   is deferred to Slice 3.
 
 3. **Future delivery to main without leaks.** Admitted-request
    futures are created inside the engine task. Main needs to
@@ -789,65 +1612,42 @@ loop or the snapshot boundary.
    `hpx::wait_all` over them returns immediately. No race
    window. Document this ordering invariant in Slice 3.
 
-4. **Slot-reuse KV-empty assertion failure mode.** If for any
-   reason the prior owner's KV clear didn't fully take effect
-   (a llama.cpp bug, an engine logic error, or a future
-   refactor that splits cancel-clear from cleanup), reusing the
-   slot would silently mix two requests' KV state. Mitigation:
-   the assertion in §3 is fail-closed; admission aborts and the
-   engine drains the unfulfilled promises with `set_exception`,
-   surfacing a clean `FAIL: <reason>` to main. A future Slice
-   should consider running an explicit `llama_memory_seq_rm`
-   immediately before binding (idempotent on an already-empty
-   slot, defensive against a missed cleanup) but v1 keeps the
-   assertion-only form to keep the failure mode loud.
+4. **Slot-reuse KV-empty assertion failure.** If the prior
+   owner's KV clear didn't take effect, reusing the slot would
+   silently mix two requests' KV. Mitigation: the §3 assertion
+   is fail-closed — admission aborts, the engine
+   `set_exception`s unfulfilled promises, main observes
+   `FAIL: <reason>`. v1 keeps assertion-only to make the
+   failure loud.
 
-5. **`request_admitted` event semantics.** The existing event
-   fires for original active requests at engine start. Live
-   admission introduces a second class of admissions. Risk: a
-   trace reader expecting one event class. Mitigation: keep the
-   existing event firing only for original active requests, and
-   add `request_admitted_live` for admission-driven entries.
-   Document the split in the admission slice's README and
-   results.md.
+5. **`request_admitted` event semantics.** Existing event
+   keeps its original-active-only meaning; live admissions emit
+   a distinct `request_admitted_live` event (see §7).
 
-6. **`update_iterations` and `decode_calls` cross-shape
-   stability.** With surviving budget-256 active seqs running
-   to iter 255, `update_iterations` stays at 255 even with
-   admission. Risk: a future plan with no surviving budget-256
-   seq would reduce the iteration count and break the anchor.
-   Mitigation: do not use `update_iterations == 255` as a
-   correctness gate; treat it as a descriptive metric.
-   Correctness depends only on per-result invariants and the
-   residual-KV-empty check.
+6. **`update_iterations` and `decode_calls` are descriptive,
+   not gates.** They depend on whether a budget-256 seq
+   survives; correctness rides on per-result invariants and
+   residual-KV-empty only.
 
-7. **Hash anchors after admission.** Surviving-active
-   budget-64 / budget-256 hashes will differ from the
-   cancellation-only run because iter 17 is a mixed batch. This
-   is expected and parallels the Cancel-Slice-2 caveat.
-   Mitigation: the design (§4 caveat, §6 gate wording) commits
-   only to the same-shape uniqueness gate (one unique hash per
-   class within the run) for those budgets, and to the
-   canonical anchor only for budget-8.
+7. **Hash anchors after admission.** Iter 17 is a mixed batch,
+   so surviving-active budget-64/256 hashes differ from the
+   cancellation-only run. §4 / §6 commit only to within-run
+   uniqueness for those budgets; the canonical anchor remains
+   for budget-8 only.
 
-8. **Determinism across `--repeat 2`.** Determinism of the
-   admission outcome (which `request_id` lands on which
-   `seq_id`, at which iter, with which budget) depends on the
-   FIFO+lowest-seq-id rule being deterministic. As long as the
-   waiting queue is built once at construction time and not
-   re-ordered, and the engine consumes it in declared order at
-   each admission boundary, both repeats produce identical
-   admission schedules. Slice 3 must validate this with a
-   per-result determinism check on `(request_id, seq_id,
-   admitted_at_iter, reused_seq_id, hash, generated_tokens,
-   done_iter, pos_max_at_clear)`.
+8. **Determinism across `--repeat 2`.** Admission determinism
+   relies on (a) the waiting queue being built once at
+   construction and consumed FIFO, and (b) `free_due_to_cancel`
+   being appended in deterministic ascending-`seq_id` order
+   (cancellation already fires deterministically at iter 16).
+   Slice 3 validates with a per-result determinism check on
+   `(request_id, seq_id, admitted_at_iter, reused_seq_id,
+   previous_request_id, admission_source, hash,
+   generated_tokens, done_iter, pos_max_at_clear)`.
 
-9. **CLI surface stability.** New flags `--n-active`,
-   `--n-waiting`, `--waiting-budget` add a small surface. Risk:
-   later interaction with priority/streaming flags. Mitigation:
-   namespace future flags under `--admit-*` and `--wait-*`
-   prefixes if they grow; for v1 the three flags above are
-   sufficient.
+9. **CLI surface.** `--n-active`, `--n-waiting`,
+   `--waiting-budget` are sufficient for v1; later flags should
+   namespace under `--admit-*` / `--wait-*` if they grow.
 
 ---
 
@@ -866,8 +1666,8 @@ gate without changing any runtime behavior.
 
 Read first:
 docs/hpx/continuous_batching_live_admission_design.md
-docs/hpx/hpx_continuous_batching_cancellation_design.md
-docs/hpx/hpx_continuous_batching_prototype_design.md
+docs/hpx/continuous_batching_cancellation_design.md
+docs/hpx/continuous_batching_prototype_design.md
 tools/hpx-continuous-batch-gate/README.md
 tools/hpx-continuous-batch-gate/results.md
 local/ahandoff.md
@@ -886,34 +1686,26 @@ Do not add (Live Admission Slice 1):
 - metrics changes
 - HTTP / external admission
 - orchestration pool / resource partitioner
+- any push into free_due_to_cancel from the cancel path
+  (the placeholder must stay empty in Slice 1)
 
-Live Admission Slice 1 scope:
-- Add to engine-internal seq_state:
-  - int32_t request_id          = -1   (== seq_id while no
-                                         admission has happened;
-                                         distinguishable later)
-  - int32_t admitted_at_iter    = -1
-  - int32_t previous_request_id = -1
-- Add to request_result:
-  - int32_t request_id          = <copied from seq_state>
-  - int32_t admitted_at_iter    = -1
-  - int32_t reused_seq_id       = -1
-- Engine initializes seq_state.request_id = seq_id at
-  construction (no admission yet, so request_id and seq_id are
-  1:1).
-- Engine writes admitted_at_iter = -1 and reused_seq_id = -1 on
-  every completion path AND every cancellation path (the cancel
-  path stays unchanged in semantics; only the new fields are
-  populated with their default).
-- Engine never admits in this slice — the new fields are
-  present but unused except for the request_id-equals-seq_id
-  default.
-- Main validates from request_result snapshots that every
-  result has:
-  - admitted_at_iter == -1
-  - reused_seq_id == -1
-  - request_id == seq_id
-  This proves the data model is plumbed without behavior change.
+Live Admission Slice 1 scope (full spec: §9 of this design):
+- Add to seq_state: request_id (init = seq_id at construction),
+  admitted_at_iter (-1), previous_request_id (-1),
+  admission_source (none).
+- Add to request_result: request_id (copied from seq_state),
+  admitted_at_iter (-1), reused_seq_id (-1),
+  previous_request_id (-1), admission_source (none).
+- Add an engine-level free_due_to_cancel placeholder (e.g.
+  std::deque<int32_t>). In Slice 1 it MUST remain empty and
+  unused — the cancel path does not push, nothing pops.
+- Engine writes the four new request_result fields with their
+  defaults on every completion AND every cancellation path.
+- Main validates every result has admitted_at_iter == -1,
+  reused_seq_id == -1, previous_request_id == -1,
+  admission_source == none, and request_id == seq_id.
+- Engine validates free_due_to_cancel is empty at end of every
+  iteration and at end of run.
 
 Correctness gates:
 All Cancel Slice 4 gates still pass on the 99-seq /
@@ -940,7 +1732,12 @@ All Cancel Slice 4 gates still pass on the 99-seq /
 Live-Admission-Slice-1-specific gates:
 - every result.admitted_at_iter == -1
 - every result.reused_seq_id == -1
+- every result.previous_request_id == -1
+- every result.admission_source == none
 - every result.request_id == result.seq_id
+- engine free_due_to_cancel placeholder stays empty for the
+  entire run (no push from the cancel path, no pop from
+  anywhere)
 - no new trace events fire (compact and trace runs both
   unchanged from Cancel Slice 4)
 - metrics block unchanged
@@ -984,7 +1781,10 @@ Stop and report:
 - final stdout lines
 - whether all Cancel Slice 4 gates still pass
 - whether every result has admitted_at_iter == -1,
-  reused_seq_id == -1, and request_id == seq_id
+  reused_seq_id == -1, previous_request_id == -1,
+  admission_source == none, and request_id == seq_id
+- whether the engine's free_due_to_cancel placeholder stayed
+  empty / unused for the entire run
 - whether repeat 2 passed
 - any HPX runtime warnings
 - any llama_decode return-code issues
