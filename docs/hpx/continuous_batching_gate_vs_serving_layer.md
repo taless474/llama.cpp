@@ -1,9 +1,11 @@
 # HPX continuous-batching gate vs. an HPX serving layer
 
-After Live Admission Slices 1–7 the final stdout label is
-`HPX_CB_ADMIT_STEP7: PASS`. The
+After Live Admission Slices 1–7 and Streaming Slices 1–7
+the final stdout label is `HPX_CB_STREAM_STEP7: PASS`. The
 `tools/hpx-continuous-batch-gate/` binary now exercises a
-complete end-to-end admission surface against a real
+complete end-to-end admission surface plus an end-to-end
+in-process streaming surface (including completion-freed
+multi-cycle slot reuse with streaming) against a real
 `llama_context` on a Metal-enabled build. This note is the
 explicit boundary between **what that surface proves** and
 **what a real HPX serving layer would still have to add on
@@ -40,6 +42,13 @@ demonstrate that the HPX prototype:
 | 5 | **completion-freed-slot admission** under a demand gate (`--reuse-completed`; second engine deque `free_due_to_completion_`; per-source priority rule defined: cancel-freed first, completion-freed second) | `HPX_CB_ADMIT_STEP5: PASS` |
 | 6 | **async external arrivals** (single scripted HPX submitter task, `engine::submit(arrival_msg)` under an `hpx::spinlock`-guarded inbox, deterministic **release + ack barrier** for visibility, `arrival_source=external` propagated end-to-end) | `HPX_CB_ADMIT_STEP6: PASS` |
 | 7 | **mixed-source admission priority** end-to-end (`free_due_to_cancel_` and `free_due_to_completion_` both non-empty at the same admission boundary; cancel-freed drains first; completion-freed residual is unchanged) | `HPX_CB_ADMIT_STEP7: PASS` |
+| Streaming Slice 1 | **first HPX-native per-request token streaming** at the gate boundary for original active completed requests (one `hpx::lcos::local::channel<token_stream_event>` per bound active seq; engine sole producer, main sole consumer; terminal `kind=closed` event sent before `channel.close()`; only `int32_t` token id and close reason cross the channel; engine-side stream counters match per-`request_result` status counts) | `HPX_CB_STREAM_STEP1: PASS` |
+| Streaming Slice 2 | **cancellation-aware token streaming** at the gate boundary (HPX local `channel<token_stream_event>` per bound active seq; engine sole producer, main sole consumer; cancelled streamed requests close with `reason=cancelled` after exactly `n_decoded_at_cancel` token events; engine-side stream counters match per-`request_result` status counts; only `int32_t` token id and close reason cross the channel) | `HPX_CB_STREAM_STEP2: PASS` |
+| Streaming Slice 3 | **admitted-request streaming over a completion-freed slot** at the gate boundary (`admit_one` rebinds the slot's `token_stream_channel`, resets `stream_closed=false` and the cumulative per-slot `stream_tokens_emitted`, and pushes an explicit `{request_id, receiver}` bundle under the existing `admitted_futures_mtx_` critical section — no new `std::mutex`, no new HPX primitive; engine-side stream counters are derived from the per-`request_result` status of the union of original-active and admitted-streamed requests; admitted streamed token vector is gated independent of the previous occupant's vector) | `HPX_CB_STREAM_STEP3: PASS` |
+| Streaming Slice 4 | **admitted-request streaming over a cancel-freed slot** at the gate boundary (the same `admit_one` rebind path is extended to fire when `src == cancel_freed` in addition to `src == completion_freed`; cancel-freed admitted request opens a fresh HPX local-channel stream, emits exactly `rr.n_decoded` token events, has `streamed_hash == rr.hash`, and closes with `reason=completed` without inheriting the cancelled occupant's close reason or stream state; no new HPX primitive, no new `std::mutex`, no new CLI flag, no new trace event name, no new channel type, no CMake change; the streamed-request loop and the engine-side counter block both extend uniformly to the union {`none`, `completion_freed`, `cancel_freed`}; Slice 4 coverage gate fires when `--stream-all && !cancel_plan.empty() && --n-waiting > 0` but no cancel-freed admitted streamed request is witnessed) | `HPX_CB_STREAM_STEP4: PASS` |
+| Streaming Slice 5 | **external-arrival admitted streaming over a completion-freed slot** at the gate boundary (an externally arriving request submitted through the scripted HPX submitter task via `engine::submit()` and admitted into a slot freed by a sibling's natural completion is itself streamed end-to-end: the `admit_one` external branch now rebinds the slot's `token_stream_channel` and pushes a `{request_id, receiver}` bundle onto `admitted_stream_handoffs_` when `--stream-all && src == completion_freed`, under the existing `admitted_futures_mtx_` critical section; no new HPX primitive, no new `std::mutex`, no new CLI flag, no new trace event name, no new channel type, no CMake change; the submitter-held `hpx::future<request_result>` continues to carry the result snapshot and main drains the stream receiver via the same Slice 3 / 4 path; Slice 5 coverage gate fires when `--stream-all && n_external_arrivals > 0 && --reuse-completed && cancel_plan.empty()` but no streamed external-arrival admitted request is witnessed) | `HPX_CB_STREAM_STEP5: PASS` |
+| Streaming Slice 6 | **external-arrival admitted streaming over a cancel-freed slot** at the gate boundary (the Slice 5 external-branch rebind predicate is broadened by one disjunct so that `admit_one` rebinds the slot's `token_stream_channel` and pushes a `{request_id, receiver}` bundle onto `admitted_stream_handoffs_` when `--stream-all && (src == completion_freed || src == cancel_freed)`, under the existing `admitted_futures_mtx_` critical section; structurally symmetric to the Slice 4 broadening on the preloaded branch; no new HPX primitive, no new `std::mutex`, no new CLI flag, no new trace event name, no new channel type, no CMake change; an externally arriving request admitted into a slot freed by a sibling's cooperative cancellation opens a fresh HPX local-channel stream, emits exactly `rr.n_decoded` token events, has `streamed_hash == rr.hash`, and closes with `reason=completed` without inheriting the cancelled occupant's stream state or close reason; Slice 6 coverage gate fires when `--stream-all && n_external_arrivals > 0 && !cancel_plan.empty()` but no streamed external-arrival admitted request with `admission_src == cancel_freed` is witnessed; the gate lives inside the enclosing `if (args.stream_all)` block so stream-off regression is unaffected; with Slice 6 closed, every admission and arrival source combination — preloaded × {completion_freed, cancel_freed} and external × {completion_freed, cancel_freed} — is now gated end-to-end as a streaming surface) | `HPX_CB_STREAM_STEP6: PASS` |
+| Streaming Slice 7 | **completion-freed multi-cycle slot reuse with streaming** at the gate boundary (a single `seq_id` slot hosts a three-occupant chain `request 0 -> request 1 -> request 2` in one engine run; each occupant gets a fresh HPX local-channel stream lifecycle, closes with `reason=completed`, preserves `streamed_hash == rr.hash`, and links to the immediately previous occupant through `previous_request_id`; the Slice 7 source change is validation-only — `admit_one` already rebound a fresh channel per admitted request, reset per-slot stream state, asserted KV-empty before rebind, cleared generated tokens, and reset hash state; Slice 7 replaces one-reuse-per-slot validation assumptions with chain-aware validation accepting `reused_seq_id_set` as a multiset; no new HPX primitive, no new `std::mutex`, no new CLI flag, no new trace event name, no new channel type, no CMake change; **Path alpha**: structural independence — fresh channel per admission, per-slot stream counter reset, KV-empty assertion before each bind, the `previous_request_id` chain walk, per-cycle `streamed_hash == rr.hash`, and independent stream open/close counters — not token-vector inequality, which is not claimed because identical prompt × budget × greedy decoding produces equal token vectors by design) | `HPX_CB_STREAM_STEP7: PASS` |
 
 Carried-over correctness invariants gated on every Slice 1–7
 run:
@@ -151,20 +160,86 @@ The gate is not a serving layer. Specifically, it does
   `llama_model` and one `llama_context`, created once at
   `main()` and torn down once at exit. No model hot-swap, no
   per-request model selection, no per-tenant isolation.
-- **No streaming.** The gate fulfills `hpx::promise<...>`
-  with a complete `request_result` snapshot **after** the
-  request reaches its budget (or is cancelled). There is no
-  per-token incremental emission to a downstream consumer.
+- **No network / server streaming.** Gate-only HPX-native
+  per-request streaming is now wired and gated (Streaming
+  Slices 1, 2, 3, 4, 5, 6, and 7): each bound active seq has
+  an `hpx::lcos::local::channel<token_stream_event>`, the
+  engine task publishes one token event per decoded token,
+  and the channel closes with `reason=completed` on the
+  completion path or `reason=cancelled` after exactly
+  `n_decoded_at_cancel` token events on the cancellation
+  path. Streaming also covers **admitted requests on every
+  admission × arrival-source combination** the gate
+  exercises: preloaded waiters over **completion-freed**
+  (Slice 3) and over **cancel-freed** (Slice 4); external
+  arrivals over **completion-freed** (Slice 5) and over
+  **cancel-freed** (Slice 6). `admit_one` rebinds the
+  recycled slot's stream channel and pushes an explicit
+  `{request_id, receiver}` handoff bundle in both
+  arrival-source branches (preloaded and external) when
+  `src == completion_freed || src == cancel_freed` —
+  uniform across both branches with Slice 6 closed. A
+  request admitted into a slot freed by either a sibling's
+  natural completion or a sibling's cooperative
+  cancellation, whether the admitted request entered
+  through the preloaded waiting queue or through
+  `engine::submit()` via the scripted HPX submitter task,
+  is itself streamed end-to-end on a fresh HPX local
+  channel — gates assert that the admitted streamed token
+  vector and the admitted close reason do **not** inherit
+  the previous occupant's. Streaming also covers
+  **completion-freed multi-cycle slot reuse** (Slice 7): a
+  single `seq_id` slot can host a three-occupant chain in
+  one engine run, each occupant receiving an independent
+  HPX local-channel stream lifecycle, closing with
+  `reason=completed`, preserving `streamed_hash == rr.hash`,
+  and linking to the immediately previous occupant through
+  `previous_request_id`; Slice 7 frames independence
+  structurally (fresh channel per admission, KV-empty
+  assertion before each bind, the chain walk, per-cycle
+  hash equality, independent open/close counters) rather
+  than as token-vector inequality, since identical prompt
+  × budget × greedy decoding produces equal token vectors
+  by design. The stream is **in-process only**: events
+  carry an `int32_t` token id and a close reason, no
+  `llama_context` / KV / logits state crosses the channel,
+  and the consumer is a same-process HPX task in
+  `main()`. The submitter-held
+  `hpx::future<request_result>` continues to carry the
+  result snapshot for external arrivals (main does **not**
+  push to `admitted_futures_` for those); the stream
+  receiver is pushed onto the same
+  `admitted_stream_handoffs_` vector used by Slice 3 / 4 /
+  5 and is drained by main via the same
+  `eng.take_admitted_stream_handoffs()` path. There is
+  no HTTP / gRPC / Unix-socket streaming, no backpressure /
+  bounded-channel policy, no per-token network framing,
+  and no chat-template assembly. The single-shot
+  `hpx::promise<request_result>` is still fulfilled after
+  the channel closes; the streaming surface is layered on
+  top of it, not a replacement for it. **Cancel-freed
+  multi-cycle reuse** and **external-arrival multi-cycle
+  reuse** (chaining a second admit-then-stream cycle on
+  the same slot within one run through those paths) and
+  **engine-failure `reason=error` stream semantics** (the
+  defensive `error` close path exists in source but no
+  smoke exercises it) remain out of scope for the
+  streaming gate.
 - **No priority queue or scheduling fairness.** Admission
   within each source is FIFO by `request_id`. Source-
   priority is fixed at compile time (cancel-freed before
   completion-freed) and does not consider per-request
   priority, deadline, or fairness.
-- **No multi-cycle slot reuse.** A `seq_id` is reused at
-  most once per run (one cancel-then-admit chain, or one
-  complete-then-admit chain). Chaining waiting → admitted →
-  completed → second-waiting → second-admitted on the same
-  slot is out of scope.
+- **Multi-cycle slot reuse limited to completion-freed.**
+  Streaming Slice 7 closes one shape: a single `seq_id`
+  slot can host a three-occupant completion-freed chain
+  (`request 0 -> request 1 -> request 2`) in one engine
+  run, with each occupant receiving an independent stream
+  lifecycle. Multi-cycle reuse on the **cancel-freed** and
+  **external-arrival** paths — i.e. chaining
+  `cancelled → admitted → completed → second-admitted` on
+  one slot, or doing so through `engine::submit()` —
+  remains out of scope.
 - **No per-request prompts.** Every request shares the same
   prompt string ("Hello, my name is" by default). There is
   no chat-template machinery, no system prompt, no per-
@@ -297,6 +372,108 @@ the gate** and safe to make verbatim:
   `hpx::future<void>` and a release+ack barrier. No
   `std::thread`, no `std::condition_variable`, no wall-clock
   sleep, no new `std::mutex` is introduced."
+- "Gate-only HPX-native per-request token streaming is
+  gated end-to-end on both the completion and the
+  cancellation paths. Each bound active seq has an
+  `hpx::lcos::local::channel<token_stream_event>`; the
+  engine task is the sole producer, main is the sole
+  consumer, and the terminal `kind=closed` event is sent
+  before `channel.close()`. Cancellation-aware streaming
+  is gated: a cancelled streamed request closes its HPX
+  local channel with `reason=cancelled` after exactly
+  `n_decoded_at_cancel` token events, with
+  `streamed_hash == rr.hash` and `rr.status == cancelled`."
+- "Admitted-request streaming is gated at the HPX
+  continuous-batching gate boundary on the completion-freed
+  admission path: a waiting request bound to a slot freed
+  by a sibling's natural completion opens a fresh HPX
+  local-channel stream, emits exactly `rr.n_decoded` token
+  events whose FNV-1a fold equals `rr.hash`, and closes
+  with `reason=completed`. The admitted streamed token
+  vector does not inherit the previous occupant's vector
+  or close reason. Streaming Slice 3 introduces no HTTP /
+  server streaming, no backpressure, no new CLI flag, and
+  no performance claim. Admitted streaming on the cancel-
+  freed and external-arrival admission paths remains
+  deferred."
+- "Cancel-freed admitted-request streaming is gated at
+  the HPX continuous-batching gate boundary: after a
+  streamed original request is cancelled and frees its
+  slot, a waiting request admitted into that slot
+  receives a fresh HPX local-channel stream, emits
+  exactly `rr.n_decoded` token events whose FNV-1a fold
+  equals `rr.hash`, closes with `reason=completed`, and
+  does not inherit the cancelled occupant's close reason
+  or stream state. Streaming Slice 4 introduces no new
+  HPX primitive, no new `std::mutex`, no new CLI flag,
+  no new trace event name, no HTTP / server streaming,
+  no backpressure, and no performance claim. Admitted
+  streaming on the external-arrival admission path
+  remains deferred."
+- "External-arrival admitted-request streaming is gated
+  at the HPX continuous-batching gate boundary on the
+  completion-freed admission path: an externally
+  arriving request submitted through the scripted HPX
+  submitter task via `engine::submit()` and admitted
+  into a slot freed by a sibling's natural completion
+  opens a fresh HPX local-channel stream, emits exactly
+  `rr.n_decoded` token events whose FNV-1a fold equals
+  `rr.hash`, and closes with `reason=completed`. The
+  submitter-held `hpx::future<request_result>` continues
+  to carry the result snapshot; the stream receiver is
+  pushed onto the existing `admitted_stream_handoffs_`
+  vector and drained by main via the same Slice 3 / 4
+  path. Streaming Slice 5 introduces no new HPX
+  primitive, no new `std::mutex`, no new CLI flag, no
+  new trace event name, no HTTP / server streaming, no
+  backpressure, and no performance claim."
+- "External-arrival admitted streaming is gated on the
+  cancel-freed path: after an original streamed request
+  is cancelled and frees a slot, an external request
+  admitted into that slot receives a fresh HPX
+  local-channel stream, emits exactly `rr.n_decoded`
+  token events whose FNV-1a fold equals `rr.hash`,
+  closes with `reason=completed`, and does not inherit
+  the cancelled occupant's stream state or close
+  reason. The Slice 6 engine-side delta is a single
+  predicate broadening on the external-branch
+  `admit_one` rebind to fire on
+  `src == completion_freed || src == cancel_freed`,
+  structurally symmetric to Slice 4 on the preloaded
+  branch. Streaming Slice 6 introduces no new HPX
+  primitive, no new `std::mutex`, no new CLI flag, no
+  new trace event name, no new channel type, no CMake
+  change, no HTTP / server streaming, no backpressure,
+  no multi-cycle slot reuse, no engine-error stream
+  semantics, and no performance claim."
+- "Multi-cycle completion-freed slot reuse with
+  streaming is gated at the HPX continuous-batching
+  gate boundary. A single `seq_id` slot can host a
+  three-occupant chain in one engine run
+  (`request 0 -> request 1 -> request 2`), and each
+  occupant gets an independent HPX local-channel stream
+  lifecycle. The gate validates the `request_id` chain
+  (`previous_request_id` points to the immediately
+  previous occupant), per-cycle
+  `streamed_hash == rr.hash`, per-cycle `completed`
+  close reasons, and KV-empty handoff before reuse.
+  Slice 7 intentionally does not require token-vector
+  inequality, because equal vectors are expected under
+  the same prompt, same budget, and greedy decoding.
+  The Slice 7 source change is validation-only — the
+  engine already rebound a fresh channel per admitted
+  request, reset per-slot stream state, asserted
+  KV-empty before rebind, cleared generated tokens, and
+  reset hash state; Slice 7 replaces one-reuse-per-slot
+  validation assumptions with chain-aware validation
+  that accepts `reused_seq_id_set` as a multiset.
+  Streaming Slice 7 introduces no new HPX primitive,
+  no new `std::mutex`, no new CLI flag, no new trace
+  event name, no new channel type, no CMake change,
+  no HTTP / server streaming, no backpressure, no
+  cancel-freed multi-cycle reuse, no external-arrival
+  multi-cycle reuse, no engine-error stream semantics,
+  and no performance claim."
 
 The following claims are **not** supported by the gate and
 should be avoided:

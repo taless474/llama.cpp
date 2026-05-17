@@ -797,11 +797,1262 @@ HPX-vs-std performance claim is made.
   `tools/hpx-continuous-batch-gate/results.md` under the
   *Live Admission Slice 7 results — mixed-source admission
   priority* section.
+- **Streaming Slice 1 (done):** first HPX-native per-
+  request token streaming boundary, layered on top of the closed
+  admission gate sequence at `HPX_CB_ADMIT_STEP7: PASS`. Adds an
+  HPX local-channel token stream per bound active seq: when
+  `--stream-all` is ON, the engine publishes every generated
+  token id onto a per-seq channel before the existing
+  `request_result` promise is fulfilled. Main consumes via a
+  matching `receive_channel`. The admission gate sequence is
+  preserved unchanged — this is a new gate sequence
+  (`HPX_CB_STREAM_STEP1`) layered on top, not an extension of
+  the admission line.
+
+  HPX-native abstraction (replaces the earlier future-chain
+  design that was explored in source review):
+
+  ```text
+  token_stream_channel  = hpx::lcos::local::channel<token_stream_event>
+  token_stream_sender   = hpx::lcos::local::send_channel<token_stream_event>
+  token_stream_receiver = hpx::lcos::local::receive_channel<token_stream_event>
+  ```
+
+  Event payload:
+
+  ```text
+  enum class stream_event_kind   { token, closed };
+  enum class stream_close_reason { completed, cancelled, error };
+
+  struct token_stream_event {
+      stream_event_kind    kind;          // token or closed
+      int32_t              token_id;      // valid iff kind == token
+      stream_close_reason  close_reason;  // valid iff kind == closed
+  };
+  ```
+
+  Ownership rules:
+  - Engine task is the **sole producer**. Only the engine
+    publishes onto the channel and only the engine calls
+    `channel.close()`.
+  - Main / caller is the **sole consumer**, holding the
+    matching `receive_channel`. The caller never touches
+    `llama_context`, `llama_batch`, `llama_decode`,
+    `llama_get_logits_ith`, or `llama_memory_seq_*`.
+  - Stream events carry **only** an `int32_t` token id and a
+    close reason. No `llama_context` / KV / logits state ever
+    crosses the channel.
+  - The terminal event (`kind=closed`) is sent **before**
+    `channel.close()`. Reversing the order would make `set()`
+    throw `invalid_status`.
+  - Underlying critical section is an `hpx::spinlock` (already
+    accepted as HPX-native in Slice 6). No `std::thread`, no
+    `std::condition_variable`, no `std::this_thread::sleep_for`,
+    no new `std::mutex`.
+
+  New CLI flag (default OFF):
+
+  ```text
+  --stream-all   default: OFF
+                 Slice 8: enable HPX-native per-request token
+                 streaming. Each bound active seq gets an
+                 engine-owned hpx::lcos::local::channel; main
+                 holds the matching receive_channel and drains
+                 the chain after engine_fut.get().
+  ```
+
+  With `--stream-all` OFF the engine allocates no channel,
+  emits no `token_stream_*` events, and keeps every Slice 8
+  stream counter at zero. The Slice 7 smoke shape under
+  `--stream-all` OFF reproduces Slice 7 semantics; only the
+  final stdout label line changes (label-line excluded
+  comparison, see Slice 7 evidence).
+
+  New trace events (gated on the existing `LLAMA_HPX_CB_TRACE=1`
+  flag — trace-off is a single atomic load per call site, as
+  with every earlier slice):
+
+  ```text
+  token_stream_opened request=<id> seq_id=<id>
+  token_stream_token  request=<id> seq_id=<id> pos=<int> token=<int>
+  token_stream_closed request=<id> seq_id=<id> n_tokens=<int> reason=completed|cancelled|error
+  ```
+
+  `token_stream_token` is high-cardinality (one event per
+  emitted token); the 1:1 `token_stream_token`-per-streamed-
+  token invariant holds.
+
+  New `engine_result` counters (maintained by the engine task
+  regardless of trace state):
+
+  ```text
+  streams_opened
+  streams_closed_completed
+  streams_closed_cancelled
+  streams_closed_error
+  stream_tokens_emitted_total
+  ```
+
+  Slice 8 smoke shape (deterministic):
+
+  ```text
+  --stream-all
+  --n-seqs 3
+  --decode-budget-mix 8,64,256
+  --cancel-plan none
+  --n-waiting 0
+  --n-external-arrivals 0
+  ```
+
+  Smoke gates (per repeat, per streaming request):
+
+  - `stream_token_count == rr.n_decoded`
+  - `streamed_hash == rr.hash` (FNV-1a over int32_t token ids,
+    same fold as the per-seq result hash)
+  - stream close count == 1
+  - stream close reason == `completed`
+  - residual KV empty (Slice 1+ carry-over)
+  - `--repeat 2` deterministic on per-seq streamed token
+    vectors AND close reasons
+
+  Engine-side counter gates (Slice 8 smoke, `--stream-all` ON):
+
+  ```text
+  streams_opened            == 3
+  streams_closed_completed  == 3
+  streams_closed_cancelled  == 0
+  streams_closed_error      == 0
+  stream_tokens_emitted_total == 328   (= 8 + 64 + 256)
+  ```
+
+  Observed per-request hashes on the smoke shape (Metal build):
+
+  ```text
+  budget 8   hash=0x0619d4d1900c2365  (canonical anchor; gated)
+  budget 64  hash=0x3b15a0474dfe11be  (within-run uniqueness only)
+  budget 256 hash=0x8790fbe5a60c9ae6  (within-run uniqueness only)
+  ```
+
+  OFF-mode regression gate: with `--stream-all` OFF every
+  Slice 8 stream counter must be exactly zero and the
+  receiver vector must be empty; fail-closed otherwise.
+
+  Hard scope of Streaming Slice 1:
+  - No HTTP/API or server integration (boundary note unchanged).
+  - No cancellation+streaming smoke yet; `cancel_and_fulfill`
+    defensively closes with `cancelled`, but no smoke
+    exercises the path. A dedicated streaming-cancellation
+    slice will gate it.
+  - No backpressure / bounded-channel policy. The unlimited
+    `channel<T>` is used so the engine never suspends on the
+    consumer. Bounded channels are deferred.
+  - No tokenizer / prompt generalization (still
+    `"Hello, my name is"` greedy on TinyLlama).
+  - No per-request sampling configuration.
+  - No streaming through admitted reuser slots in the smoke
+    (smoke has no admission). The wiring is admission-
+    agnostic, but the gates target the original-active path.
+  - **No performance claim.** Streaming Slice 1 is a
+    correctness/lifecycle gate.
+
+  Final emit is `HPX_CB_STREAM_STEP1: PASS` / `FAIL: <reason>`.
+  Closeout evidence is in
+  `tools/hpx-continuous-batch-gate/results.md` under the
+  *Streaming Slice 1 results — HPX local-channel token stream*
+  section.
+- **Streaming Slice 2 (done):** cancellation-aware
+  token streams. Slice 1 proved per-request streaming on the
+  completion path only; Slice 2 closes the cancellation path
+  end-to-end on the same HPX local-channel substrate, with no
+  new HPX primitive, no new CLI flag, and no engine-side
+  behavior change beyond what Slice 1 already wired
+  defensively. The engine-side `cancel_and_fulfill` flow
+  observes cancellation at an iteration boundary, runs the
+  KV-clear + cross-talk check, and closes the per-seq stream
+  channel with `close_reason = cancelled` **before**
+  fulfilling the per-request `request_result` promise with
+  `status = cancelled`. The streamed token vector for the
+  cancelled seq carries exactly `rr.n_decoded_at_cancel`
+  tokens, and the stream closes with `reason=cancelled`.
+  Slice 2 gates this semantically through stream length,
+  close reason, `rr.status`, and `streamed_hash == rr.hash`,
+  not through a per-token trace-order assertion.
+
+  The gate is what changes in Slice 2. The Slice 1 close-
+  reason / token-count gates become status-aware:
+
+  ```text
+  per streamed request:
+    expected_close_reason = (rr.status == cancelled)
+                              ? cancelled
+                              : completed
+    streamed_tokens[seq].size() == rr.n_decoded
+    if rr.status == cancelled:
+      streamed_tokens[seq].size() == rr.n_decoded_at_cancel
+    streamed_hash == rr.hash       # completed and cancelled
+
+  engine-side stream counters:
+    streams_closed_completed == count(rr.status == completed)
+    streams_closed_cancelled == count(rr.status == cancelled)
+    streams_closed_error     == 0
+    streams_opened           == streams_closed_completed
+                              + streams_closed_cancelled
+                              + streams_closed_error
+    stream_tokens_emitted_total
+                             == sum(rr.n_decoded over streamed)
+  ```
+
+  The `--stream-all` OFF regression on the Slice 7 admission
+  shape still gates every stream counter at exactly zero.
+  Slice 1 lifecycle invariants — single producer (engine
+  task), single consumer (main), terminal `kind=closed` event
+  sent **before** `channel.close()`, only `int32_t` token id
+  and a close reason cross the channel — all carry over
+  unchanged. Slice 1's Slice 7 carry-over also carries over:
+  every admission/cancellation/lifecycle gate from Slices 1–7
+  remains a strict invariant under `HPX_CB_STREAM_STEP2`.
+
+  Slice 2 smoke shape (deterministic):
+
+  ```text
+  --stream-all
+  --n-seqs 3
+  --decode-budget-mix 8,64,256
+  --cancel-plan 1
+  --cancel-after 16
+  --n-waiting 0
+  --n-external-arrivals 0
+  --repeat 2
+  ```
+
+  Expected per-request behavior on the smoke:
+
+  ```text
+  seq 0  budget=8    status=completed  close=completed  streamed=8
+  seq 1  budget=64   status=cancelled  close=cancelled  streamed=16
+                     n_decoded=16  n_decoded_at_cancel=16
+                     cancel_observed_iter=16
+  seq 2  budget=256  status=completed  close=completed  streamed=256
+  ```
+
+  Engine-side counter gates (Slice 2 smoke, `--stream-all` ON):
+
+  ```text
+  streams_opened              == 3
+  streams_closed_completed    == 2
+  streams_closed_cancelled    == 1
+  streams_closed_error        == 0
+  stream_tokens_emitted_total == 280   (= 8 + 16 + 256)
+  ```
+
+  Trace event counts on the trace-on smoke (`LLAMA_HPX_CB_TRACE=1`,
+  per repeat — the smoke runs `--repeat 2`, so totals are
+  double):
+
+  ```text
+  token_stream_opened           == 3   (per repeat)
+  token_stream_token            == 280 (per repeat)
+  token_stream_closed           == 3   (per repeat)
+    reason=completed            == 2   (per repeat)
+    reason=cancelled            == 1   (per repeat)
+  cancel_requested              == 1   (per repeat)
+  cancel_observed               == 1   (per repeat)
+  cancel_kv_cleared             == 1   (per repeat)
+  cancel_future_fulfilled       == 1   (per repeat)
+  ```
+
+  Observed hashes on the smoke (Metal build):
+
+  ```text
+  budget 8   completed         hash=0x0619d4d1900c2365   (canonical anchor; gated)
+  budget 256 completed         hash=0x8790fbe5a60c9ae6   (within-run uniqueness only)
+  budget 64  cancelled-prefix  streamed_hash == rr.hash   (gated; concrete value
+                                                            not surfaced in stdout —
+                                                            partition row prints only
+                                                            unique_completed_hashes)
+  ```
+
+  The budget-64 cancelled-prefix hash is **not** compared to
+  the Slice 1 budget-64 completed hash (`0x3b15a0474dfe11be`):
+  Slice 1 hashed 64 tokens, Slice 2 hashes only the 16-token
+  cancelled prefix.
+
+  Hard scope of Streaming Slice 2:
+  - No HTTP/API or server integration (boundary note carry-
+    over).
+  - No backpressure / bounded-channel policy. `channel<T>` is
+    still unbounded so the engine never suspends on the
+    consumer. Bounded channels remain deferred.
+  - No engine-failure stream smoke. The defensive `error`
+    close path still exists; no smoke exercises it yet.
+  - No tokenizer / prompt generalization (still
+    `"Hello, my name is"` greedy on TinyLlama).
+  - No per-request sampling configuration.
+  - No new HPX primitive: same `hpx::lcos::local::channel<token_stream_event>`,
+    same `hpx::spinlock`, same `hpx::promise<request_result>`.
+  - No source change to `cancel_and_fulfill` /
+    `close_stream` / `token_stream_event` /
+    `engine_result` counter set — Slice 2 changes only the
+    gate logic and the STEP label.
+  - **No performance claim.** Streaming Slice 2 is a
+    correctness/lifecycle gate.
+
+  Final emit is `HPX_CB_STREAM_STEP2: PASS` / `FAIL: <reason>`.
+  Closeout evidence is in
+  `tools/hpx-continuous-batch-gate/results.md` under the
+  *Streaming Slice 2 results — cancellation-aware streaming*
+  section.
+- **Streaming Slice 3 (done):** admitted-request
+  streaming over a completion-freed slot. Slices 1 and 2
+  proved per-request streaming on the completion and
+  cancellation paths for **original-active** seqs. Admitted
+  requests — those bound to a slot freed at runtime by a
+  sibling's completion (Slice 5 `--reuse-completed`
+  surface) — were excluded from the Slice 1/2 gates: the
+  gate's per-seq streamed loop filtered on
+  `rr.admission_src == none && rr.request_id == rr.seq_id`,
+  and engine-side, an admitted slot inherited
+  `stream_closed = true` from the prior occupant so
+  `publish_token` short-circuited silently. Slice 3 closes
+  that gap on the completion-freed admission path:
+  `admit_one` rebinds the per-slot stream channel
+  (fresh `token_stream_channel{}`, reset
+  `stream_closed = false`, reset cumulative
+  `stream_tokens_emitted = 0` so the close-event trace
+  reads the admitted-request count, not prev+admitted) and
+  pushes an explicit `{ request_id, receiver }` bundle
+  onto a new per-admission handoff vector
+  (`admitted_stream_handoffs_`). Main drains the bundle
+  after `engine_fut.get()` and keys streamed tokens by
+  `request_id`, so the existing seq-id-indexed Slice 1
+  loop and the new per-request-id Slice 3 loop coexist
+  without aliasing.
+
+  HPX-native design note (Correction acknowledged):
+  the new bundle vector is guarded by the **same existing
+  `admitted_futures_mtx_` critical section** that already
+  serializes admitted-future handoff. No new `std::mutex`
+  is introduced. No `hpx::spinlock`, `std::thread`,
+  `std::condition_variable`, `std::this_thread::sleep_for`,
+  or wall-clock sleep is introduced. The lock guards
+  engine→main result-handoff metadata only; it does NOT
+  guard `llama_context`, `llama_batch`, `llama_decode`,
+  `llama_memory_seq_*`, or `llama_get_logits_ith` access.
+
+  Safe claim (verbatim):
+
+  ```text
+  A waiting request admitted into a completion-freed slot
+  opens a fresh HPX local-channel stream, emits exactly
+  rr.n_decoded token events, has streamed_hash == rr.hash,
+  and closes with reason=completed.
+  ```
+
+  The gate-side change generalizes the streaming gate to
+  range over the **union** of original-active streamed
+  requests (keyed by `seq_id`) and completion-freed
+  admitted streamed requests (keyed by `request_id`). The
+  Slice 2 status-aware close-reason / token-count / hash
+  gates apply uniformly to both. Slice 3 adds:
+
+  ```text
+  per admitted-streamed request (admission_src=completion_freed):
+    admitted_streamed_seen[rr.request_id] == true
+    admitted_streamed_tokens[rr.request_id].size()
+                                == rr.n_decoded
+    streamed_hash == rr.hash
+    streamed_close == completed   (Slice 3 scope; cancelled
+                                   admitted streaming is
+                                   deferred)
+    admitted_streamed_tokens[rr.request_id]
+                                != streamed_tokens[rr.seq_id]
+                                (no inheritance of prev
+                                 occupant's token vector)
+    rr.previous_request_id >= 0
+    rr.seq_id ∈ [0, n_active)
+
+  engine-side stream counters (expected-from-results,
+  admission-aware):
+    streams_opened              == count(streamed requests
+                                          in results)
+    streams_closed_completed    == count(rr.status==completed
+                                          over streamed)
+    streams_closed_cancelled    == count(rr.status==cancelled
+                                          over streamed)
+    streams_closed_error        == 0
+    streams_opened              == streams_closed_completed
+                                  + streams_closed_cancelled
+                                  + streams_closed_error
+    stream_tokens_emitted_total == sum(rr.n_decoded over
+                                       streamed)
+  ```
+
+  Coverage gate (new in Slice 3): when `--stream-all` AND
+  `--reuse-completed` AND `--n-waiting > 0`, at least one
+  streamed completion-freed admitted request must be
+  witnessed; misconfigured smoke shapes fail-closed
+  instead of silently proving nothing.
+
+  Slice 3 smoke shape (deterministic):
+
+  ```text
+  --stream-all
+  --n-seqs 2
+  --n-active 1
+  --n-waiting 1
+  --decode-budget-mix 8
+  --waiting-budget 16
+  --reuse-completed
+  --cancel-plan none
+  --n-external-arrivals 0
+  --repeat 2
+  ```
+
+  Expected per-request behavior:
+
+  ```text
+  request_id=0 (original active, seq_id=0, admission_src=none)
+    budget=8   status=completed  close=completed  streamed=8
+
+  request_id=1 (admitted waiter, seq_id=0,
+                admission_src=completion_freed,
+                arrival_source=preloaded,
+                reused_seq_id=0,
+                previous_request_id=0,
+                admitted_at_iter=8)
+    budget=16  status=completed  close=completed  streamed=16
+  ```
+
+  Engine-side counter gates (Slice 3 smoke, `--stream-all`
+  ON, per repeat):
+
+  ```text
+  streams_opened              == 2   (1 ctor + 1 admit)
+  streams_closed_completed    == 2
+  streams_closed_cancelled    == 0
+  streams_closed_error        == 0
+  stream_tokens_emitted_total == 24  (= 8 + 16)
+  ```
+
+  Observed hashes on the smoke (Metal build):
+
+  ```text
+  budget 8   original  completed  hash=0x0619d4d1900c2365   (canonical anchor; gated)
+  budget 16  admitted  completed  hash=0x833045f1e2ebf49f   (observed and
+                                                              repeat-deterministic;
+                                                              NOT a new
+                                                              cross-shape canonical
+                                                              claim)
+  ```
+
+  OFF-mode regression gate: with `--stream-all` OFF on the
+  canonical Slice 7 admission shape every stream counter
+  is exactly zero, the receiver vector is empty, and the
+  new admitted-stream handoff vector is empty;
+  fail-closed otherwise.
+
+  Hard scope of Streaming Slice 3:
+  - **Completion-freed admission only.** Cancel-freed
+    admitted streaming is not gated; external-arrival
+    admitted streaming is not gated. The `admit_one`
+    rebind is explicitly predicated on
+    `src == admission_source::completion_freed`, so the
+    other admission paths still produce admitted requests
+    whose slots inherit `stream_closed=true` and skip
+    streaming (carry-over of Slice 1/2 phantom behavior).
+  - No HTTP/API or server integration (boundary note
+    carry-over).
+  - No backpressure / bounded-channel policy.
+    `channel<T>` is still unbounded so the engine never
+    suspends on the consumer.
+  - No engine-failure stream smoke. The defensive
+    `error` close path remains untested.
+  - No tokenizer / prompt generalization (still
+    `"Hello, my name is"` greedy on TinyLlama).
+  - No per-request sampling configuration.
+  - No new HPX primitive. Same
+    `hpx::lcos::local::channel<token_stream_event>`,
+    same `hpx::spinlock` for the existing inbox, same
+    `hpx::promise<request_result>` /
+    `hpx::future<request_result>`.
+  - **No performance claim.** Streaming Slice 3 is a
+    correctness/lifecycle gate.
+
+  Final emit is `HPX_CB_STREAM_STEP3: PASS` / `FAIL: <reason>`.
+  Closeout evidence is in
+  `tools/hpx-continuous-batch-gate/results.md` under the
+  *Streaming Slice 3 results — admitted-request streaming
+  over completion-freed slot* section.
+
+- **Streaming Slice 4 (done):** admitted-request
+  streaming over a **cancel-freed** slot. Slice 3 closed
+  the completion-freed admission path; Slice 4 extends the
+  same `admit_one` stream-rebind to the cancel-freed
+  admission path so that a waiting request bound to a slot
+  freed by a sibling's cooperative cancellation is itself
+  streamed end-to-end on a fresh HPX local channel. The
+  engine-side delta is one predicate change: the rebind
+  block in `admit_one` now fires when
+  `src == admission_source::completion_freed` **or**
+  `src == admission_source::cancel_freed`. No new HPX
+  primitive, no new `std::mutex`, no new CLI flag, no new
+  trace event name, no new channel type, no CMake change.
+  The streaming substrate, ownership rules, payload, and
+  trace event set are unchanged from Slices 1–3.
+
+  HPX-native design note (carry-over from Slice 3):
+  the rebound handoff is still pushed inside the same
+  existing `admitted_futures_mtx_` critical section that
+  serializes admitted-future handoff. No new mutex / no
+  new spinlock is introduced for the cancel-freed path.
+  The lock guards engine→main result-handoff metadata
+  only; it does **not** guard `llama_context`,
+  `llama_batch`, `llama_decode`, `llama_memory_seq_*`, or
+  `llama_get_logits_ith` access. Only the engine HPX task
+  touches llama.cpp execution state.
+
+  Safe claim (verbatim):
+
+  ```text
+  A waiting request admitted into a cancel-freed slot
+  opens a fresh HPX local-channel stream, emits exactly
+  rr.n_decoded token events, has streamed_hash == rr.hash,
+  and closes with reason=completed without inheriting the
+  cancelled occupant's close reason or stream state.
+  ```
+
+  The gate-side change is the symmetric extension of the
+  Slice 3 generalization: the streamed-request loop now
+  ranges over the **union** of original-active streamed
+  requests (`admission_src=none`), completion-freed
+  admitted streamed requests (`admission_src=completion_freed`),
+  and cancel-freed admitted streamed requests
+  (`admission_src=cancel_freed`). The Slice 2 status-aware
+  close-reason / token-count / hash gates apply uniformly
+  to all three. Slice 4 adds:
+
+  ```text
+  per cancel-freed admitted-streamed request:
+    rr.admission_src                       == cancel_freed
+    admitted_streamed_seen[rr.request_id]  == true
+    admitted_streamed_close[rr.request_id] == completed
+                                              (cancelled
+                                               occupant's
+                                               close_reason
+                                               is NOT
+                                               inherited)
+    admitted_streamed_tokens[rr.request_id].size()
+                                            == rr.n_decoded
+    streamed_hash                           == rr.hash
+    admitted_streamed_tokens[rr.request_id]
+                                  != streamed_tokens[rr.seq_id]
+                                  (no inheritance of the
+                                   cancelled occupant's
+                                   token vector)
+    rr.previous_request_id                  >= 0
+    rr.seq_id ∈ [0, n_active)               true
+  ```
+
+  Coverage gate (new in Slice 4): when `--stream-all` AND
+  the configured `cancel_plan` is non-empty AND
+  `--n-waiting > 0`, at least one streamed cancel-freed
+  admitted request must be witnessed; misconfigured smoke
+  shapes fail-closed instead of silently proving nothing.
+  The Slice 3 completion-freed coverage gate is untouched.
+
+  Slice 4 smoke-shape adjustment (versus the natural
+  one-active sketch):
+
+  The originally suggested `--n-active 1` shape **cannot**
+  fire cancel-freed admission: when the single active seq
+  is cancelled at iter K, the engine exits via
+  `if (!any_active())` before iter K+1 (the design's
+  one-iter cancel→admit delay). The smoke therefore uses
+  `--n-active 2` with one cancelled and one surviving
+  active seq, plus one preloaded waiter, so the decode
+  loop stays alive across the cancel→admit boundary.
+  Additionally, because greedy decoding from the same
+  prompt produces the same first-N tokens regardless of
+  admission path, the cancelled prefix length is set to
+  8 tokens and the admitted budget to 16 so the
+  independence-gate token-vector compare is naturally
+  inequality-by-length.
+
+  Slice 4 smoke shape (deterministic):
+
+  ```text
+  --stream-all
+  --n-seqs 3
+  --n-active 2
+  --n-waiting 1
+  --decode-budget-mix 64,256
+  --waiting-budget 16
+  --cancel-plan 0
+  --cancel-after 8
+  --n-external-arrivals 0
+  --repeat 2
+  ```
+
+  Expected per-request behavior:
+
+  ```text
+  request_id=0 (original active, seq_id=0,
+                admission_src=none)
+    budget=64  status=cancelled  close=cancelled
+    n_decoded=8  n_decoded_at_cancel=8
+    cancel_observed_iter=8  streamed=8
+
+  request_id=1 (original active, seq_id=1,
+                admission_src=none)
+    budget=256  status=completed  close=completed
+    streamed=256
+
+  request_id=2 (admitted waiter, seq_id=0,
+                admission_src=cancel_freed,
+                arrival_source=preloaded,
+                reused_seq_id=0,
+                previous_request_id=0,
+                admitted_at_iter=9)
+    budget=16  status=completed  close=completed
+    streamed=16
+  ```
+
+  Engine-side counter gates (Slice 4 smoke, `--stream-all`
+  ON, per repeat):
+
+  ```text
+  streams_opened              == 3   (2 ctor + 1 admit)
+  streams_closed_completed    == 2   (orig 1 + admitted 2)
+  streams_closed_cancelled    == 1   (orig 0)
+  streams_closed_error        == 0
+  stream_tokens_emitted_total == 280 (= 8 + 256 + 16)
+  ```
+
+  Observed hashes on the smoke (Metal build):
+
+  ```text
+  budget 16   admitted (cancel_freed)   completed  hash=0x833045f1e2ebf49f
+  budget 256  original                  completed  hash=0x8790fbe5a60c9ae6
+  budget 64   original                  cancelled  (cancelled-prefix
+                                                     hash not surfaced
+                                                     separately; gated
+                                                     through
+                                                     streamed_hash
+                                                     == rr.hash)
+  ```
+
+  The admitted budget-16 hash equals the Slice 3
+  completion-freed admitted budget-16 hash for the same
+  prompt/policy/budget — this is expected under greedy
+  decoding, **not** a new cross-shape canonical anchor.
+
+  OFF-mode regression gate: with `--stream-all` OFF on the
+  canonical Slice 7 admission shape every stream counter
+  is exactly zero, the receiver vector is empty, and the
+  admitted-stream handoff vector is empty; fail-closed
+  otherwise.
+
+  Hard scope of Streaming Slice 4:
+  - **Cancel-freed admission path covered.** The
+    `admit_one` stream rebind predicate now includes
+    `cancel_freed` alongside `completion_freed`.
+  - **Completion-freed admission path remains covered**
+    from Slice 3 (carry-over invariant; Slice 3 smoke
+    and gates unchanged).
+  - **External-arrival admitted streaming still
+    deferred.** The `admit_one` predicate still excludes
+    `arrival_source::external` admissions; those slots
+    inherit `stream_closed=true` and silently skip
+    streaming until a later slice extends the rebind to
+    the external arrival path.
+  - No HTTP / API / server / network streaming. The
+    stream is in-process only between the engine HPX task
+    and `main()`.
+  - No backpressure / bounded-channel policy.
+    `channel<T>` is still unbounded so the engine never
+    suspends on the consumer.
+  - No engine-failure stream smoke. The defensive
+    `error` close path remains untested.
+  - No tokenizer / prompt generalization (still
+    `"Hello, my name is"` greedy on TinyLlama).
+  - No per-request sampling configuration.
+  - No new HPX primitive. Same
+    `hpx::lcos::local::channel<token_stream_event>`,
+    same `hpx::spinlock` for the existing inbox, same
+    `hpx::promise<request_result>` /
+    `hpx::future<request_result>`.
+  - **No performance claim.** Streaming Slice 4 is a
+    correctness/lifecycle gate.
+
+  Final emit is `HPX_CB_STREAM_STEP4: PASS` / `FAIL: <reason>`.
+  Closeout evidence is in
+  `tools/hpx-continuous-batch-gate/results.md` under the
+  *Streaming Slice 4 results — admitted-request streaming
+  over cancel-freed slot* section.
+
+- **Streaming Slice 5 (done):** external-arrival
+  admitted streaming over a **completion-freed** slot.
+  Slices 3 and 4 closed admitted-request streaming for
+  **preloaded** waiters on the completion-freed and
+  cancel-freed admission paths. Slice 5 extends streaming
+  to **external arrivals**: a request that entered through
+  `engine::submit()` from a scripted HPX submitter task,
+  admitted into a slot freed by a sibling's natural
+  completion, opens a fresh HPX local-channel stream and
+  is streamed end-to-end. The engine-side delta is one
+  new rebind block at the end of the external branch of
+  `admit_one`, gated on
+  `stream_all_ && src == admission_source::completion_freed`
+  (Slice 5 scope; the predicate was broadened in Streaming
+  Slice 6 to also cover `cancel_freed`). No new HPX
+  primitive, no new `std::mutex`, no new CLI flag, no new
+  trace event name, no new channel type, no CMake change.
+
+  HPX-native design note (carry-over from Slice 3 / 4):
+  the rebound handoff is pushed inside the same existing
+  `admitted_futures_mtx_` critical section that already
+  serializes admitted-future handoff and the Slice 3 / 4
+  stream handoff. No new mutex / no new spinlock is
+  introduced. The submitter-held
+  `hpx::future<request_result>` remains the result route
+  (main does NOT push to `admitted_futures_` for external
+  arrivals); the stream receiver is pushed to
+  `admitted_stream_handoffs_` keyed by `request_id`, so
+  main drains it via the same Slice 3 / 4 path. The lock
+  guards engine→main result-handoff metadata only; it
+  does **not** guard `llama_context`, `llama_batch`,
+  `llama_decode`, `llama_memory_seq_*`, or
+  `llama_get_logits_ith` access. The scripted submitter
+  helper body still calls no `llama_*` API. Only the
+  engine HPX task touches llama.cpp execution state.
+
+  Safe claim (verbatim):
+
+  ```text
+  An externally arriving request admitted into a
+  completion-freed slot opens a fresh HPX local-channel
+  stream, emits exactly rr.n_decoded token events, has
+  streamed_hash == rr.hash, and closes with
+  reason=completed.
+  ```
+
+  The gate-side change adds:
+
+  ```text
+  per external-arrival admitted-streamed request
+    (admission_src=completion_freed, arrival_src=external):
+      admitted_streamed_seen[rr.request_id]  == true
+      admitted_streamed_close[rr.request_id] == completed
+      admitted_streamed_tokens[rr.request_id].size()
+                                              == rr.n_decoded
+      streamed_hash                           == rr.hash
+      rr.previous_request_id                  >= 0
+      rr.reused_seq_id                        == prior occupant's seq_id
+      rr.seq_id ∈ [0, n_active)               true
+      admitted_streamed_tokens[rr.request_id]
+                                    != streamed_tokens[rr.seq_id]
+                                    (length-based inequality;
+                                     not a semantic
+                                     token-divergence claim)
+  ```
+
+  Coverage gate (new in Slice 5): when `--stream-all` AND
+  `args.n_external_arrivals > 0` AND `--reuse-completed`
+  AND `args.cancel_plan.empty()`, at least one streamed
+  external-arrival admitted request must be witnessed;
+  misconfigured smoke shapes fail-closed instead of
+  silently proving nothing. The Slice 3 and Slice 4
+  coverage gates are untouched.
+
+  Pre-existing Live Admission Slice 6 gate adjustment:
+  the original gate at the Slice 6 results-validation
+  block required every external arrival to come via
+  `admission_src=cancel_freed` (its own comment admitted
+  "no completion-freed external path exercised yet"). Slice
+  5 relaxed it to accept either `cancel_freed` (when
+  `cancel_plan` non-empty) or `completion_freed` (when
+  `--reuse-completed` is on). The Slice 7 mixed-source
+  `slice7_strict` block is unaffected: its preconditions
+  (`reuse_completed && !cancel_plan.empty() && n_waiting > 0
+   && n_external_arrivals > 0`) exclude the Slice 5 smoke
+  shape, so no Slice 7 invariants moved.
+
+  Slice 5 smoke shape (deterministic):
+
+  ```text
+  --stream-all
+  --n-seqs 3
+  --n-active 2
+  --n-waiting 0
+  --n-external-arrivals 1
+  --decode-budget-mix 8,256
+  --external-arrival-budget 16
+  --external-release-iter 3
+  --reuse-completed
+  --cancel-plan none
+  --repeat 2
+  ```
+
+  Expected per-request behavior:
+
+  ```text
+  request_id=0 (original active, seq_id=0,
+                admission_src=none, arrival_src=preloaded)
+    budget=8     status=completed   close=completed
+    streamed=8   hash=0x0619d4d1900c2365
+
+  request_id=1 (original active, seq_id=1,
+                admission_src=none, arrival_src=preloaded)
+    budget=256   status=completed   close=completed
+    streamed=256 hash=0x8790fbe5a60c9ae6
+
+  request_id=2 (external arrival, seq_id=0,
+                admission_src=completion_freed,
+                arrival_src=external,
+                reused_seq_id=0,
+                previous_request_id=0,
+                admitted_at_iter=8)
+    budget=16    status=completed   close=completed
+    streamed=16  hash=0x833045f1e2ebf49f
+                 done_iter=23  pos_max_at_clear=20
+  ```
+
+  Engine-side counter gates (Slice 5 smoke, `--stream-all`
+  ON, per repeat):
+
+  ```text
+  streams_opened              == 3   (2 ctor + 1 external admit)
+  streams_closed_completed    == 3
+  streams_closed_cancelled    == 0
+  streams_closed_error        == 0
+  stream_tokens_emitted_total == 280  (= 8 + 256 + 16)
+  ```
+
+  External-arrival metrics (per repeat):
+
+  ```text
+  admitted_count              == 1
+  external_admitted_count     == 1
+  arrival_drained_count       == 1
+  first_external_drain_iter   == 4    (= external_release_iter + 1)
+  iter_release_fired_set      == {3}
+  submitter_ack_set           == {3}
+  ```
+
+  Observed hashes on the smoke (Metal build):
+
+  ```text
+  budget  8   original  completed             hash=0x0619d4d1900c2365   (canonical anchor)
+  budget 256  original  completed             hash=0x8790fbe5a60c9ae6
+  budget 16   external admitted completion_freed
+                                              hash=0x833045f1e2ebf49f
+  ```
+
+  The external admitted budget-16 hash equals the Slice 3
+  / Slice 4 preloaded admitted budget-16 hashes for the
+  same prompt / policy / budget — expected under greedy
+  decoding, **not** a new cross-shape canonical anchor.
+
+  OFF-mode regression gate: with `--stream-all` OFF on the
+  canonical Slice 7 admission shape every stream counter
+  is exactly zero, the receiver vector is empty, and the
+  admitted-stream handoff vector is empty; fail-closed
+  otherwise.
+
+  Hard scope of Streaming Slice 5:
+  - **External-arrival admitted streaming over the
+    completion-freed path covered.** The external branch
+    of `admit_one` now rebinds the stream channel when
+    `--stream-all` is on and `src == completion_freed`.
+  - **External-arrival admitted streaming over the
+    cancel-freed path was deferred at Slice 5; covered
+    in Streaming Slice 6 below.**
+  - **Slice 3 / Slice 4 preloaded admitted streaming
+    invariants remain strict carry-overs.**
+  - No HTTP / API / server / network streaming. The
+    stream is in-process only between the engine HPX
+    task and `main()`. The scripted submitter is an HPX
+    task, not a network adapter.
+  - No backpressure / bounded-channel policy.
+    `channel<T>` is still unbounded so the engine never
+    suspends on the consumer.
+  - No engine-failure stream smoke. The defensive
+    `error` close path remains untested.
+  - No tokenizer / prompt generalization (still
+    `"Hello, my name is"` greedy on TinyLlama).
+  - No per-request sampling configuration.
+  - No new HPX primitive. Same
+    `hpx::lcos::local::channel<token_stream_event>`,
+    same `hpx::spinlock` for the existing inbox, same
+    `hpx::promise<request_result>` /
+    `hpx::future<request_result>`.
+  - **No performance claim.** Streaming Slice 5 is a
+    correctness/lifecycle gate.
+
+  Final emit was `HPX_CB_STREAM_STEP5: PASS` / `FAIL: <reason>`.
+  Closeout evidence is in
+  `tools/hpx-continuous-batch-gate/results.md` under the
+  *Streaming Slice 5 results — external-arrival streaming
+  over completion-freed slot* section.
+
+- **Streaming Slice 6 (done):** external-arrival
+  admitted streaming over a **cancel-freed** slot. Slice 5
+  closed external-arrival admitted streaming on the
+  completion-freed path only; Slice 6 broadens the
+  external-branch rebind predicate in `admit_one` by one
+  disjunct so that an externally arriving request admitted
+  into a slot freed by a sibling's cooperative cancellation
+  is itself streamed end-to-end. The engine-side delta is a
+  single-line predicate change at the end of the external
+  branch of `admit_one`:
+  `stream_all_ && (src == admission_source::completion_freed
+   || src == admission_source::cancel_freed)`.
+  This is structurally symmetric to the Slice 4 → Slice 6
+  pattern Slice 4 already proved on the preloaded branch.
+  No new HPX primitive, no new `std::mutex`, no new CLI
+  flag, no new trace event name, no new channel type, no
+  CMake change.
+
+  HPX-native design note (carry-over from Slices 3 / 4 / 5):
+  the rebound handoff for the external + cancel_freed
+  admission is pushed inside the same existing
+  `admitted_futures_mtx_` critical section that already
+  serializes the Slice 3 / 4 / 5 stream handoff. No new
+  mutex / no new spinlock is introduced. The submitter-held
+  `hpx::future<request_result>` remains the result route
+  (main does NOT push to `admitted_futures_` for external
+  arrivals); the stream receiver is pushed to
+  `admitted_stream_handoffs_` keyed by `request_id`, so
+  main drains it via the same Slice 3 / 4 / 5 path. The
+  lock guards engine→main result-handoff metadata only; it
+  does **not** guard `llama_context`, `llama_batch`,
+  `llama_decode`, `llama_memory_seq_*`, or
+  `llama_get_logits_ith` access. The scripted submitter
+  helper body still calls no `llama_*` API. Only the
+  engine HPX task touches llama.cpp execution state.
+
+  Safe claim (verbatim):
+
+  ```text
+  An externally arriving request admitted into a
+  cancel-freed slot opens a fresh HPX local-channel
+  stream, emits exactly rr.n_decoded token events, has
+  streamed_hash == rr.hash, and closes with
+  reason=completed without inheriting the cancelled
+  previous occupant's stream state or close reason.
+  ```
+
+  The gate-side change adds:
+
+  ```text
+  per external-arrival admitted-streamed request
+    (admission_src=cancel_freed, arrival_src=external):
+      admitted_streamed_seen[rr.request_id]  == true
+      admitted_streamed_close[rr.request_id] == completed
+      admitted_streamed_tokens[rr.request_id].size()
+                                              == rr.n_decoded
+      streamed_hash                           == rr.hash
+      rr.previous_request_id                  >= 0
+      rr.reused_seq_id                        == prior occupant's seq_id
+                                                  (the cancelled slot)
+      rr.seq_id ∈ [0, n_active)               true
+      admitted_streamed_tokens[rr.request_id]
+                                    != streamed_tokens[rr.seq_id]
+                                    (length-based inequality;
+                                     not a semantic
+                                     token-divergence claim)
+  ```
+
+  Coverage gate (new in Slice 6): when `--stream-all` AND
+  `args.n_external_arrivals > 0` AND
+  `!args.cancel_plan.empty()`, at least one streamed
+  external-arrival admitted request with
+  `admission_src == cancel_freed` must be witnessed;
+  misconfigured smoke shapes fail-closed instead of
+  silently proving nothing. The gate lives inside the
+  enclosing `if (args.stream_all)` block so stream-off
+  regression runs are unaffected. The Slice 3 / 4 / 5
+  coverage gates are untouched.
+
+  Slice 6 smoke shape (deterministic):
+
+  ```text
+  --stream-all
+  --n-seqs 3
+  --n-active 2
+  --n-waiting 0
+  --n-external-arrivals 1
+  --decode-budget-mix 64,256
+  --external-arrival-budget 16
+  --external-release-iter 3
+  --cancel-plan 0
+  --cancel-after 8
+  --repeat 2
+  ```
+
+  Expected per-request behavior:
+
+  ```text
+  request_id=0 (original active, seq_id=0,
+                admission_src=none, arrival_src=preloaded)
+    budget=64    status=cancelled  close=cancelled
+    cancel_observed_iter=8         n_decoded_at_cancel=8
+    streamed=8
+
+  request_id=1 (original active, seq_id=1,
+                admission_src=none, arrival_src=preloaded)
+    budget=256   status=completed  close=completed
+    streamed=256 hash=0x8790fbe5a60c9ae6
+
+  request_id=2 (external arrival, seq_id=0,
+                admission_src=cancel_freed,
+                arrival_src=external,
+                reused_seq_id=0,
+                previous_request_id=0,
+                admitted_at_iter=9       (== cancel_after+1))
+    budget=16    status=completed  close=completed
+    streamed=16  hash=0x833045f1e2ebf49f
+                 done_iter=24  pos_max_at_clear=20
+  ```
+
+  Engine-side counter gates (Slice 6 smoke, `--stream-all`
+  ON, per repeat):
+
+  ```text
+  streams_opened              == 3
+                                (1 ctor cancelled
+                               + 1 ctor surviving
+                               + 1 external admit-rebind)
+  streams_closed_completed    == 2     (req 1 + req 2)
+  streams_closed_cancelled    == 1     (req 0)
+  streams_closed_error        == 0
+  stream_tokens_emitted_total == 280   (= 8 + 256 + 16)
+  ```
+
+  External / cancel metrics (per repeat):
+
+  ```text
+  admitted_count                == 1
+  external_admitted_count       == 1
+  arrival_drained_count         == 1
+  first_external_drain_iter     == 4    (== external_release_iter + 1)
+  iter_release_fired_set        == {3}
+  submitter_ack_set             == {3}
+  cancel_observed               == 1
+  cancel_kv_cleared             == 1
+  cancel_future_fulfilled       == 1
+  request_admitted_live         == 1    (with
+                                          admission_source=cancel_freed,
+                                          arrival_source=external)
+  seq_reused                    == 1
+  admitted_prefilled            == 1
+  ```
+
+  Observed hashes on the smoke (Metal build):
+
+  ```text
+  budget  64  original cancelled              (no completion hash)
+  budget 256  original completed              hash=0x8790fbe5a60c9ae6
+  budget  16  external admitted cancel_freed
+                                              hash=0x833045f1e2ebf49f
+  ```
+
+  The external admitted budget-16 hash equals the Slice 3
+  / Slice 4 / Slice 5 admitted budget-16 hashes for the
+  same prompt / policy / budget — expected under greedy
+  decoding, **not** a new cross-shape canonical anchor.
+
+  OFF-mode regression gate: with `--stream-all` OFF on the
+  canonical Slice 7 admission shape every stream counter
+  is exactly zero, the receiver vector is empty, and the
+  admitted-stream handoff vector is empty; fail-closed
+  otherwise.
+
+  Hard scope of Streaming Slice 6:
+  - **External-arrival admitted streaming over the
+    cancel-freed path covered.** The external branch of
+    `admit_one` now rebinds the stream channel when
+    `--stream-all` is on and `src == cancel_freed`, in
+    addition to the Slice 5 `completion_freed` case.
+  - **External-arrival + completion-freed path remains
+    covered (Slice 5 carry-over).** The optional Slice 5
+    regression run on the Slice 5 smoke shape still passes
+    after the Slice 6 predicate broadening.
+  - **Preloaded completion-freed and cancel-freed admitted
+    streaming remain covered (Slices 3 / 4 carry-overs).**
+  - No HTTP / API / server / network streaming. The
+    stream is in-process only between the engine HPX
+    task and `main()`. The scripted submitter is an HPX
+    task, not a network adapter.
+  - No backpressure / bounded-channel policy.
+    `channel<T>` is still unbounded so the engine never
+    suspends on the consumer.
+  - No multi-cycle slot reuse with streaming. A `seq_id`
+    is still reused at most once per run.
+  - No engine-failure stream smoke. The defensive
+    `error` close path remains untested.
+  - No tokenizer / prompt generalization (still
+    `"Hello, my name is"` greedy on TinyLlama).
+  - No per-request sampling configuration.
+  - No new HPX primitive. Same
+    `hpx::lcos::local::channel<token_stream_event>`,
+    same `hpx::spinlock` for the existing inbox, same
+    `hpx::promise<request_result>` /
+    `hpx::future<request_result>`.
+  - **No performance claim.** Streaming Slice 6 is a
+    correctness/lifecycle gate.
+
+  Final emit is `HPX_CB_STREAM_STEP6: PASS` / `FAIL: <reason>`.
+  Closeout evidence is in
+  `tools/hpx-continuous-batch-gate/results.md` under the
+  *Streaming Slice 6 results — external-arrival streaming
+  over cancel-freed slot* section.
+
+- **Streaming Slice 7 (this version):** completion-freed
+  multi-cycle slot reuse with streaming. Earlier streaming
+  slices closed the width of the first-admission surface:
+  original active completion, original active cancellation,
+  preloaded admitted requests over `completion_freed` and
+  `cancel_freed`, and external admitted requests over
+  `completion_freed` and `cancel_freed`. Slice 7 closes the
+  next depth case: one `seq_id` slot can host more than one
+  admitted streamed request in the same engine run. The
+  Slice 7 source change is validation-only — `admit_one`
+  already rebound a fresh channel per admitted request, reset
+  per-slot stream state, asserted KV-empty before rebind,
+  cleared generated tokens, and reset hash state. Slice 7
+  relaxes one-reuse-per-slot validation assumptions and
+  replaces them with chain-aware validation. No new HPX
+  primitive, no new `std::mutex`, no new CLI flag, no new
+  trace event name, no new channel type, no CMake change.
+
+  HPX-native design note: the stream substrate remains
+  `hpx::lcos::local::channel<token_stream_event>`, stream
+  payload is still token id plus close reason only, the
+  engine HPX task remains the sole producer, `main` remains
+  the consumer, and only the engine HPX task touches
+  llama.cpp execution state.
+
+  Slice 7 smoke shape (the design proposal used `--n-seqs 2`,
+  but the CLI requires `n_active + n_waiting <= n_seqs`, so
+  the smoke uses `--n-seqs 3`; only slot 0 is live at any
+  moment):
+
+  ```text
+  --n-seqs 3
+  --n-active 1
+  --n-waiting 2
+  --waiting-budget 8
+  --decode-budget-mix 8
+  --reuse-completed
+  --cancel-plan none
+  --stream-all
+  --repeat 2
+  ```
+
+  Slot 0 hosts a three-occupant completion-freed chain
+  (`request 0 -> request 1 -> request 2`) in one engine run.
+  Expected per-request behavior:
+
+  ```text
+  request_id=0 (original active, seq_id=0,
+                admission_src=none, arrival_src=preloaded)
+    budget=8     status=completed close=completed
+    done_iter=7  streamed=8  hash=0x0619d4d1900c2365
+
+  request_id=1 (admitted, seq_id=0,
+                admission_src=completion_freed,
+                arrival_src=preloaded,
+                reused_seq_id=0,
+                previous_request_id=0,
+                admitted_at_iter=8)
+    budget=8     status=completed close=completed
+    done_iter=15 streamed=8  hash=0x0619d4d1900c2365
+
+  request_id=2 (admitted, seq_id=0,
+                admission_src=completion_freed,
+                arrival_src=preloaded,
+                reused_seq_id=0,
+                previous_request_id=1,
+                admitted_at_iter=16)
+    budget=8     status=completed close=completed
+    done_iter=23 streamed=8  hash=0x0619d4d1900c2365
+  ```
+
+  All three occupants use the same prompt, model, greedy
+  policy, and budget. Under those conditions equal token
+  vectors and equal hashes are expected. Slice 7 therefore
+  uses **Path alpha: structural independence**, not
+  token-vector inequality, as the independence proof: fresh
+  channel per admission, per-slot stream counter reset
+  before rebind, KV-empty assertion before each bind, the
+  `previous_request_id` chain walk, per-cycle
+  `streamed_hash == rr.hash`, and independent stream
+  open/close counters.
+
+  Engine-side counter gates (Slice 7 smoke, `--stream-all`
+  ON, per repeat):
+
+  ```text
+  streams_opened              == 3
+  streams_closed_completed    == 3
+  streams_closed_cancelled    == 0
+  streams_closed_error        == 0
+  stream_tokens_emitted_total == 24
+  admitted_count              == 2
+  external_admitted_count     == 0
+  reused_seq_id_set           == {0,0}  (multiset; the
+                                          duplicate is the
+                                          multi-cycle evidence)
+  ```
+
+  OFF-mode regression: with `--stream-all` OFF on the
+  canonical Slice 7 admission shape, every stream counter is
+  exactly zero and the admitted-stream handoff vector is
+  empty; fail-closed otherwise. The representative Slice 6
+  regression also passes under the Slice 7 binary, confirming
+  that the Slice 7 validation relaxations are conditional on
+  the multi-cycle shape and do not weaken the previous
+  external + cancel_freed single-cycle path.
+
+  Hard scope of Streaming Slice 7:
+  - **Completion-freed multi-cycle reuse covered.** A single
+    `seq_id` slot can host a three-occupant chain in one
+    engine run.
+  - **Cancel-freed multi-cycle reuse is deferred.**
+  - **External-arrival multi-cycle reuse is deferred.**
+  - No engine-failure `reason=error` stream semantics.
+  - No HTTP / gRPC / Unix-socket / WebSocket streaming.
+  - No backpressure / bounded-channel policy.
+  - No tokenizer / prompt generalization.
+  - No per-request sampling configuration.
+  - **No performance claim.** Streaming Slice 7 is a
+    correctness/lifecycle gate.
+
+  Final emit is `HPX_CB_STREAM_STEP7: PASS` / `FAIL: <reason>`.
+  Closeout evidence is in
+  `tools/hpx-continuous-batch-gate/results.md` under the
+  *Streaming Slice 7 results — multi-cycle slot reuse with
+  streaming* section.
 
 See `docs/hpx/continuous_batching_prototype_design.md` for the
-full slice plan, correctness gates, and out-of-scope list, and
+full slice plan, correctness gates, and out-of-scope list,
 `docs/hpx/continuous_batching_live_admission_design.md` for the
-live-admission-specific design.
+live-admission-specific design,
+`docs/hpx/continuous_batching_streaming_slice1_design.md` for
+the Streaming Slice 1 design,
+`docs/hpx/continuous_batching_streaming_slice2_design.md` for
+the Streaming Slice 2 design,
+`docs/hpx/continuous_batching_streaming_slice3_design.md` for
+the Streaming Slice 3 design,
+`docs/hpx/continuous_batching_streaming_slice4_design.md` for
+the Streaming Slice 4 design,
+`docs/hpx/continuous_batching_streaming_slice5_design.md` for
+the Streaming Slice 5 design,
+`docs/hpx/continuous_batching_streaming_slice6_design.md` for
+the Streaming Slice 6 design, and
+`docs/hpx/continuous_batching_streaming_slice7_design.md` for
+the Streaming Slice 7 design.
 
 ## Why no orchestration pool yet?
 
@@ -888,6 +2139,15 @@ llama-hpx-continuous-batch-gate --model <path> [options]
                             engine fires the release promise.
                             Submitter pushes its K-block then sets
                             the ack; engine drains at top of iter K+1.
+  --stream-all              default: OFF
+                            Streaming Slice 1: enable HPX-native
+                            per-request token streaming via
+                            hpx::lcos::local::channel<token_stream_event>.
+                            Each bound active seq gets an
+                            engine-owned channel; main holds the
+                            matching receive_channel and drains
+                            the chain after engine_fut.get(). OFF
+                            preserves Slice 7 semantics.
 ```
 
 Set `LLAMA_HPX_CB_TRACE=1` to enable HPX runtime startup/shutdown
@@ -898,10 +2158,12 @@ Cancel-Slice-2 events (`cancel_requested`, `cancel_observed`,
 `cancel_kv_cleared`, `cancel_future_fulfilled`), the Live
 Admission Slice 4 events (`request_queued`,
 `request_admitted_live`, `seq_reused`, `admitted_prefilled`,
-`admitted_decode_row`, `admitted_complete`), and the Live
+`admitted_decode_row`, `admitted_complete`), the Live
 Admission Slice 6 events (`request_submitted_external`,
 `arrival_drained`, `iter_release_fired`,
-`submitter_ack_observed`) on stderr.
+`submitter_ack_observed`), and the Streaming Slice 1 events
+(`token_stream_opened`, `token_stream_token`,
+`token_stream_closed`) on stderr.
 
 ### Trace event format
 
@@ -934,12 +2196,16 @@ Examples:
 [hpx-cb-gate] event=arrival_drained request=93 iter=9 budget=64
 [hpx-cb-gate] event=request_queued request=93 budget=64 arrival_source=external
 [hpx-cb-gate] event=request_admitted_live request=93 reused_seq_id=1 iter=17 admission_source=cancel_freed arrival_source=external
+[hpx-cb-gate] event=token_stream_opened request=0 seq_id=0
+[hpx-cb-gate] event=token_stream_token request=0 seq_id=0 pos=0 token=2259
+[hpx-cb-gate] event=token_stream_closed request=0 seq_id=0 n_tokens=8 reason=completed
 ```
 
-`decode_row` and `admitted_decode_row` are high-cardinality (one
-event per row, per decode iter). All trace output is gated on
-`LLAMA_HPX_CB_TRACE=1` and is silent by default; the off-path is
-a single atomic load per call site.
+`decode_row`, `admitted_decode_row`, and `token_stream_token` are
+high-cardinality (one event per row / per emitted token, per
+decode iter). All trace output is gated on `LLAMA_HPX_CB_TRACE=1`
+and is silent by default; the off-path is a single atomic load per
+call site.
 
 ### Metrics block
 
@@ -969,14 +2235,24 @@ Timing-derived fields (`wall_ms`, `ttc_ms`) are not part of the
 
 Current final stdout line:
 
-- `HPX_CB_ADMIT_STEP7: PASS`
+- `HPX_CB_STREAM_STEP7: PASS`
 
   or
 
-- `HPX_CB_ADMIT_STEP7: FAIL: <reason>`
+- `HPX_CB_STREAM_STEP7: FAIL: <reason>`
+
+`HPX_CB_STREAM_STEP7` is the seventh label in the streaming
+gate sequence opened by `HPX_CB_STREAM_STEP1`, layered on top
+of — and not replacing — the closed admission gate sequence at
+`HPX_CB_ADMIT_STEP7: PASS`. Every Slice 1 … Slice 7
+admission/cancellation/lifecycle invariant and every
+Streaming Slice 1 + Streaming Slice 2 + Streaming Slice 3
++ Streaming Slice 4 + Streaming Slice 5 + Streaming Slice 6
+streaming invariant remains a carry-over invariant under
+`HPX_CB_STREAM_STEP7`.
 
 Historical slice labels (kept for reference only — the binary now
-emits the Live Admission Slice 7 label):
+emits the Streaming Slice 7 label):
 
 - `HPX_CB_STEP1` — Slice 1
 - `HPX_CB_STEP2` — Slice 2
@@ -992,7 +2268,24 @@ emits the Live Admission Slice 7 label):
 - `HPX_CB_ADMIT_STEP4` — Live Admission Slice 4
 - `HPX_CB_ADMIT_STEP5` — Live Admission Slice 5
 - `HPX_CB_ADMIT_STEP6` — Live Admission Slice 6
-- `HPX_CB_ADMIT_STEP7` — Live Admission Slice 7 (current)
+- `HPX_CB_ADMIT_STEP7` — Live Admission Slice 7 (closing
+  label of the admission gate sequence)
+- `HPX_CB_STREAM_STEP1` — Streaming Slice 1 (opens the
+  streaming gate sequence)
+- `HPX_CB_STREAM_STEP2` — Streaming Slice 2
+  (cancellation-aware streaming)
+- `HPX_CB_STREAM_STEP3` — Streaming Slice 3
+  (admitted-request streaming over completion-freed slot)
+- `HPX_CB_STREAM_STEP4` — Streaming Slice 4
+  (admitted-request streaming over cancel-freed slot)
+- `HPX_CB_STREAM_STEP5` — Streaming Slice 5
+  (external-arrival admitted streaming over completion-freed
+  slot)
+- `HPX_CB_STREAM_STEP6` — Streaming Slice 6
+  (external-arrival admitted streaming over cancel-freed
+  slot)
+- `HPX_CB_STREAM_STEP7` — Streaming Slice 7 (current;
+  completion-freed multi-cycle slot reuse with streaming)
 
 ## Structural prerequisites
 

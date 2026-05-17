@@ -1751,3 +1751,651 @@ Cancelled and completed requests both resolve through request_result snapshots.
 KV cleanup remains engine-owned and residual KV is empty.
 ```
 
+## 6. hpx-cb-gate: componentize continuous-batch gate after live-admission and streaming closeout
+
+After the cancellation closeout, the next question was no longer whether HPX could wrap one run-to-completion batch. Cancellation had already shown that HPX could own a real serving lifecycle event: a request could leave the active batch early, its future could resolve as `cancelled`, and the engine could clear its KV safely.
+
+The next question became:
+
+```text
+Can the HPX engine continue running while request capacity changes underneath it?
+```
+
+This section records the evidence added after the earlier cancellation package:
+
+```text
+Live admission:
+  waiting requests can enter freed capacity while the engine loop is already running
+
+Streaming:
+  token delivery can be represented as an HPX-native per-request stream
+
+M0 componentization:
+  the proven gate can be split into focused components without changing behavior
+```
+
+This section is still correctness and lifecycle provenance. It is not a performance claim.
+
+---
+
+### 6.1 Live admission changed the gate from static batch to dynamic serving lifecycle
+
+Live admission was originally documented as design-only in Section 5.7.
+
+That design has now been implemented and closed through the live-admission slices.
+
+Question:
+
+```text
+Can an HPX-owned engine admit waiting work into freed seq_id capacity while the decode loop is already running?
+```
+
+Result:
+
+```text
+Yes.
+Live admission passed through the later admission slices and is now part of the continuous-batch gate.
+```
+
+What live admission adds:
+
+```text
+The engine starts with active requests.
+Other requests wait outside the active batch.
+When capacity becomes free, the engine admits waiting requests.
+The admitted request receives a reused seq_id.
+KV for the reused seq_id is cleared before reuse.
+The admitted request receives its own future/promise result.
+The admitted request participates in later decode iterations.
+```
+
+Important serving meaning:
+
+```text
+Cancellation proved that requests can leave.
+Live admission proves that new requests can enter.
+Together, they turn the gate from a fixed batch experiment into a serving-lifecycle prototype.
+```
+
+Admission semantics:
+
+```text
+The engine task remains the only owner of llama.cpp mutable state.
+External submitter code does not call llama_decode or mutate llama_context.
+Admission happens at engine-controlled iteration boundaries.
+Freed slots are reused only after the engine clears KV for the seq_id.
+The waiting/admitted request is tracked through request_result.
+```
+
+Live-admission evidence includes:
+
+```text
+completion-freed reuse
+cancel-freed reuse
+external arrivals
+release/ack synchronization for scripted external arrivals
+multi-source admission accounting
+source-priority validation
+reused seq_id tracking
+residual KV empty checks
+```
+
+Representative external-arrival smoke:
+
+```text
+--stream-all
+--n-seqs 3
+--n-active 2
+--n-waiting 0
+--n-external-arrivals 1
+--decode-budget-mix 8,256
+--external-arrival-budget 16
+--external-release-iter 3
+--reuse-completed
+--cancel-plan none
+--repeat 2
+```
+
+Observed external-arrival anchors:
+
+```text
+arrival_drained_count = 1
+external_admitted_count = 1
+first_external_drain_iter = 4
+iter_release_fired_set = {3}
+submitter_ack_set = {3}
+```
+
+Interpretation:
+
+```text
+The HPX gate now demonstrates dynamic request admission, not just static request execution.
+A request can arrive after the engine has started, wait behind the engine boundary, and enter a reused seq_id slot when capacity becomes available.
+```
+
+---
+
+### 6.2 Streaming slices proved HPX-native token delivery
+
+After live admission, the next serving question was:
+
+```text
+Can HPX deliver tokens incrementally per request while preserving the same final request_result correctness?
+```
+
+Result:
+
+```text
+Yes.
+Streaming closed through HPX_CB_STREAM_STEP7.
+```
+
+Streaming mechanism:
+
+```text
+Each active seq_id has an HPX local channel for token events.
+The engine publishes token events while it owns llama.cpp execution state.
+The consumer drains stream receivers outside the engine task.
+Each stream ends with a closed event.
+The close reason records completed, cancelled, or error.
+```
+
+Streaming event model:
+
+```text
+token_stream_opened
+token_stream_token
+token_stream_closed
+```
+
+Correctness contract:
+
+```text
+The streamed token sequence must match the request_result token sequence.
+The streamed hash must match rr.hash.
+Every opened stream must close.
+Closed streams must report the correct close reason.
+Trace-off mode must emit no event trace lines.
+Trace-on mode must preserve per-event-name counts.
+```
+
+Streaming Slice 7 added the important reuse case:
+
+```text
+A seq_id can complete.
+The engine clears its KV.
+The same seq_id can be reused.
+The newly admitted request gets a new stream.
+The old stream and new stream remain distinguishable by request_id.
+```
+
+Representative Streaming Slice 7 smoke:
+
+```text
+--n-seqs 3
+--n-active 1
+--n-waiting 2
+--waiting-budget 8
+--decode-budget-mix 8
+--reuse-completed
+--cancel-plan none
+--stream-all
+--repeat 2
+```
+
+Representative Streaming Slice 7 anchors:
+
+```text
+HPX_CB_STREAM_STEP7: PASS
+
+streams_opened = 3
+streams_closed_completed = 3
+streams_closed_cancelled = 0
+streams_closed_error = 0
+stream_tokens_emitted_total = 24
+reused_seq_id_set = {0,0}
+```
+
+Trace-on representative anchors:
+
+```text
+token_stream_opened = 6
+token_stream_closed = 6
+token_stream_token = 48
+seq_reused = 4
+request_admitted_live = 4
+engine_start = 2
+engine_stop = 2
+```
+
+Interpretation:
+
+```text
+Streaming proves the gate can represent request progress before final completion.
+This is a serving-control capability, not a llama.cpp execution change.
+The engine still owns llama_decode and KV mutation; HPX owns the lifecycle, futures, and token stream handoff.
+```
+
+---
+
+### 6.3 The gate now demonstrates the intended Project C serving-control boundary
+
+After cancellation, live admission, seq_id reuse, external arrivals, and streaming, the HPX continuous-batch gate demonstrates:
+
+```text
+one llama_context
+many seq_ids
+one shared llama_batch
+one HPX engine task owning llama.cpp mutable state
+per-request futures/promises
+cooperative cancellation
+live admission
+seq_id reuse
+external arrivals
+streaming token delivery
+trace/counter validation
+repeat determinism gates
+residual KV cleanup checks
+```
+
+The boundary remains:
+
+```text
+HPX owns:
+  request lifecycle
+  admission
+  cancellation observation
+  future/promise completion
+  stream handoff
+  trace/counter validation
+
+llama.cpp owns:
+  llama_decode
+  ggml graph execution
+  kernels
+  tokenizer behavior
+  sampler math
+  KV implementation
+```
+
+This is the right Project C boundary.
+
+The gate is not trying to replace llama.cpp execution.
+It is proving that HPX can own the serving-control plane around llama.cpp execution.
+
+---
+
+### 6.4 M0 componentization turned the proven gate into maintainable components
+
+Once the live-admission and streaming slices passed, the main blocker was no longer missing lifecycle behavior.
+
+The blocker became structure.
+
+Before M0:
+
+```text
+tools/hpx-continuous-batch-gate/hpx-continuous-batch-gate.cpp
+was a large monolithic translation unit.
+
+It contained:
+  shared helpers
+  token hash helpers
+  trace helpers
+  POD types
+  CLI parsing
+  HPX runtime startup/shutdown
+  scripted submitter logic
+  engine implementation
+  validation harness
+  metrics printing
+  repeat determinism checks
+  main driver
+```
+
+Question:
+
+```text
+Can the proven HPX continuous-batch gate be split into focused files without changing behavior?
+```
+
+Result:
+
+```text
+Yes.
+M0 componentization completed with no functional behavior change.
+```
+
+M0 produced this component layout:
+
+```text
+tools/hpx-continuous-batch-gate/
+  token_hash.h
+  trace.h
+  trace.cpp
+  gate_emit.h
+  types.h
+  cli.h
+  cli.cpp
+  hpx_runtime.h
+  hpx_runtime.cpp
+  engine.h
+  engine.cpp
+  submitter.h
+  submitter.cpp
+  gate_validation.h
+  gate_validation.cpp
+  hpx-continuous-batch-gate.cpp
+```
+
+What moved:
+
+```text
+token_hash.h:
+  token hash constants and fold_token_hash
+
+trace.h / trace.cpp:
+  trace initialization, trace enablement, trace event emission
+
+gate_emit.h:
+  STEP label
+  emit_pass
+  emit_fail
+
+types.h:
+  request_status
+  admission_source
+  arrival_source
+  stream close/event types
+  token_stream_event
+  channel aliases
+  request_result
+  waiting_request
+  arrival_msg
+  engine_metrics
+  engine_result
+
+cli.h / cli.cpp:
+  cli_args
+  usage printing
+  argument parsing
+
+hpx_runtime.h / hpx_runtime.cpp:
+  HPX runtime start/stop helpers
+  process-wide runtime state
+
+engine.h / engine.cpp:
+  engine_options
+  class engine
+  engine run/submit/result APIs
+  admission/cancellation/streaming internals
+  admit_one private method
+
+submitter.h / submitter.cpp:
+  submitter_release_block
+  run_scripted_submitter
+
+gate_validation.h / gate_validation.cpp:
+  per-repeat validation harness
+  per-result checks
+  stream checks
+  live-admission checks
+  Slice 3/5/6/7 strict gates
+  Slice 7 multi-cycle coverage
+  metrics block
+  residual KV checks
+  repeat determinism checks
+
+hpx-continuous-batch-gate.cpp:
+  thin driver
+```
+
+M0 intentionally did not create a new library target.
+
+```text
+The target name stayed:
+  llama-hpx-continuous-batch-gate
+
+The engine is now in its own files, but still compiled into the same gate target.
+Promoting the engine to a reusable library is later work.
+```
+
+---
+
+### 6.5 M0 preserved the engine ownership model
+
+The most important invariant was preserved:
+
+```text
+Only the HPX engine task touches llama.cpp mutable execution state.
+```
+
+M0 did not change:
+
+```text
+admission behavior
+cancellation behavior
+streaming behavior
+seq_id reuse behavior
+promise/future ownership
+trace names
+trace counts
+CLI behavior
+PASS/FAIL labels
+validation rules
+```
+
+The engine construction was made explicit through `engine_options`:
+
+```text
+engine_options carries:
+  borrowed llama_context / vocab / prompt tokens / waiting queue
+  value-owned budgets
+  value-owned release_iter_set
+  cancel plan
+  batch capacity
+  n_seq_max
+  stream_all
+  reuse_completed
+  max_decode_iters
+```
+
+The engine constructor now takes:
+
+```text
+engine(engine_options opts)
+```
+
+and the driver calls:
+
+```text
+engine eng(std::move(eng_opts));
+```
+
+Value-owned fields are moved into the engine.
+Borrowed fields remain borrowed.
+
+The `admit_one` logic was also lifted out of the decode-loop lambda into a private engine method:
+
+```text
+bool admit_one(int32_t reuse_seq,
+               admission_source src,
+               const char * src_label,
+               int32_t iter,
+               llama_memory_t mem);
+```
+
+This did not change admission semantics.
+It only made the engine implementation more readable and less dependent on a large captured lambda.
+
+---
+
+### 6.6 M0 validation result
+
+Build command:
+
+```text
+cmake --build /Users/unick/Desktop/HPX/builds/llama-hpx-hpx-on \
+  --target llama-hpx-continuous-batch-gate -j
+```
+
+Result:
+
+```text
+Built target llama-hpx-continuous-batch-gate
+```
+
+Six-smoke suite:
+
+```text
+1. Slice 7 multi-cycle streaming
+2. Slice 7 trace-on
+3. Streaming Slice 5 external arrival
+4. Streaming Slice 6 external × cancel-freed
+5. Default-mode regression
+6. Stream-off Live Admission Slice 7
+```
+
+All passed:
+
+```text
+HPX_CB_STREAM_STEP7: PASS
+```
+
+Normalized diff result:
+
+```text
+0 lines of diff for all six smokes
+excluding timing fields:
+  wall_ms
+  ttc_ms_*
+  admitted_ttc_ms[*]
+```
+
+Trace-off result:
+
+```text
+0 [hpx-cb-gate] event= lines
+```
+
+Trace-on result:
+
+```text
+174 events
+per-event-name totals matched the previous baseline
+```
+
+Representative trace-on totals:
+
+```text
+admitted_complete      = 4
+admitted_decode_row    = 28
+admitted_prefilled     = 4
+decode_row             = 42
+engine_start           = 2
+engine_stop            = 2
+kv_cleared             = 6
+promise_fulfilled      = 6
+request_admitted       = 2
+request_admitted_live  = 4
+request_queued         = 2
+seq_complete           = 6
+seq_prefilled          = 2
+seq_reused             = 4
+token_stream_closed    = 6
+token_stream_opened    = 6
+token_stream_token     = 48
+```
+
+Final source shape:
+
+```text
+hpx-continuous-batch-gate.cpp      692 lines
+engine.cpp / engine.h              1372 / 244 lines
+gate_validation.cpp / .h           2915 / 57 lines
+cli.cpp / cli.h                    287 / 83 lines
+submitter.cpp / submitter.h        61 / 37 lines
+hpx_runtime.cpp / hpx_runtime.h    86 / 24 lines
+trace.cpp / trace.h                41 / 25 lines
+types.h                            370 lines
+token_hash.h                       35 lines
+gate_emit.h                        25 lines
+```
+
+Interpretation:
+
+```text
+M0 did not prove a new serving feature.
+It made the already-proven serving-control gate maintainable.
+
+The gate is now structurally ready for the next milestones:
+  per-request prompts
+  per-request sampling pass-through
+  public engine API
+  HTTP/server adapter
+  matched comparison against llama-server
+```
+
+---
+
+### 6.7 Overall conclusion
+
+This section closes the provenance gap after the earlier cancellation package.
+
+What was added after the old Section 5.7 design-only point:
+
+```text
+Live admission is now implemented.
+Waiting requests can enter freed capacity.
+External arrivals are represented.
+Completion-freed and cancel-freed reuse paths are validated.
+Streaming token delivery is implemented with HPX local channels.
+Streams are opened, drained, hashed, and closed with checked close reasons.
+Slice 7 validates multi-cycle seq_id reuse with streaming.
+M0 splits the gate into maintainable components with no behavior change.
+```
+
+What this proves:
+
+```text
+The HPX continuous-batch gate is now a serving-control-plane prototype.
+
+It can:
+  complete requests
+  cancel requests
+  admit new requests
+  reuse seq_ids
+  stream tokens
+  preserve KV safety
+  preserve deterministic validation
+  keep llama.cpp execution inside the engine task
+```
+
+What this does not claim:
+
+```text
+No performance advantage is claimed here.
+No HTTP serving API exists yet.
+No per-request prompt/sampling API exists yet.
+No comparison against llama-server is claimed yet.
+No distributed or multi-engine orchestration is claimed yet.
+```
+
+Next natural milestone:
+
+```text
+M1:
+  per-request prompts
+  per-request sampling pass-through
+  request-shaped submit API inside the gate
+
+M2:
+  promote the engine into a reusable library target
+
+M3:
+  build the HPX serving binary
+
+M4:
+  compare hpx-server against llama-server under matched conditions
+```
+
+---

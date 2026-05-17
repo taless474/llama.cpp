@@ -1,5 +1,12 @@
 set(TARGET llama-hpx-continuous-batch-gate)
-add_executable(${TARGET} hpx-continuous-batch-gate.cpp)
+add_executable(${TARGET}
+    hpx-continuous-batch-gate.cpp
+    cli.cpp
+    engine.cpp
+    gate_validation.cpp
+    hpx_runtime.cpp
+    submitter.cpp
+    trace.cpp)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 target_link_libraries(${TARGET}
     PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
