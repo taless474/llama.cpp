@@ -50,8 +50,18 @@ engine::engine(engine_options opts)
       prompt_tokens_(*opts.prompt_tokens),
       budgets_(std::move(opts.budgets)),
       batch_capacity_(opts.batch_capacity),
-      promises_(budgets_.size()),
-      seqs_(budgets_.size()),
+      // M2f: promises_ and seqs_ are sized to the total slot population
+      // (initial actives + idle pool). With initial_idle_slots == 0 the
+      // sum collapses to budgets_.size(), matching the pre-M2f layout
+      // byte-for-byte. Slots in [budgets_.size(), seqs_.size()) are
+      // never bound to initial actives; admit_one rebinds them when
+      // the admission step consumes from free_idle_.
+      promises_(budgets_.size()
+                + static_cast<size_t>(std::max<int32_t>(
+                    opts.initial_idle_slots, 0))),
+      seqs_(budgets_.size()
+            + static_cast<size_t>(std::max<int32_t>(
+                opts.initial_idle_slots, 0))),
       n_seq_max_(opts.n_seq_max),
       waiting_queue_(opts.waiting_queue),
       reuse_completed_(opts.reuse_completed),
@@ -75,6 +85,15 @@ engine::engine(engine_options opts)
         throw std::invalid_argument(
             "engine_options::waiting_queue must be non-null");
     }
+    if (opts.initial_idle_slots < 0) {
+        throw std::invalid_argument(
+            "engine_options::initial_idle_slots must be >= 0");
+    }
+    if (static_cast<size_t>(opts.n_seq_max) < seqs_.size()) {
+        throw std::invalid_argument(
+            "engine_options::n_seq_max must be >= "
+            "budgets.size() + initial_idle_slots");
+    }
     // Live Admission Slice 6: pre-allocate release/ack vectors so
     // engine::register_external_release_iter(K) can take a slot
     // before any HPX task is spawned. Vectors are sized to cover
@@ -95,11 +114,50 @@ engine::engine(engine_options opts)
         seqs_[s].decode_budget = budgets_[s];
         seqs_[s].generated_tokens.reserve(
             static_cast<size_t>(budgets_[s]));
+        // M1b: populate the per-seq owned prompt vector for each
+        // initial active seq from the existing shared prompt source.
+        // The initial-prefill loop in run_body() reads from this
+        // owned copy instead of the shared prompt_tokens_ borrow.
+        // M1c added the symmetric path for waiters/external arrivals
+        // — admit_one moves the bound waiter's prompt vector into
+        // the slot's seq_state::prompt_tokens, and the admitted-
+        // prefill loop now reads it. M1d adds the per-active-prompt
+        // override: when main supplied per_active_prompt_tokens
+        // (file mode), seed each initial seq from the matching
+        // file-tokenized vector. Otherwise fall back to the shared
+        // prompt_tokens_ borrow exactly as M1b/M1c did. The shared
+        // borrow is still retained so the no-file path remains
+        // byte-identical.
+        if (opts.per_active_prompt_tokens != nullptr
+         && opts.per_active_prompt_tokens->size() >= budgets_.size()) {
+            seqs_[s].prompt_tokens =
+                (*opts.per_active_prompt_tokens)[s];
+        } else {
+            seqs_[s].prompt_tokens = prompt_tokens_;
+        }
+    }
+    // M2f: initialize the idle slots ([budgets_.size(), seqs_.size()))
+    // to clean "available, never bound" state. seq_id is the slot
+    // index; done=true so the prefill / decode_row / cancel-observe
+    // / any_active() loops skip the slot; decode_budget=0 and
+    // request_id=-1 are sentinels until admit_one rebinds them.
+    // free_idle_ is seeded here in ctor and re-seeded in run_body's
+    // per-repeat reset so the pool starts fresh on every run().
+    for (size_t s = budgets_.size(); s < seqs_.size(); s++) {
+        seqs_[s].seq_id        = static_cast<int32_t>(s);
+        seqs_[s].request_id    = -1;
+        seqs_[s].decode_budget = 0;
+        seqs_[s].done          = true;
+        free_idle_.push_back(static_cast<int32_t>(s));
     }
     // Cancel Slice 2: propagate the deterministic plan into
     // seq_state. Out-of-range seq_ids are silently skipped here
     // because main has already validated the plan against
     // [0, n_seqs) and printed the per-seq budget assertion.
+    // M2f: idle slots can technically appear in the plan (cs in
+    // [budgets_.size(), seqs_.size())) but are inert because
+    // cancel_should_observe short-circuits on seq.done=true, and
+    // admit_one resets cancel_after_decoded_tokens=-1 at rebind.
     for (int32_t cs : opts.cancel_plan) {
         if (cs >= 0 && static_cast<size_t>(cs) < seqs_.size()) {
             seqs_[static_cast<size_t>(cs)]
@@ -114,9 +172,17 @@ engine::engine(engine_options opts)
     // engine publishes events through the channel during the run.
     // Engine is reconstructed per repeat, so this fires once per
     // repeat naturally.
+    // M2g: iterate budgets_.size() rather than seqs_.size() so initial
+    // idle slots are excluded from the bulk receiver vector. With
+    // initial_idle_slots == 0 (every existing gate run) this collapses
+    // to seqs_.size() and stream_receivers_ remains byte-identical;
+    // with idle slots present, the bulk path is for initial actives
+    // only, and an admitted-into-idle request opting into streaming
+    // via submit_request(want_stream=true) gets its caller-supplied
+    // channel installed by admit_one instead.
     if (stream_all_) {
-        stream_receivers_.reserve(seqs_.size());
-        for (size_t s = 0; s < seqs_.size(); s++) {
+        stream_receivers_.reserve(budgets_.size());
+        for (size_t s = 0; s < budgets_.size(); s++) {
             seqs_[s].stream_enabled = true;
             seqs_[s].stream_channel = token_stream_channel{};
             stream_receivers_.emplace_back(
@@ -167,6 +233,56 @@ void engine::submit(arrival_msg msg) {
         rid, bud);
 }
 
+// M2f: read-only inbox-non-empty probe used by the decode-loop
+// predicate. Acquires the existing inbox spinlock the same way
+// submit() does, then peeks deque::empty(). Engine task only. No
+// llama.cpp API call sites — pure HPX-side metadata access.
+// Non-const intentionally: hpx::spinlock is not a const-mutex type
+// (lock_guard requires a non-const mutex ref), and inbox_mtx_ is
+// declared without `mutable`. Marking inbox_mtx_ mutable was avoided
+// per M2f guidance.
+bool engine::inbox_has_pending() {
+    std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
+    return !inbox_.empty();
+}
+
+submit_handle engine::submit_request(struct submit_request req) {
+    // Create the engine-side promise; the matching future is moved
+    // into the returned handle so the caller owns it directly.
+    hpx::promise<request_result> promise;
+    hpx::future<request_result>  fut = promise.get_future();
+
+    // Build the engine-internal arrival_msg. All llama-touching work
+    // happens later inside the engine task; this method only moves
+    // POD/owned data onto the inbox via the existing submit() path.
+    arrival_msg msg;
+    msg.request_id    = req.request_id;
+    msg.decode_budget = req.decode_budget;
+    msg.prompt_tokens = std::move(req.prompt_tokens);
+    msg.src           = arrival_source::external;
+    msg.promise       = std::move(promise);
+    msg.want_stream   = req.want_stream;
+
+    submit_handle h;
+    h.result = std::move(fut);
+    h.stream = std::nullopt;
+    // M2g: per-request opt-in streaming. Build the HPX channel on the
+    // caller's side, hand the receiver to the caller via
+    // submit_handle.stream, and move the channel into arrival_msg.
+    // drain_external_inbox will stash it in external_stream_channels_
+    // keyed by request_id, and admit_one will move it into the bound
+    // slot's seq_state::stream_channel. No llama.cpp API call sites
+    // here — channel construction is pure HPX-side wiring.
+    if (req.want_stream) {
+        token_stream_channel  chan;
+        token_stream_receiver rx(chan);
+        msg.stream_channel.emplace(std::move(chan));
+        h.stream.emplace(std::move(rx));
+    }
+    submit(std::move(msg));
+    return h;
+}
+
 external_release_handle engine::register_external_release_iter(int32_t K) {
     if (K < 0 || static_cast<size_t>(K) >= iter_release_promises_.size()) {
         throw std::runtime_error(
@@ -215,6 +331,34 @@ void engine::run() {
         if (seqs_[s].stream_closed)   continue;
         close_stream(seqs_[s], stream_close_reason::error);
     }
+    // M2g: close any per-request stream channels submitted via
+    // submit_request(want_stream=true) that the engine never bound to
+    // a slot (e.g., engine bailed before admission, or admission
+    // failed). The caller is holding the matching receiver via
+    // submit_handle.stream and would otherwise hang on .get(). Set a
+    // closed{reason=error} event then close the channel; bump
+    // streams_closed_error so the counter reflects orphan closures
+    // symmetrically with the bound-but-unfinished path above.
+    for (auto & kv : external_stream_channels_) {
+        try {
+            kv.second.set(token_stream_event{
+                stream_event_kind::closed, 0,
+                stream_close_reason::error});
+        } catch (...) {
+            // Already closed; fall through to close().
+        }
+        try {
+            kv.second.close();
+        } catch (...) {
+            // Already closed.
+        }
+        result_.streams_closed_error++;
+        trace::event(
+            "token_stream_closed request=%d seq_id=-1 "
+            "n_tokens=0 reason=error",
+            kv.first);
+    }
+    external_stream_channels_.clear();
     // Live Admission Slice 6: similarly drain any pre-registered
     // release promises that were not fired (engine bailed before
     // reaching iter K). Without this, the submitter task would
@@ -521,11 +665,23 @@ void engine::drain_external_inbox(int32_t iter) {
         const int32_t rid = msg.request_id;
         const int32_t bud = msg.decode_budget;
         external_promises_.emplace(rid, std::move(msg.promise));
+        // M2g: stash any caller-supplied stream channel for this
+        // request. admit_one's external branch checks the map at
+        // bind time and moves the channel into the slot. Always
+        // engine-task-only — no synchronization needed.
+        if (msg.stream_channel.has_value()) {
+            external_stream_channels_.emplace(
+                rid, std::move(*msg.stream_channel));
+        }
         waiting_request w;
         w.request_id    = rid;
         w.decode_budget = bud;
         w.src           = arrival_source::external;
-        waiting_queue_consumable_.push_back(w);
+        // M1c: preserve the per-arrival prompt by moving it onto
+        // the new waiting_request. admit_one will move it again
+        // into the bound slot's seq_state::prompt_tokens.
+        w.prompt_tokens = std::move(msg.prompt_tokens);
+        waiting_queue_consumable_.push_back(std::move(w));
         result_.arrival_drained_count++;
         if (result_.first_external_drain_iter == -1) {
             result_.first_external_drain_iter = iter;
@@ -565,8 +721,10 @@ bool engine::admit_one(int32_t              reuse_seq,
         return false;
     }
 
-    const waiting_request w =
-        waiting_queue_consumable_.front();
+    // M1c: move the waiter out so its prompt_tokens vector can be
+    // moved into the bound slot below without an extra copy.
+    waiting_request w =
+        std::move(waiting_queue_consumable_.front());
     waiting_queue_consumable_.pop_front();
 
     seq_state & rseq =
@@ -602,6 +760,12 @@ bool engine::admit_one(int32_t              reuse_seq,
     rseq.promise_fulfilled      = false;
     rseq.hash_state             = k_token_hash_init;
     rseq.generated_tokens.clear();
+    // M1c: hand the waiter's per-request prompt vector to the
+    // engine's per-seq slot. The admitted-prefill loop in
+    // run_body() now reads this owned copy. In M1c every waiter's
+    // prompt is still a copy of the shared prompt source, so the
+    // resulting prefill rows are byte-identical to M1b / M0.
+    rseq.prompt_tokens          = std::move(w.prompt_tokens);
     rseq.cancel_observed             = false;
     rseq.cancel_observed_iter        = -1;
     rseq.n_decoded_at_cancel         = -1;
@@ -632,6 +796,29 @@ bool engine::admit_one(int32_t              reuse_seq,
             std::move(it->second);
         external_promises_.erase(it);
         result_.external_admitted_count++;
+        // M2g: caller-supplied stream channel takes precedence over
+        // the gate's `stream_all_` admitted-handoff path. When the
+        // caller submitted with want_stream=true, the receiver is
+        // already on the caller's side via submit_handle.stream; the
+        // engine moves the matching channel into the slot here and
+        // skips pushing onto admitted_stream_handoffs_ (which is the
+        // gate's bulk-collection mechanism, not a public API). The
+        // engine's existing publish_token / close_stream paths drive
+        // the channel from here exactly like the stream_all_ path.
+        // No mutex — external_stream_channels_ is engine-task-only.
+        auto it_stream =
+            external_stream_channels_.find(w.request_id);
+        if (it_stream != external_stream_channels_.end()) {
+            rseq.stream_channel        = std::move(it_stream->second);
+            rseq.stream_enabled        = true;
+            rseq.stream_closed         = false;
+            rseq.stream_tokens_emitted = 0;
+            result_.streams_opened++;
+            trace::event(
+                "token_stream_opened request=%d seq_id=%d",
+                w.request_id, reuse_seq);
+            external_stream_channels_.erase(it_stream);
+        }
         // Streaming Slice 5 / Slice 6: rebind the slot's
         // stream channel for this externally-arriving
         // admitted request when --stream-all is on AND the
@@ -653,7 +840,12 @@ bool engine::admit_one(int32_t              reuse_seq,
         // primitive, no new CLI flag. The lock guards
         // engine→main result-handoff metadata only; it
         // does NOT guard llama.cpp execution state.
-        if (stream_all_
+        // M2g: only fall into the gate's admitted-handoff path when
+        // no caller-supplied channel was installed above. With every
+        // existing gate smoke (`want_stream=false`), the new
+        // short-circuit is silent and this block fires identically
+        // to pre-M2g.
+        else if (stream_all_
             && (src == admission_source::completion_freed
              || src == admission_source::cancel_freed)) {
             std::lock_guard<std::mutex> lk(
@@ -784,6 +976,21 @@ void engine::run_body() {
     // cleared between repeats so the residual count is per-run.
     free_due_to_cancel_.clear();
     free_due_to_completion_.clear();
+    // M2f: re-seed the idle-slot pool per run. Idle slots also have
+    // their dynamic state reset below (done=true, decode_budget=0,
+    // request_id=-1, prompt_tokens cleared) so a slot returning to
+    // idle between repeats starts the next run as a fresh idle slot.
+    free_idle_.clear();
+    for (size_t s = budgets_.size(); s < seqs_.size(); s++) {
+        free_idle_.push_back(static_cast<int32_t>(s));
+    }
+    // M2g: defensively clear any leftover per-request stream channels
+    // from a prior repeat. With `--repeat 1` this is a no-op; with
+    // `--repeat N` and a submission that never got admitted in repeat
+    // r, the engine cleanup at the end of repeat r already closed and
+    // dropped the channel, so the map is empty at this point. Clear
+    // is the safe invariant either way.
+    external_stream_channels_.clear();
     waiting_queue_consumable_.assign(
         waiting_queue_->begin(), waiting_queue_->end());
     {
@@ -813,21 +1020,26 @@ void engine::run_body() {
     // the original active value, so a slot that was admitted on a
     // prior repeat starts the next repeat as its original active
     // request again.
+    // M2f: idle slots (s >= budgets_.size()) reset to the "available,
+    // never bound" state: done=true so the prefill / decode_row /
+    // cancel-observe / any_active() loops skip them; decode_budget=0
+    // and request_id=-1 as sentinels until admit_one rebinds them.
+    // prompt_tokens is cleared so a slot that was admitted in a prior
+    // repeat returns to a fresh-idle vector instead of carrying the
+    // prior occupant's tokens. With initial_idle_slots == 0 the loop
+    // never enters the else branch and behavior is byte-identical.
     for (size_t s = 0; s < seqs_.size(); s++) {
         seq_state & seq = seqs_[s];
         seq.n_decoded         = 0;
         seq.pos_next          = 0;
         seq.i_batch           = -1;
         seq.last_token        = 0;
-        seq.done              = false;
         seq.done_iter         = -1;
         seq.pos_max_at_clear  = -1;
         seq.kv_cleared        = false;
         seq.promise_fulfilled = false;
         seq.hash_state        = k_token_hash_init;
         seq.generated_tokens.clear();
-        seq.decode_budget        = budgets_[s];
-        seq.request_id           = static_cast<int32_t>(s);
         seq.admitted_at_iter     = -1;
         seq.previous_request_id  = -1;
         seq.admission_src        = admission_source::none;
@@ -839,6 +1051,16 @@ void engine::run_body() {
         seq.cancel_observed_iter = -1;
         seq.n_decoded_at_cancel  = -1;
         seq.cancel_requested.store(false, std::memory_order_release);
+        if (s < budgets_.size()) {
+            seq.done          = false;
+            seq.decode_budget = budgets_[s];
+            seq.request_id    = static_cast<int32_t>(s);
+        } else {
+            seq.done          = true;
+            seq.decode_budget = 0;
+            seq.request_id    = -1;
+            seq.prompt_tokens.clear();
+        }
     }
 
     t_start_ = std::chrono::steady_clock::now();
@@ -879,64 +1101,81 @@ void engine::run_body() {
     common_batch_clear(batch);
     for (int32_t s = 0; s < n_seqs; s++) {
         seq_state & seq = seqs_[s];
-        for (int32_t p = 0; p < n_prompt; p++) {
-            const bool last = (p == n_prompt - 1);
-            common_batch_add(batch, prompt_tokens_[p], /*pos=*/p,
+        // M1b: initial prefill reads the per-seq owned prompt vector
+        // populated by the engine ctor. In M1b every initial seq's
+        // seq.prompt_tokens is a copy of the same shared prompt
+        // source, so prompt.size() equals the outer n_prompt and the
+        // emitted rows / pos / logits selection are byte-identical to
+        // the M1a / M0 path. M1c will diverge when waiters/external
+        // arrivals carry their own prompt vectors.
+        const auto &  prompt       = seq.prompt_tokens;
+        const int32_t n_seq_prompt =
+            static_cast<int32_t>(prompt.size());
+        for (int32_t p = 0; p < n_seq_prompt; p++) {
+            const bool last = (p == n_seq_prompt - 1);
+            common_batch_add(batch, prompt[p], /*pos=*/p,
                              /*seq_ids=*/{seq.seq_id}, /*logits=*/last);
             if (last) {
                 seq.i_batch = batch.n_tokens - 1;
             }
         }
-        seq.pos_next = n_prompt;
+        seq.pos_next = n_seq_prompt;
     }
 
-    result_.metrics.rows_per_batch.push_back(batch.n_tokens);
-    result_.decode_calls++;
-    result_.metrics.decode_calls = result_.decode_calls;
-    if (llama_decode(ctx_, batch) != 0) {
-        result_.decode_failures++;
-        result_.error = "llama_decode failed during prefill";
-        llama_batch_free(batch);
-        finalize_wall_ms();
-        return;
-    }
-    llama_synchronize(ctx_);
-
-    const int32_t prefill_iter = 0;
-    for (int32_t s = 0; s < n_seqs; s++) {
-        seq_state & seq = seqs_[s];
-        const float * logits = llama_get_logits_ith(ctx_, seq.i_batch);
-        if (logits == nullptr) {
-            result_.error = "llama_get_logits_ith returned null after prefill";
+    // M2f: with zero initial actives (budgets_.empty()), the prefill
+    // batch above adds no rows. Skip the prefill llama_decode +
+    // post-prefill argmax pass entirely so an empty llama_batch is
+    // never submitted. With at least one initial active, batch.n_tokens
+    // is strictly > 0 and the body runs byte-identically to pre-M2f.
+    if (batch.n_tokens > 0) {
+        result_.metrics.rows_per_batch.push_back(batch.n_tokens);
+        result_.decode_calls++;
+        result_.metrics.decode_calls = result_.decode_calls;
+        if (llama_decode(ctx_, batch) != 0) {
+            result_.decode_failures++;
+            result_.error = "llama_decode failed during prefill";
             llama_batch_free(batch);
             finalize_wall_ms();
             return;
         }
-        const llama_token next_id = argmax(logits, n_vocab_);
-        trace::event("seq_prefilled seq=%d first_token=%d",
-                     seq.seq_id, static_cast<int>(next_id));
-        if (llama_vocab_is_eog(vocab_, next_id)) {
-            if (!finalize_and_fulfill(seq, prefill_iter, mem)) {
+        llama_synchronize(ctx_);
+
+        const int32_t prefill_iter = 0;
+        for (int32_t s = 0; s < n_seqs; s++) {
+            seq_state & seq = seqs_[s];
+            const float * logits = llama_get_logits_ith(ctx_, seq.i_batch);
+            if (logits == nullptr) {
+                result_.error = "llama_get_logits_ith returned null after prefill";
                 llama_batch_free(batch);
                 finalize_wall_ms();
                 return;
             }
-            continue;
-        }
-        // Streaming Slice 8: publish the same int32 fed to the hash
-        // BEFORE n_decoded mutates, so streamed-hash == rr.hash and
-        // stream_tokens_emitted == rr.n_decoded hold by construction.
-        publish_token(seq, static_cast<int32_t>(next_id));
-        seq.generated_tokens.push_back(next_id);
-        seq.hash_state = fold_token_hash(seq.hash_state,
-                                         static_cast<int32_t>(next_id));
-        seq.n_decoded++;
-        seq.last_token = next_id;
-        if (seq.n_decoded >= seq.decode_budget) {
-            if (!finalize_and_fulfill(seq, prefill_iter, mem)) {
-                llama_batch_free(batch);
-                finalize_wall_ms();
-                return;
+            const llama_token next_id = argmax(logits, n_vocab_);
+            trace::event("seq_prefilled seq=%d first_token=%d",
+                         seq.seq_id, static_cast<int>(next_id));
+            if (llama_vocab_is_eog(vocab_, next_id)) {
+                if (!finalize_and_fulfill(seq, prefill_iter, mem)) {
+                    llama_batch_free(batch);
+                    finalize_wall_ms();
+                    return;
+                }
+                continue;
+            }
+            // Streaming Slice 8: publish the same int32 fed to the hash
+            // BEFORE n_decoded mutates, so streamed-hash == rr.hash and
+            // stream_tokens_emitted == rr.n_decoded hold by construction.
+            publish_token(seq, static_cast<int32_t>(next_id));
+            seq.generated_tokens.push_back(next_id);
+            seq.hash_state = fold_token_hash(seq.hash_state,
+                                             static_cast<int32_t>(next_id));
+            seq.n_decoded++;
+            seq.last_token = next_id;
+            if (seq.n_decoded >= seq.decode_budget) {
+                if (!finalize_and_fulfill(seq, prefill_iter, mem)) {
+                    llama_batch_free(batch);
+                    finalize_wall_ms();
+                    return;
+                }
             }
         }
     }
@@ -966,8 +1205,20 @@ void engine::run_body() {
     }
 
     // ---- Decode loop (one row per still-active seq per iter) -------
+    // M2f: predicate widened to also peek the async inbox so the loop
+    // can enter / re-enter even when there are no active seqs yet and
+    // no waiters have been drained. inbox_has_pending() acquires the
+    // existing inbox_mtx_ and reads inbox_.empty(); no llama.cpp API
+    // call sites. With the gate's existing smokes (initial_idle_slots=0
+    // and inbox empty outside the release-barrier window), the new
+    // term flips only during the one-iter drain window where
+    // any_active() is already true, so the predicate is behaviorally
+    // identical and the gate's smoke output remains byte-for-byte the
+    // same.
     int32_t iter = 0;
-    while (any_active() || !waiting_queue_consumable_.empty()) {
+    while (any_active()
+        || !waiting_queue_consumable_.empty()
+        || inbox_has_pending()) {
         iter++;
 
         // Live Admission Slice 6: drain the async-arrival inbox at
@@ -995,7 +1246,12 @@ void engine::run_body() {
         // seq.done=true via clear_and_check, so the active_idx
         // loop below skips it naturally. This makes
         // wasted_decode_rows_after_cancel structurally 0.
-        for (int32_t s = 0; s < n_seqs; s++) {
+        // M2f: iterate over the full slot set so admitted-into-idle
+        // slots are reachable here too. Idle slots that have not
+        // been admitted carry done=true and short-circuit on the
+        // `if (seq.done) continue` line, so behavior is identical
+        // when initial_idle_slots == 0.
+        for (size_t s = 0; s < seqs_.size(); s++) {
             seq_state & seq = seqs_[s];
             if (seq.done) continue;
             if (cancel_should_observe(seq)) {
@@ -1064,6 +1320,30 @@ void engine::run_body() {
             }
         }
 
+        // M2f: drain free_idle_ AFTER cancel-freed and completion-freed
+        // so the existing source priority for the gate's smokes is
+        // preserved. No --reuse-completed gate: idle slots have no
+        // prior occupant to demand-pair against. With
+        // initial_idle_slots == 0 (every existing gate run), free_idle_
+        // is empty and this loop is a no-op, so no new
+        // `admission_source=initial_idle` trace event ever fires on
+        // the seven canonical gate smokes.
+        while (!free_idle_.empty()
+            && !waiting_queue_consumable_.empty()) {
+            const int32_t reuse_seq = free_idle_.front();
+            free_idle_.pop_front();
+
+            if (!admit_one(reuse_seq,
+                           admission_source::initial_idle,
+                           "initial_idle", iter, mem)) {
+                llama_batch_free(batch);
+                result_.metrics.update_iterations = iter;
+                finalize_wall_ms();
+                return;
+            }
+            admitted_this_iter++;
+        }
+
         // Live Admission Slice 4: record this iter in
         // admission_iter_set (one push per iter that admitted at
         // least one waiting request). Then sample the queue depth
@@ -1087,8 +1367,13 @@ void engine::run_body() {
 
         common_batch_clear(batch);
         std::vector<int32_t> active_idx;
-        active_idx.reserve(static_cast<size_t>(n_seqs));
-        for (int32_t s = 0; s < n_seqs; s++) {
+        // M2f: walk the full slot set so admitted-into-idle slots get
+        // picked up for prefill/decode. Initial active loops at engine
+        // start (request_admitted trace, prefill batch build) still use
+        // n_seqs = budgets_.size() because those events only describe
+        // the preloaded initial population.
+        active_idx.reserve(seqs_.size());
+        for (size_t s = 0; s < seqs_.size(); s++) {
             seq_state & seq = seqs_[s];
             if (seq.done) continue;
             // Live Admission Slice 3: a freshly admitted seq has
@@ -1099,9 +1384,20 @@ void engine::run_body() {
             // first token via the same path as a normal
             // post-prefill argmax, after which n_decoded == 1.
             if (seq.admitted_at_iter == iter && seq.n_decoded == 0) {
-                for (int32_t p = 0; p < n_prompt; p++) {
-                    const bool last = (p == n_prompt - 1);
-                    common_batch_add(batch, prompt_tokens_[p],
+                // M1c: admitted prefill reads the per-seq owned
+                // prompt vector that admit_one moved in from the
+                // waiter. In M1c every waiter's prompt is still a
+                // copy of the shared prompt source, so prompt.size()
+                // equals the outer n_prompt and the emitted rows /
+                // pos / logits selection are byte-identical to the
+                // M1b path. M1d+ will diverge when CLI flags allow
+                // per-request prompts.
+                const auto &  prompt       = seq.prompt_tokens;
+                const int32_t n_seq_prompt =
+                    static_cast<int32_t>(prompt.size());
+                for (int32_t p = 0; p < n_seq_prompt; p++) {
+                    const bool last = (p == n_seq_prompt - 1);
+                    common_batch_add(batch, prompt[p],
                                      /*pos=*/p,
                                      /*seq_ids=*/{seq.seq_id},
                                      /*logits=*/last);
@@ -1109,8 +1405,8 @@ void engine::run_body() {
                         seq.i_batch = batch.n_tokens - 1;
                     }
                 }
-                seq.pos_next = n_prompt;
-                active_idx.push_back(s);
+                seq.pos_next = n_seq_prompt;
+                active_idx.push_back(static_cast<int32_t>(s));
                 // No decode_row trace for prefill rows; Slice 4
                 // owns admitted-prefill trace events.
             } else {
@@ -1120,7 +1416,7 @@ void engine::run_body() {
                                  /*logits=*/true);
                 seq.i_batch = batch.n_tokens - 1;
                 seq.pos_next++;
-                active_idx.push_back(s);
+                active_idx.push_back(static_cast<int32_t>(s));
                 trace::event("decode_row iter=%d seq=%d pos=%d",
                              iter, seq.seq_id, seq.pos_next - 1);
                 // Live Admission Slice 4: fine-grained event for

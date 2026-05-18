@@ -76,6 +76,18 @@ struct cli_args {
     // OFF (default) preserves Slice 7 semantics; engine never allocates
     // stream promises and emits no token_stream_* events / counters.
     bool                 stream_all              = false;
+
+    // M1d: optional per-request prompt source. When non-empty, the
+    // file must contain exactly
+    //     n_active + n_waiting + n_external_arrivals
+    // lines, one prompt per line, with line i corresponding to
+    // request_id i. Each line is tokenized with the same
+    // common_tokenize(add_special=true, parse_special=true) call
+    // currently used for --prompt. When empty (default), the legacy
+    // shared-prompt path (--prompt) is unchanged and every request
+    // receives a copy of the same tokenized vector, byte-identical
+    // to M1c.
+    std::string          request_prompts_file;
 };
 
 void print_usage(const char * argv0);

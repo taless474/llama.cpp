@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,12 +48,15 @@ inline const char * status_name(request_status s) noexcept {
 // `none` is the default for every result. `cancel_freed` marks an admitted
 // request that reused a slot popped from the engine's free_due_to_cancel
 // queue. `completion_freed` (Slice 5) marks a slot popped from
-// free_due_to_completion. Slice 1 only ever sets `none`; Slice 3
-// introduces `cancel_freed`; Slice 5 introduces `completion_freed`.
+// free_due_to_completion. `initial_idle` (M2f) marks a slot popped from
+// the engine's startup idle pool — never-bound seq_ids reserved at engine
+// construction so submit_request can be admitted without any prior
+// active completion or cancellation.
 enum class admission_source : uint8_t {
     none             = 0,
     cancel_freed     = 1,
     completion_freed = 2,
+    initial_idle     = 3,
 };
 
 inline const char * admission_source_name(admission_source s) noexcept {
@@ -60,6 +64,7 @@ inline const char * admission_source_name(admission_source s) noexcept {
         case admission_source::none:             return "none";
         case admission_source::cancel_freed:     return "cancel_freed";
         case admission_source::completion_freed: return "completion_freed";
+        case admission_source::initial_idle:     return "initial_idle";
     }
     return "unknown";
 }
@@ -231,6 +236,19 @@ struct seq_state {
     int32_t                  stream_tokens_emitted        = 0;
     token_stream_channel     stream_channel;
 
+    // ---- M1a per-request prompt data model (not exercised) ------------
+    // Per-seq owned prompt token vector. Engine code in M1a does NOT
+    // read or write this field — the existing shared-prompt path
+    // (engine_options::prompt_tokens consumed by both the initial
+    // prefill and admitted-prefill loops) is unchanged. The field is
+    // intentionally left default-empty across the entire run, including
+    // across --repeat iterations and admission-rebinds, so the engine
+    // is behavior-identical to M0. M1b will populate this from the
+    // existing shared prompt at engine construction time and switch the
+    // initial-prefill loop to read it; M1c will move per-waiter prompt
+    // vectors in at admit_one time and drop the shared-prompt borrow.
+    std::vector<llama_token> prompt_tokens;
+
     uint64_t finalize_hash() const noexcept {
         return (n_decoded == 0) ? token_hash::k_token_hash_empty : hash_state;
     }
@@ -242,9 +260,18 @@ struct seq_state {
 // arrival_msg (external path). Slice 6: `src` records which path; the
 // admission step uses it to decide promise ownership at bind time.
 struct waiting_request {
-    int32_t        request_id    = -1;
-    int32_t        decode_budget = 0;
-    arrival_source src           = arrival_source::preloaded;
+    int32_t                  request_id    = -1;
+    int32_t                  decode_budget = 0;
+    arrival_source           src           = arrival_source::preloaded;
+    // M1c: per-waiter owned prompt vector. Populated by main for
+    // preloaded waiters, or moved out of arrival_msg by
+    // drain_external_inbox for external arrivals. admit_one moves
+    // this into the bound slot's seq_state::prompt_tokens at the
+    // admission boundary, after which the admitted-prefill loop in
+    // run_body() reads the per-seq vector. In M1c every waiter's
+    // prompt is still a copy of the shared prompt source, so the
+    // admitted-prefill batch is byte-identical to M1b / M0.
+    std::vector<llama_token> prompt_tokens;
 };
 
 // ---- Async external arrival (Live Admission Slice 6) -------------------
@@ -259,6 +286,53 @@ struct arrival_msg {
     int32_t                      decode_budget = 0;
     hpx::promise<request_result> promise;
     arrival_source               src           = arrival_source::external;
+    // M1c: per-arrival owned prompt vector. Populated by the
+    // scripted submitter task from the matching scripted_arrival
+    // before eng.submit(). drain_external_inbox() moves it into
+    // the new waiting_request and pushes it onto the consumable
+    // waiting queue; admit_one then moves it into the bound
+    // slot's seq_state::prompt_tokens.
+    std::vector<llama_token>     prompt_tokens;
+    // M2g: per-arrival opt-in streaming. `want_stream` is the bool the
+    // caller set on `submit_request`; `stream_channel` carries the
+    // engine-bound half of an HPX local channel constructed inside
+    // `engine::submit_request` when `want_stream` is true. The receiver
+    // half is returned to the caller via `submit_handle.stream` and the
+    // channel is moved through `drain_external_inbox` into the engine's
+    // private `external_stream_channels_` map keyed by request_id, then
+    // moved a final time into the bound slot at `admit_one`.
+    bool                                want_stream    = false;
+    std::optional<token_stream_channel> stream_channel;
+};
+
+// ---- Public submit API (M2b) -------------------------------------------
+// `submit_request` is the public counterpart to the engine-internal
+// `arrival_msg`. Clients fill in the four fields below and call
+// `engine::submit_request(...)` to enqueue work; the engine constructs
+// the matching `arrival_msg` (with src=external and a fresh
+// hpx::promise) and routes through the existing inbox/spinlock path.
+// `arrival_source` is intentionally NOT exposed — runtime submissions
+// always become arrival_source::external internally. Sampling
+// configuration is intentionally NOT included; a later stage adds it.
+struct submit_request {
+    int32_t                  request_id    = -1;
+    std::vector<llama_token> prompt_tokens;
+    int32_t                  decode_budget = 0;
+    bool                     want_stream   = false;
+};
+
+// `submit_handle` is the move-only result handle returned by
+// `engine::submit_request(...)`. `result` is the per-request future
+// (HPX-native, never std::future); awaiting it yields the same
+// `request_result` snapshot the legacy path produces. `stream` is
+// `std::nullopt` in M2b — stream support is deferred to M2c, where
+// the engine's admit_one branch can be wired at the same time as the
+// gate's submitter migration. Passing want_stream=true today causes
+// `submit_request(...)` to throw with an explicit "not yet
+// implemented" message so callers cannot silently miss the receiver.
+struct submit_handle {
+    hpx::future<request_result>          result;
+    std::optional<token_stream_receiver> stream;
 };
 
 // ---- Pre-run release/ack handle (Live Admission Slice 6) ---------------
@@ -277,9 +351,13 @@ struct external_release_handle {
 // arrivals sharing the same release_iter are pushed in script order
 // under a single release+ack barrier.
 struct scripted_arrival {
-    int32_t request_id    = -1;
-    int32_t decode_budget = 0;
-    int32_t release_iter  = -1;
+    int32_t                  request_id    = -1;
+    int32_t                  decode_budget = 0;
+    int32_t                  release_iter  = -1;
+    // M1c: per-arrival owned prompt vector populated by main from
+    // the existing shared prompt source. The submitter task moves
+    // it into the matching arrival_msg before calling eng.submit().
+    std::vector<llama_token> prompt_tokens;
 };
 
 // ---- Engine metrics -----------------------------------------------------

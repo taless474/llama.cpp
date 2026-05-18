@@ -68,6 +68,25 @@ struct engine_options {
     std::set<int32_t>                     release_iter_set;
     int32_t                               max_decode_iters = 0;
     bool                                  stream_all       = false;
+    // M1d: optional per-active-seq prompt vectors. When non-null and
+    // sized >= budgets.size(), the engine ctor seeds each initial
+    // seq's prompt_tokens from the matching entry instead of from
+    // the shared prompt_tokens_ borrow. When null (default), the M1b
+    // shared-prompt seeding path is used and behavior matches M1c
+    // byte-for-byte. Borrowed pointer — main must keep the pointee
+    // alive for the engine's lifetime.
+    const std::vector<std::vector<llama_token>> *
+                                          per_active_prompt_tokens = nullptr;
+    // M2f: count of additional seq slots reserved at engine startup as
+    // an idle pool. Slots have ids
+    // [budgets.size(), budgets.size() + initial_idle_slots) and start
+    // done=true / decode_budget=0 / request_id=-1. They are consumed by
+    // the admission step from `free_idle_` after cancel-freed and
+    // completion-freed sources, allowing submit_request to be admitted
+    // without any prior active completion or cancellation. Default 0
+    // preserves existing behavior byte-for-byte. The engine ctor
+    // requires `n_seq_max >= budgets.size() + initial_idle_slots`.
+    int32_t                               initial_idle_slots = 0;
 };
 
 class engine {
@@ -115,6 +134,20 @@ public:
     // Hard rule: this body must not call any llama_* API. The grep
     // gate in main asserts that.
     void submit(arrival_msg msg);
+
+    // M2b: public submit API. Converts the public submit_request into
+    // the engine-internal arrival_msg (with src=external and a fresh
+    // engine-owned hpx::promise) and routes through the existing
+    // submit(arrival_msg) inbox path. Returns a move-only handle
+    // carrying the per-request HPX future; submit_handle.stream is
+    // std::nullopt in M2b (req.want_stream=true throws — stream
+    // wiring is deferred to M2c, where it can be added alongside the
+    // gate's scripted-submitter migration). Safe to call from any
+    // HPX task. Hard rule: this body must not call any llama_* API.
+    // `struct submit_request` is an elaborated type specifier; it
+    // disambiguates the parameter type from the enclosing member
+    // function name (both spell `submit_request`).
+    submit_handle submit_request(struct submit_request req);
 
     // Live Admission Slice 6: pre-run registration of a release+ack
     // barrier at decode iter K. Must be called once per watched K
@@ -164,6 +197,11 @@ private:
                    int32_t              iter,
                    llama_memory_t       mem);
 
+    // M2f: non-const because it acquires `inbox_mtx_` (the existing
+    // engine-internal spinlock). Engine task only. Pure metadata
+    // probe — no llama.cpp API call sites in the body.
+    bool inbox_has_pending();
+
     void run_body();
 
     void finalize_wall_ms();
@@ -201,6 +239,14 @@ private:
     // primary source when both are present.
     bool                             reuse_completed_ = false;
     std::deque<int32_t>              free_due_to_completion_;
+    // M2f: initial-idle slot reuse queue. Populated in the ctor (and
+    // re-seeded in run_body's per-repeat reset) with the seq_ids of
+    // every idle slot allocated via engine_options::initial_idle_slots.
+    // Drained by the admission step AFTER free_due_to_cancel_ and
+    // free_due_to_completion_, with no demand gate — idle slots have no
+    // prior occupant to demand-pair against. Empty when
+    // initial_idle_slots == 0, so existing gate runs are inert.
+    std::deque<int32_t>              free_idle_;
     // Live Admission Slice 3: per-admission promise/future pairs created
     // inside the engine task. Main drains this after engine_fut.get()
     // returns; by that point every entry's promise is fulfilled, so a
@@ -231,6 +277,16 @@ private:
     hpx::spinlock                                   inbox_mtx_;
     std::deque<arrival_msg>                                      inbox_;
     std::unordered_map<int32_t, hpx::promise<request_result>>    external_promises_;
+    // M2g: engine-task-only stash of per-request stream channels
+    // submitted via `submit_request(want_stream=true)`. Populated in
+    // `drain_external_inbox` (moves the channel out of `arrival_msg`)
+    // and consumed in `admit_one`'s external branch (moves the channel
+    // into the bound `seq_state`). No mutex — every reader/writer
+    // lives on the single engine task. Defensively cleared in
+    // `run_body`'s per-repeat reset; the `run()` cleanup tail closes
+    // any leftover channels with reason=error so the caller's receiver
+    // cannot hang if the engine bails before admission.
+    std::unordered_map<int32_t, token_stream_channel>            external_stream_channels_;
     std::vector<hpx::promise<void>>                              iter_release_promises_;
     std::vector<hpx::future<void>>                               submitter_ack_futures_;
     std::set<int32_t>                                            iter_release_set_;

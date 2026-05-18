@@ -104,7 +104,15 @@ void print_usage(const char * argv0) {
         "                            active seq gets a shared_future head\n"
         "                            published by the engine task; main\n"
         "                            drains the chain after engine_fut.\n"
-        "                            OFF preserves Slice 7 semantics.\n",
+        "                            OFF preserves Slice 7 semantics.\n"
+        "  --request-prompts-file <path>   default: <unset>\n"
+        "                            M1d: per-request prompt source.\n"
+        "                            One prompt per line. Line i is the\n"
+        "                            prompt for request_id i. Required\n"
+        "                            line count is n_active + n_waiting\n"
+        "                            + n_external_arrivals. When unset,\n"
+        "                            the legacy --prompt path is\n"
+        "                            byte-identical to M1c.\n",
         argv0);
 }
 
@@ -233,6 +241,10 @@ bool parse_args(int argc, char ** argv, cli_args & args) {
         } else if (a == "--stream-all") {
             // Slice 8 boolean flag, no value.
             args.stream_all = true;
+        } else if (a == "--request-prompts-file") {
+            const char * v = need("--request-prompts-file");
+            if (!v) return false;
+            args.request_prompts_file = v;
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return false;

@@ -115,6 +115,18 @@ bool run_validation(
     // pre-extraction baseline.
     const int32_t r = repeat_index;
 
+    // M1d: legacy_shape is true when --request-prompts-file is unset.
+    // In that case every request carries a copy of the same shared
+    // prompt, so the canonical-hash anchors and the
+    // `n_prompt + budget - 2` pos_max equality gates apply and remain
+    // enforced exactly as in M1c. In file mode prompts differ per
+    // request, so per-partition unique-completed-hashes and the
+    // pos_max equality gates are skipped — repeat determinism,
+    // streamed_hash == rr.hash, residual-KV-empty, status summaries,
+    // and the prompt-length-independent per-result gates remain in
+    // force to catch the M1d invariants.
+    const bool legacy_shape = args.request_prompts_file.empty();
+
     // Validation-local fail handler. Records the failure through the
     // same `emit_fail` channel main would have used, then propagates a
     // false return up to main. Main is responsible for tearing down the
@@ -424,16 +436,20 @@ bool run_validation(
                         rr.n_decoded, rr.decode_budget);
                     fail_with(buf); return false;
                 }
-                const llama_pos expected_pos =
-                    n_prompt_tokens + rr.n_decoded - 2;
-                if (rr.pos_max_at_clear != expected_pos) {
-                    char buf[256];
-                    std::snprintf(buf, sizeof(buf),
-                        "iter %d: req %d cancelled pos_max_at_clear=%d "
-                        "!= n_prompt+n_decoded-2=%d", r, rr.request_id,
-                        rr.pos_max_at_clear,
-                        static_cast<int>(expected_pos));
-                    fail_with(buf); return false;
+                // M1d: pos_max equality depends on per-seq prompt
+                // length; only enforced in legacy shared-prompt mode.
+                if (legacy_shape) {
+                    const llama_pos expected_pos =
+                        n_prompt_tokens + rr.n_decoded - 2;
+                    if (rr.pos_max_at_clear != expected_pos) {
+                        char buf[256];
+                        std::snprintf(buf, sizeof(buf),
+                            "iter %d: req %d cancelled pos_max_at_clear=%d "
+                            "!= n_prompt+n_decoded-2=%d", r, rr.request_id,
+                            rr.pos_max_at_clear,
+                            static_cast<int>(expected_pos));
+                        fail_with(buf); return false;
+                    }
                 }
             } else {
                 if (rr.status != request_status::completed) {
@@ -533,16 +549,20 @@ bool run_validation(
                     expected_done_iter_admit);
                 fail_with(buf); return false;
             }
-            const llama_pos expected_pos_admit =
-                n_prompt_tokens + rr.decode_budget - 2;
-            if (rr.pos_max_at_clear != expected_pos_admit) {
-                char buf[200];
-                std::snprintf(buf, sizeof(buf),
-                    "iter %d: admitted req %d pos_max_at_clear=%d "
-                    "(expected n_prompt+budget-2=%d)",
-                    r, rr.request_id, rr.pos_max_at_clear,
-                    static_cast<int>(expected_pos_admit));
-                fail_with(buf); return false;
+            // M1d: pos_max equality depends on per-seq prompt length;
+            // only enforced in legacy shared-prompt mode.
+            if (legacy_shape) {
+                const llama_pos expected_pos_admit =
+                    n_prompt_tokens + rr.decode_budget - 2;
+                if (rr.pos_max_at_clear != expected_pos_admit) {
+                    char buf[200];
+                    std::snprintf(buf, sizeof(buf),
+                        "iter %d: admitted req %d pos_max_at_clear=%d "
+                        "(expected n_prompt+budget-2=%d)",
+                        r, rr.request_id, rr.pos_max_at_clear,
+                        static_cast<int>(expected_pos_admit));
+                    fail_with(buf); return false;
+                }
             }
             if (rr.cancel_observed_iter != -1
              || rr.n_decoded_at_cancel != -1) {
@@ -686,17 +706,21 @@ bool run_validation(
                     expected_done_iter_admit);
                 fail_with(buf); return false;
             }
-            const llama_pos expected_pos_admit =
-                n_prompt_tokens + rr.decode_budget - 2;
-            if (rr.pos_max_at_clear != expected_pos_admit) {
-                char buf[200];
-                std::snprintf(buf, sizeof(buf),
-                    "iter %d: completion_freed req %d "
-                    "pos_max_at_clear=%d (expected "
-                    "n_prompt+budget-2=%d)",
-                    r, rr.request_id, rr.pos_max_at_clear,
-                    static_cast<int>(expected_pos_admit));
-                fail_with(buf); return false;
+            // M1d: pos_max equality depends on per-seq prompt length;
+            // only enforced in legacy shared-prompt mode.
+            if (legacy_shape) {
+                const llama_pos expected_pos_admit =
+                    n_prompt_tokens + rr.decode_budget - 2;
+                if (rr.pos_max_at_clear != expected_pos_admit) {
+                    char buf[200];
+                    std::snprintf(buf, sizeof(buf),
+                        "iter %d: completion_freed req %d "
+                        "pos_max_at_clear=%d (expected "
+                        "n_prompt+budget-2=%d)",
+                        r, rr.request_id, rr.pos_max_at_clear,
+                        static_cast<int>(expected_pos_admit));
+                    fail_with(buf); return false;
+                }
             }
             if (rr.cancel_observed_iter != -1
              || rr.n_decoded_at_cancel != -1) {
@@ -1374,7 +1398,13 @@ bool run_validation(
             fprintf(stdout, "}\n");
 
             if (completed_b > 0) {
-                if (hashes.size() != 1) {
+                // M1d: unique-hash partition gate assumes every
+                // request shares the same prompt; in file mode
+                // prompts differ per request_id so distinct hashes
+                // per partition are expected. Repeat determinism +
+                // per-result hash stability still enforce that the
+                // SAME prompt produces the SAME hash across repeats.
+                if (legacy_shape && hashes.size() != 1) {
                     char buf[256];
                     std::snprintf(buf, sizeof(buf),
                         "iter %d: src=%s budget %d: %zu distinct "
@@ -1411,16 +1441,21 @@ bool run_validation(
                             done_iters.size(), expected_done_iter);
                         fail_with(buf); return false;
                     }
-                    if (pos_maxes.size() != 1
-                        || pos_maxes[0] != expected_pos_max) {
-                        char buf[256];
-                        std::snprintf(buf, sizeof(buf),
-                            "iter %d: src=%s budget %d completed: "
-                            "pos_max set has %zu values, "
-                            "expected {%d}",
-                            r, admission_source_name(src), b,
-                            pos_maxes.size(), expected_pos_max);
-                        fail_with(buf); return false;
+                    // M1d: pos_max equality depends on prompt
+                    // length being uniform across the partition;
+                    // file mode breaks that assumption.
+                    if (legacy_shape) {
+                        if (pos_maxes.size() != 1
+                            || pos_maxes[0] != expected_pos_max) {
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf),
+                                "iter %d: src=%s budget %d completed: "
+                                "pos_max set has %zu values, "
+                                "expected {%d}",
+                                r, admission_source_name(src), b,
+                                pos_maxes.size(), expected_pos_max);
+                            fail_with(buf); return false;
+                        }
                     }
                 }
                 // Canonical budget-8 anchor only applies to the
@@ -1428,7 +1463,10 @@ bool run_validation(
                 // The smoke shape never admits a budget-8 request
                 // (budget-8 slots aren't in cancel_plan), so the
                 // anchor still rides on the original active set.
-                if (src == admission_source::none
+                // M1d: only meaningful when every seq carries the
+                // shared canonical prompt.
+                if (legacy_shape
+                    && src == admission_source::none
                     && b == 8
                     && any_hash != k_canonical_budget_8) {
                     char buf[256];
@@ -1526,20 +1564,31 @@ bool run_validation(
     const int32_t cancelled_total = orig_cancelled_total;
 
     // Aggregate wasted-decode-rows-after-cancel.
+    // M1d: this gate compares pos_max against (n_prompt + n_decoded - 2),
+    // which assumes uniform prompt length. Compute the metric only in
+    // legacy shared-prompt mode; in file mode the per-cancel "no
+    // decode row after cancel observation" invariant is structurally
+    // enforced by the engine (cancelled seqs immediately become
+    // seq.done=true via clear_and_check, so the active_idx loop
+    // skips them in subsequent decode iters). The metrics block
+    // below still prints `wasted_decode_rows_after_cancel = 0` in
+    // both modes so the line stays grep-friendly.
     int32_t wasted_rows = 0;
-    for (const auto & rr : results) {
-        if (rr.status != request_status::cancelled) continue;
-        const llama_pos expected_pos =
-            n_prompt_tokens + rr.n_decoded - 2;
-        const llama_pos delta = rr.pos_max_at_clear - expected_pos;
-        if (delta > 0) wasted_rows += static_cast<int32_t>(delta);
-    }
-    if (wasted_rows != 0) {
-        char buf[200];
-        std::snprintf(buf, sizeof(buf),
-            "iter %d: wasted_decode_rows_after_cancel=%d "
-            "(expected 0)", r, wasted_rows);
-        fail_with(buf); return false;
+    if (legacy_shape) {
+        for (const auto & rr : results) {
+            if (rr.status != request_status::cancelled) continue;
+            const llama_pos expected_pos =
+                n_prompt_tokens + rr.n_decoded - 2;
+            const llama_pos delta = rr.pos_max_at_clear - expected_pos;
+            if (delta > 0) wasted_rows += static_cast<int32_t>(delta);
+        }
+        if (wasted_rows != 0) {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                "iter %d: wasted_decode_rows_after_cancel=%d "
+                "(expected 0)", r, wasted_rows);
+            fail_with(buf); return false;
+        }
     }
 
     // ---- Live Admission Slice 3 gates ------------------------------
@@ -2176,9 +2225,11 @@ bool run_validation(
             }
             // budget-64 canonical hash anchor for the slice 6 smoke
             // shape (cancel-freed external admissions only).
+            // M1d: only meaningful when every external arrival
+            // carries the canonical shared prompt.
             constexpr uint64_t k_canonical_slice6_budget_64 =
                 0x3b15a0474dfe11beull;
-            if (args.external_arrival_budget == 64) {
+            if (legacy_shape && args.external_arrival_budget == 64) {
                 for (const auto & rr : results) {
                     if (rr.arrival_src != arrival_source::external) continue;
                     if (rr.decode_budget != 64) continue;

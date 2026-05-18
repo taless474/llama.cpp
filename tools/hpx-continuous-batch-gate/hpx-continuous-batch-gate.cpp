@@ -138,6 +138,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -257,7 +258,13 @@ int main(int argc, char ** argv) {
         w.request_id    = args.n_active + i;
         w.decode_budget = args.waiting_budget;
         w.src           = arrival_source::preloaded;
-        waiting_queue.push_back(w);
+        // M1c: copy the existing shared prompt into each preloaded
+        // waiter. The engine moves this vector into the bound slot's
+        // seq_state::prompt_tokens at admission time, after which
+        // the admitted-prefill loop reads it. Same prompt source as
+        // M1b / M0 → batch is byte-identical.
+        w.prompt_tokens = prompt_tokens;
+        waiting_queue.push_back(std::move(w));
         // Live Admission Slice 6: tag the preloaded path explicitly so
         // grep on `arrival_source=` exhaustively partitions queued
         // requests across preloaded and external sources.
@@ -307,6 +314,103 @@ int main(int argc, char ** argv) {
         cleanup_llama(ctx, model);
         hpx_runtime::stop();
     };
+
+    // ---- M1d: optional per-request prompt source ----------------------
+    // When --request-prompts-file is unset, per_request_prompts stays
+    // empty, max_prompt_tokens == n_prompt_tokens, every downstream
+    // path falls back to the shared args.prompt tokenization, and the
+    // run is byte-identical to M1c.
+    //
+    // When set, the file must contain exactly
+    //     n_active + n_waiting + n_external_arrivals
+    // lines, one prompt per line. Line i is the prompt for request_id
+    // i. Each line is tokenized with the same common_tokenize call
+    // used for args.prompt. max_prompt_tokens is taken across all
+    // per-request prompts and used to size batch_capacity and the
+    // context-fit gates below; the engine still binds prompt_tokens_
+    // to the args.prompt tokenization (legacy borrow) but in file
+    // mode no seq actually reads it — initial actives are seeded
+    // from per_active_prompts (passed via engine_options) and
+    // waiters/external arrivals carry their per-request prompt
+    // directly. Sampling is still greedy/argmax everywhere; M1e
+    // will add a sampling_config field.
+    std::vector<std::vector<llama_token>> per_request_prompts;
+    int32_t       max_prompt_tokens  = n_prompt_tokens;
+    const bool    prompt_file_mode   = !args.request_prompts_file.empty();
+    const int32_t expected_prompt_lines =
+        args.n_active + args.n_waiting + args.n_external_arrivals;
+    if (prompt_file_mode) {
+        std::ifstream in(args.request_prompts_file);
+        if (!in.is_open()) {
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                "request-prompts-file: cannot open '%s'",
+                args.request_prompts_file.c_str());
+            fail_with(buf); return 1;
+        }
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) {
+            lines.push_back(std::move(line));
+        }
+        if (static_cast<int32_t>(lines.size()) != expected_prompt_lines) {
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                "request-prompts-file: expected %d lines "
+                "(n_active=%d + n_waiting=%d + n_external_arrivals=%d), "
+                "got %zu",
+                expected_prompt_lines, args.n_active,
+                args.n_waiting, args.n_external_arrivals,
+                lines.size());
+            fail_with(buf); return 1;
+        }
+        per_request_prompts.reserve(
+            static_cast<size_t>(expected_prompt_lines));
+        max_prompt_tokens = 0;
+        for (int32_t i = 0; i < expected_prompt_lines; i++) {
+            std::vector<llama_token> toks = common_tokenize(
+                ctx, lines[static_cast<size_t>(i)],
+                /*add_special=*/true, /*parse_special=*/true);
+            if (toks.empty()) {
+                char buf[512];
+                std::snprintf(buf, sizeof(buf),
+                    "request-prompts-file: line %d tokenized to 0 tokens",
+                    i);
+                fail_with(buf); return 1;
+            }
+            const int32_t len = static_cast<int32_t>(toks.size());
+            if (len > max_prompt_tokens) max_prompt_tokens = len;
+            per_request_prompts.push_back(std::move(toks));
+        }
+        fprintf(stdout,
+                "request_prompts_file: %s "
+                "(lines=%d max_prompt_tokens=%d)\n",
+                args.request_prompts_file.c_str(),
+                expected_prompt_lines, max_prompt_tokens);
+        fflush(stdout);
+        // Overwrite the preloaded waiter prompts (built earlier from
+        // the shared prompt) with their per-request file prompts.
+        // Waiters occupy request_ids [n_active, n_active + n_waiting).
+        for (int32_t i = 0; i < args.n_waiting; i++) {
+            waiting_queue[static_cast<size_t>(i)].prompt_tokens =
+                per_request_prompts[
+                    static_cast<size_t>(args.n_active + i)];
+        }
+    }
+
+    // Per-active prompts vector for the engine ctor. Empty (and
+    // unused) in no-file mode; populated from the first n_active
+    // entries of per_request_prompts in file mode. Pointer is
+    // passed via engine_options; engine ctor falls back to the
+    // shared prompt_tokens_ borrow when the pointer is null.
+    std::vector<std::vector<llama_token>> per_active_prompts;
+    if (prompt_file_mode) {
+        per_active_prompts.reserve(static_cast<size_t>(args.n_active));
+        for (int32_t i = 0; i < args.n_active; i++) {
+            per_active_prompts.push_back(
+                per_request_prompts[static_cast<size_t>(i)]);
+        }
+    }
 
     // ---- Cancellation plan (Cancel Slice 4: closeout — no new
     //      behavior, polished metrics/reporting). ----------------------
@@ -361,32 +465,37 @@ int main(int argc, char ** argv) {
             actual_n_seq_max, args.n_seq_max);
         fail_with(buf); return 1;
     }
-    if (actual_n_ctx < static_cast<uint32_t>(n_prompt_tokens + 256)) {
+    // M1d: context-fit and batch-capacity gates use max_prompt_tokens
+    // (the maximum prompt length across all per-request prompts in
+    // file mode, or n_prompt_tokens when no file is supplied). In
+    // no-file mode max_prompt_tokens == n_prompt_tokens, so the
+    // gate values and batch_capacity are byte-identical to M1c.
+    if (actual_n_ctx < static_cast<uint32_t>(max_prompt_tokens + 256)) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
             "actual n_ctx %u < prompt_tokens %d + 256",
-            actual_n_ctx, n_prompt_tokens);
+            actual_n_ctx, max_prompt_tokens);
         fail_with(buf); return 1;
     }
     if (actual_n_batch <
-        static_cast<uint32_t>(args.n_seqs * n_prompt_tokens)) {
+        static_cast<uint32_t>(args.n_seqs * max_prompt_tokens)) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
             "actual n_batch %u < n_seqs %d * prompt_tokens %d",
-            actual_n_batch, args.n_seqs, n_prompt_tokens);
+            actual_n_batch, args.n_seqs, max_prompt_tokens);
         fail_with(buf); return 1;
     }
     if (actual_n_ctx <
-        static_cast<uint32_t>(n_prompt_tokens + max_budget)) {
+        static_cast<uint32_t>(max_prompt_tokens + max_budget)) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
             "actual n_ctx %u < prompt_tokens %d + max_budget %d",
-            actual_n_ctx, n_prompt_tokens, max_budget);
+            actual_n_ctx, max_prompt_tokens, max_budget);
         fail_with(buf); return 1;
     }
 
     const int32_t batch_capacity =
-        std::max<int32_t>(args.n_seqs * n_prompt_tokens, args.n_seqs);
+        std::max<int32_t>(args.n_seqs * max_prompt_tokens, args.n_seqs);
 
     // Stage 6 (M0 extraction): cross-repeat snapshot state for the
     // validation harness. Constructed once and threaded through every
@@ -428,6 +537,13 @@ int main(int argc, char ** argv) {
         eng_opts.release_iter_set = release_iter_set;
         eng_opts.max_decode_iters = max_decode_iters_for_ctor;
         eng_opts.stream_all       = args.stream_all;
+        // M1d: in file mode, point the engine ctor at the per-active
+        // prompt vector so initial seqs are seeded from their own
+        // file-tokenized prompts. In no-file mode (pointer left
+        // nullptr), the ctor falls back to the shared prompt_tokens_
+        // borrow exactly as M1b/M1c did.
+        eng_opts.per_active_prompt_tokens =
+            prompt_file_mode ? &per_active_prompts : nullptr;
         engine eng(std::move(eng_opts));
 
         // Live Admission Slice 6: build scripted arrivals + per-arrival
@@ -446,17 +562,31 @@ int main(int argc, char ** argv) {
                 sa.request_id    = args.n_active + args.n_waiting + i;
                 sa.decode_budget = args.external_arrival_budget;
                 sa.release_iter  = args.external_release_iter;
-                scripted_arrivals.push_back(sa);
+                // M1c: copy the existing shared prompt into each
+                // scripted external arrival. M1d: in file mode,
+                // use the per-request file prompt instead (indexed
+                // by request_id). The submitter task moves the
+                // chosen vector into the matching arrival_msg
+                // before eng.submit().
+                if (prompt_file_mode) {
+                    sa.prompt_tokens = per_request_prompts[
+                        static_cast<size_t>(sa.request_id)];
+                } else {
+                    sa.prompt_tokens = prompt_tokens;
+                }
+                scripted_arrivals.push_back(std::move(sa));
             }
-            std::vector<hpx::promise<request_result>>
-                per_arrival_promises(scripted_arrivals.size());
+            // M2c: pre-reserve external_futs so the submitter task
+            // can push_back into it without reallocating. The vector
+            // is populated inside the submitter task via
+            // engine::submit_request().result; main reads it after
+            // submitter_fut.get() joins, so no mutex is needed.
             external_futs.reserve(scripted_arrivals.size());
-            for (auto & p : per_arrival_promises) {
-                external_futs.emplace_back(p.get_future());
-            }
             // Group by release_iter (set is sorted; single entry in the
             // smoke shape). For each K, register a release handle with
-            // the engine and pack matching script entries + promises.
+            // the engine and pack matching script entries; per-arrival
+            // promises are no longer pre-created here — the engine
+            // owns them inside submit_request().
             for (int32_t K : release_iter_set) {
                 submitter_release_block blk;
                 blk.release_iter = K;
@@ -471,8 +601,6 @@ int main(int argc, char ** argv) {
                 for (size_t i = 0; i < scripted_arrivals.size(); i++) {
                     if (scripted_arrivals[i].release_iter != K) continue;
                     blk.arrivals.push_back(scripted_arrivals[i]);
-                    blk.promises.push_back(
-                        std::move(per_arrival_promises[i]));
                 }
                 blocks.push_back(std::move(blk));
             }
@@ -495,9 +623,15 @@ int main(int argc, char ** argv) {
         // reaches end of iter K. No-op when blocks is empty.
         hpx::future<void> submitter_fut;
         if (!blocks.empty()) {
+            // M2c: capture &external_futs by reference so the
+            // submitter task can push each submit_request handle's
+            // result future as it submits. external_futs.reserve()
+            // above bounds capacity so push_back never reallocates.
             submitter_fut = hpx::async(
-                [&eng, blks = std::move(blocks)]() mutable {
-                    run_scripted_submitter(eng, std::move(blks));
+                [&eng, &external_futs,
+                 blks = std::move(blocks)]() mutable {
+                    run_scripted_submitter(
+                        eng, std::move(blks), external_futs);
                 });
         }
 
