@@ -522,27 +522,30 @@ int main(int argc, char ** argv) {
         }
 
         // One engine instance per iteration (own promises/futures set).
+        // M4e: engine_options is now nested into lib / preload /
+        // gate_test sub-structs. The gate driver writes into all three
+        // because it exercises preloaded actives + scripted barriers.
         engine_options eng_opts;
-        eng_opts.ctx              = ctx;
-        eng_opts.vocab            = vocab;
-        eng_opts.n_vocab          = n_vocab;
-        eng_opts.prompt_tokens    = &prompt_tokens;
-        eng_opts.budgets          = budgets;
-        eng_opts.batch_capacity   = batch_capacity;
-        eng_opts.cancel_plan      = args.cancel_plan;
-        eng_opts.cancel_after     = args.cancel_after;
-        eng_opts.n_seq_max        = args.n_seqs;
-        eng_opts.waiting_queue    = &waiting_queue;
-        eng_opts.reuse_completed  = args.reuse_completed;
-        eng_opts.release_iter_set = release_iter_set;
-        eng_opts.max_decode_iters = max_decode_iters_for_ctor;
-        eng_opts.stream_all       = args.stream_all;
+        eng_opts.lib.ctx                  = ctx;
+        eng_opts.lib.vocab                = vocab;
+        eng_opts.lib.n_vocab              = n_vocab;
+        eng_opts.lib.batch_capacity       = batch_capacity;
+        eng_opts.lib.n_seq_max            = args.n_seqs;
+        eng_opts.preload.prompt_tokens    = &prompt_tokens;
+        eng_opts.preload.budgets          = budgets;
+        eng_opts.preload.waiting_queue    = &waiting_queue;
+        eng_opts.preload.reuse_completed  = args.reuse_completed;
+        eng_opts.preload.stream_all       = args.stream_all;
+        eng_opts.gate_test.cancel_plan      = args.cancel_plan;
+        eng_opts.gate_test.cancel_after     = args.cancel_after;
+        eng_opts.gate_test.release_iter_set = release_iter_set;
+        eng_opts.gate_test.max_decode_iters = max_decode_iters_for_ctor;
         // M1d: in file mode, point the engine ctor at the per-active
         // prompt vector so initial seqs are seeded from their own
         // file-tokenized prompts. In no-file mode (pointer left
         // nullptr), the ctor falls back to the shared prompt_tokens_
         // borrow exactly as M1b/M1c did.
-        eng_opts.per_active_prompt_tokens =
+        eng_opts.preload.per_active_prompt_tokens =
             prompt_file_mode ? &per_active_prompts : nullptr;
         engine eng(std::move(eng_opts));
 

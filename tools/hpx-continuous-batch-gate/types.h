@@ -18,6 +18,16 @@
 #include "token_hash.h"
 
 #include "llama.h"
+// M6b: pulled in for `llama_sampler_ptr`, the std::unique_ptr alias
+// with the correct llama_sampler_free deleter. The header is C++-only
+// and itself includes <memory> plus llama.h, so adding it here is the
+// minimal-surface way to give `seq_state` an owning sampler chain
+// handle without forcing every TU that includes types.h to manage
+// raw llama_sampler* lifetimes. The handle is engine-task-owned; no
+// other TU touches it (mutating sampler state would violate the
+// "engine task is the sole owner of llama.cpp mutable execution
+// state" invariant).
+#include "llama-cpp.h"
 
 #include <hpx/hpx.hpp>
 #include <hpx/lcos_local/channel.hpp>
@@ -27,6 +37,17 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+// ---- Forward declarations ----------------------------------------------
+// M5b: `submit_handle::cancel(engine &)` is a thin forwarder onto
+// `engine::cancel_request(const cancel_token &)`. The forwarder body
+// lives in engine.cpp, where the full `engine` definition is in scope;
+// only this forward declaration is needed in the header to declare the
+// member. Keeping types.h independent of the full engine definition
+// preserves the existing layering — types.h is included by engine.h,
+// the gate driver, smokes, and library consumers, none of which should
+// be forced to see the engine class definition just to use submit_handle.
+class engine;
 
 // ---- Request lifecycle status (Cancel Slice 1: data model only) --------
 enum class request_status : uint8_t {
@@ -87,6 +108,79 @@ inline const char * arrival_source_name(arrival_source s) noexcept {
         case arrival_source::external:  return "external";
     }
     return "unknown";
+}
+
+// ---- Per-request sampling configuration (M6a: data model only) ---------
+// Carried alongside `prompt_tokens` / `decode_budget` from public
+// `submit_request` through `arrival_msg`, `waiting_request`, and finally
+// into `seq_state`. M6a is plumbing-only: every sampling site in
+// `engine.cpp` (post-prefill argmax and per-iter decode argmax) still
+// reads logits via `llama_get_logits_ith` and selects the next token
+// through the local `argmax(logits, n_vocab_)` helper. The field is
+// carried so M6b can branch on `seq_state::sampling.mode` without
+// re-touching the plumbing surface.
+//
+// Greedy default (`sampling_mode::greedy`, all other fields irrelevant
+// for the greedy branch) keeps the existing argmax path bit-identical,
+// which is required to preserve the M3a/M4/M5 canonical hashes (e.g.
+// budget-8: 0x0619d4d1900c2365). Stochastic mode is wired in M6b via a
+// per-seq `llama_sampler_ptr`; in M6a, a stochastic-looking config is
+// carried but ignored, so a stochastic submission still produces the
+// greedy canonical hash. The carry smoke asserts both branches in M6a
+// and the M6b smoke flips the stochastic assertion to "differs from
+// greedy".
+enum class sampling_mode : uint8_t {
+    greedy     = 0,
+    stochastic = 1,
+};
+
+inline const char * sampling_mode_name(sampling_mode m) noexcept {
+    switch (m) {
+        case sampling_mode::greedy:     return "greedy";
+        case sampling_mode::stochastic: return "stochastic";
+    }
+    return "unknown";
+}
+
+struct sampling_config {
+    sampling_mode mode             = sampling_mode::greedy;
+    uint32_t      seed             = LLAMA_DEFAULT_SEED;
+    float         temperature      = 1.0f;
+    int32_t       top_k            = 0;
+    float         top_p            = 1.0f;
+    uint32_t      top_p_min_keep   = 1;
+};
+
+// M7b: shared validation helper. Single source of truth for the
+// `sampling_config` invariants — used both by `engine.cpp`'s
+// `build_sampler_chain` (engine-task fail-closed safety net) and by
+// the hpx-server `/completion` handler (network-edge fast-fail before
+// `submit_request`). Returns true on success; on failure returns false
+// and populates `err` with a stable human-readable message. The error
+// strings here are the contract — engine-side and server-side error
+// reporting both surface them verbatim. Pure value-in / value-out:
+// touches no llama.cpp state, takes no locks, allocates only the
+// error string.
+inline bool validate_sampling_config(const sampling_config & cfg,
+                                     std::string &           err) {
+    err.clear();
+    if (!(cfg.temperature > 0.0f)) {
+        err = "sampling_config.temperature must be > 0";
+        return false;
+    }
+    if (cfg.top_k < 0) {
+        err = "sampling_config.top_k must be >= 0";
+        return false;
+    }
+    if (!(cfg.top_p > 0.0f && cfg.top_p <= 1.0f)) {
+        err = "sampling_config.top_p must be in (0, 1]";
+        return false;
+    }
+    if (cfg.top_p_min_keep == 0) {
+        err = "sampling_config.top_p_min_keep must be >= 1";
+        return false;
+    }
+    return true;
 }
 
 // ---- Streaming token channel (Slice 8: HPX-native local channel) -------
@@ -224,6 +318,17 @@ struct seq_state {
     // this from the waiting_request that was bound. -----------------------
     arrival_source           arrival_src                  = arrival_source::preloaded;
 
+    // ---- M5a epoch ------------------------------------------------------
+    // Per-seq engine-issued epoch propagated from `waiting_request::epoch`
+    // by `admit_one` at admission time, or 0 for preloaded actives /
+    // idle slots that never went through `engine::submit_request`. Used
+    // by `cancel_and_fulfill` / `finalize_and_fulfill` / queued-cancel
+    // fulfill to perform a guarded erase against `live_epoch_by_rid_`:
+    // the entry is removed only if the map still points at this exact
+    // (rid, epoch) pair, so a late completion of an older incarnation
+    // cannot wipe the live entry of a newer same-rid submission.
+    uint64_t                 epoch                        = 0;
+
     // ---- streaming token channel (Slice 8: HPX-native local channel) ----
     // stream_enabled is set in engine ctor when --stream-all is on; it is
     // never toggled mid-run. stream_channel is the engine-owned full
@@ -249,6 +354,49 @@ struct seq_state {
     // vectors in at admit_one time and drop the shared-prompt borrow.
     std::vector<llama_token> prompt_tokens;
 
+    // ---- M6a per-request sampling configuration (data model only) -----
+    // Populated by `admit_one` by moving from the bound waiter's
+    // `sampling` field at the same point `prompt_tokens` is rebound.
+    // M6a does NOT read this in either sampling site — both still go
+    // through the local argmax. M6b will branch here to drive a per-seq
+    // llama_sampler chain when `sampling.mode == stochastic`. Default-
+    // constructed value is greedy, so preloaded actives and any path
+    // that does not explicitly set sampling stay on the existing argmax
+    // path and keep canonical-hash byte equality.
+    sampling_config          sampling                     = {};
+
+    // ---- M6b per-seq sampler chain (engine-task-owned) ----------------
+    // Default-null. `admit_one` first calls `.reset()` on this field
+    // (clearing any chain left behind by a prior owner of the slot),
+    // then — only when `sampling.mode == sampling_mode::stochastic` —
+    // builds a fresh chain via:
+    //   llama_sampler_chain_init(default_params{no_perf=true})
+    //   + llama_sampler_chain_add(... llama_sampler_init_dist(seed))
+    // and installs it with `.reset(chain)`. `finalize_and_fulfill` and
+    // `cancel_and_fulfill` reset the chain at the end of the slot's
+    // lifetime so the unique_ptr's deleter runs `llama_sampler_free`
+    // promptly. Greedy/default admissions leave this null, so the
+    // existing `llama_get_logits_ith` + local argmax path runs
+    // bit-identically (a single null-pointer compare guards the
+    // branch).
+    //
+    // Ownership rules (CRITICAL):
+    //   - Only the engine task may construct, mutate, sample from,
+    //     reset, or destroy this chain. The two sampling sites in
+    //     `run_body` and the construction/reset sites in admit_one /
+    //     finalize_and_fulfill / cancel_and_fulfill are all reached
+    //     exclusively from the engine task.
+    //   - `llama_sampler_chain_add` TRANSFERS ownership of the sub-
+    //     sampler (e.g. the dist sampler from `llama_sampler_init_dist`)
+    //     to the chain. The sub-sampler MUST NOT be wrapped in a
+    //     separate llama_sampler_ptr after that call — the chain's
+    //     deleter frees it.
+    //   - `llama_sampler_sample(chain, ctx, idx)` internally calls
+    //     `llama_sampler_accept`, so the engine MUST NOT call
+    //     `llama_sampler_accept` separately — doing so would double-
+    //     advance the dist RNG and break same-seed reproducibility.
+    llama_sampler_ptr        sampler_chain;
+
     uint64_t finalize_hash() const noexcept {
         return (n_decoded == 0) ? token_hash::k_token_hash_empty : hash_state;
     }
@@ -263,6 +411,11 @@ struct waiting_request {
     int32_t                  request_id    = -1;
     int32_t                  decode_budget = 0;
     arrival_source           src           = arrival_source::preloaded;
+    // M5a: epoch carried from `arrival_msg::epoch` when
+    // `drain_external_inbox` constructs the waiter from an external
+    // arrival. 0 for preloaded waiters (no engine-issued token).
+    // `admit_one` copies this into `seq_state::epoch` at admission.
+    uint64_t                 epoch         = 0;
     // M1c: per-waiter owned prompt vector. Populated by main for
     // preloaded waiters, or moved out of arrival_msg by
     // drain_external_inbox for external arrivals. admit_one moves
@@ -272,6 +425,12 @@ struct waiting_request {
     // prompt is still a copy of the shared prompt source, so the
     // admitted-prefill batch is byte-identical to M1b / M0.
     std::vector<llama_token> prompt_tokens;
+    // M6a: per-request sampling configuration carried from
+    // `arrival_msg::sampling` by `drain_external_inbox` and moved into
+    // `seq_state::sampling` by `admit_one`. Default greedy for
+    // preloaded waiters (`scripted_arrival` does not yet expose
+    // sampling, so the gate's scripted-submitter path stays greedy).
+    sampling_config          sampling      = {};
 };
 
 // ---- Async external arrival (Live Admission Slice 6) -------------------
@@ -286,6 +445,16 @@ struct arrival_msg {
     int32_t                      decode_budget = 0;
     hpx::promise<request_result> promise;
     arrival_source               src           = arrival_source::external;
+    // M5a: engine-issued epoch for this submission. Set by
+    // `engine::submit_request` from the engine's monotonic
+    // `next_epoch_` counter under `inbox_mtx_`; left at 0 for
+    // arrivals that are constructed and pushed via the engine-
+    // internal `engine::submit(arrival_msg)` path (the gate's
+    // scripted submitter). The engine treats epoch 0 as "no
+    // token-aware identity" and does not register such arrivals in
+    // `live_epoch_by_rid_`, so they never participate in epoch-aware
+    // cancel resolution.
+    uint64_t                     epoch         = 0;
     // M1c: per-arrival owned prompt vector. Populated by the
     // scripted submitter task from the matching scripted_arrival
     // before eng.submit(). drain_external_inbox() moves it into
@@ -303,6 +472,14 @@ struct arrival_msg {
     // moved a final time into the bound slot at `admit_one`.
     bool                                want_stream    = false;
     std::optional<token_stream_channel> stream_channel;
+    // M6a: per-request sampling configuration. Copied from
+    // `submit_request::sampling` in `engine::submit_request` before the
+    // inbox push, and moved into `waiting_request::sampling` by
+    // `drain_external_inbox`. Engine-internal `engine::submit(arrival_msg)`
+    // callers that bypass `submit_request` (the gate's scripted
+    // submitter) leave this default-constructed (greedy), so existing
+    // gate shapes are unaffected.
+    sampling_config                     sampling       = {};
 };
 
 // ---- Public submit API (M2b) -------------------------------------------
@@ -312,27 +489,71 @@ struct arrival_msg {
 // the matching `arrival_msg` (with src=external and a fresh
 // hpx::promise) and routes through the existing inbox/spinlock path.
 // `arrival_source` is intentionally NOT exposed — runtime submissions
-// always become arrival_source::external internally. Sampling
-// configuration is intentionally NOT included; a later stage adds it.
+// always become arrival_source::external internally. M6a: `sampling`
+// is now exposed and carried end-to-end through `arrival_msg` →
+// `waiting_request` → `seq_state`, but is NOT yet read at the sampling
+// sites; both sampling sites still go through the local argmax. A
+// default-constructed `sampling_config` (greedy) keeps the canonical
+// hashes byte-identical. M6b activates `sampling.mode == stochastic`.
 struct submit_request {
     int32_t                  request_id    = -1;
     std::vector<llama_token> prompt_tokens;
     int32_t                  decode_budget = 0;
     bool                     want_stream   = false;
+    sampling_config          sampling      = {};
+};
+
+// ---- M5a: cancel_token ------------------------------------------------
+// Opaque identity carried on `submit_handle` and accepted by the
+// epoch-aware overload `engine::cancel_request(const cancel_token &)`.
+// `request_id` is the caller-supplied rid (copied from
+// submit_request.request_id at issuance time); `epoch` is engine-issued
+// (monotonically increasing under `inbox_mtx_` inside
+// `engine::submit_request`). Cancellation via this token cancels the
+// specific request instance the token was issued for: if the rid is
+// later reused for a new request, an old token's `(rid, epoch)` pair
+// will NOT match the new live request's epoch, and the engine bumps
+// `engine_result::cancel_stale_epoch` rather than cancelling the new
+// request. Default-constructed tokens have `epoch = 0`, which is the
+// "unset" sentinel — engine-issued tokens always have epoch >= 1.
+// Trivially copyable; no engine back-pointer, no shared/weak handle to
+// the engine. Caller-supplied lifetime; the token must not outlive the
+// engine. M5b will add `submit_handle::cancel()` as a convenience
+// forwarder; M5a leaves the token caller-driven via the engine API.
+struct cancel_token {
+    int32_t  request_id = -1;
+    uint64_t epoch      = 0;
 };
 
 // `submit_handle` is the move-only result handle returned by
 // `engine::submit_request(...)`. `result` is the per-request future
 // (HPX-native, never std::future); awaiting it yields the same
 // `request_result` snapshot the legacy path produces. `stream` is
-// `std::nullopt` in M2b — stream support is deferred to M2c, where
-// the engine's admit_one branch can be wired at the same time as the
-// gate's submitter migration. Passing want_stream=true today causes
-// `submit_request(...)` to throw with an explicit "not yet
-// implemented" message so callers cannot silently miss the receiver.
+// engaged when the caller set `want_stream=true` on `submit_request`,
+// in which case it carries the receiver half of the per-request
+// HPX local channel the engine populates with token_stream_event
+// values as decoding progresses; it is `std::nullopt` otherwise.
+// M5a: `token` carries the engine-issued `(rid, epoch)` identity for
+// epoch-aware cancellation via
+// `engine::cancel_request(const cancel_token &)`. The token is set by
+// `engine::submit_request` before the handle is returned; the caller
+// does not set or mutate it. Trivially copyable, so the caller may
+// hold a copy of the token independently of the move-only handle.
 struct submit_handle {
     hpx::future<request_result>          result;
     std::optional<token_stream_receiver> stream;
+    cancel_token                         token;
+
+    // M5b: explicit-engine convenience forwarder onto the M5a
+    // token-aware cancel path. Equivalent to:
+    //   eng.cancel_request(this->token);
+    // Fire-and-forget; final truth is observed through `result`.
+    // Does NOT introduce a new cancellation semantic, does NOT touch
+    // llama.cpp state, and does NOT store any engine observer on the
+    // handle — the caller asserts engine liveness by passing the
+    // reference, exactly as for any C++ reference. Defined in
+    // engine.cpp, where the full `engine` type is in scope.
+    void cancel(engine & eng) const noexcept;
 };
 
 // ---- Pre-run release/ack handle (Live Admission Slice 6) ---------------
@@ -443,6 +664,77 @@ struct engine_result {
     int32_t              streams_closed_cancelled    = 0;
     int32_t              streams_closed_error        = 0;
     int64_t              stream_tokens_emitted_total = 0;
+
+    // M3a: long-running keep-alive counters. Default zero and stay
+    // zero on every engine_options::keep_alive=false run, so the
+    // seven canonical gate smokes remain byte-identical. With
+    // keep_alive=true: engine_idle_waits bumps once per cv-suspend
+    // (a single bump can cover any number of arrivals that drain in
+    // the wake), and engine_shutdown_observed is set to 1 exactly
+    // once when the decode loop exits because shutdown was
+    // requested and all work drained.
+    int32_t              engine_idle_waits           = 0;
+    int32_t              engine_shutdown_observed    = 0;
+
+    // M3b/M3c: cancellation counters. All default zero and stay
+    // zero unless engine::cancel_request() is called, so every
+    // existing engine/gate smoke remains byte-identical.
+    //
+    // queued_cancelled (M3b) — bumps once per request that was
+    //   resolved with status=cancelled BEFORE admission (either
+    //   intercepted at drain_external_inbox or pulled out of
+    //   waiting_queue_consumable_ by apply_queued_cancellations).
+    //
+    // cancel_request_calls (M3b) — bumps once per drained
+    //   cancel_inbox_ entry (duplicate cancel_request(rid) calls
+    //   count twice).
+    //
+    // cancel_active_not_supported (legacy M3b counter) — was
+    //   bumped by the pre-M3c stub when apply_queued_cancellations
+    //   matched a live active seq but could not yet propagate
+    //   cancellation. M3c replaced that stub with the real
+    //   active-cancel bridge, so this counter MUST remain zero in
+    //   M3c+ runs. Field retained so archived M3b evidence parses
+    //   cleanly; do not bump from new code.
+    //
+    // cancel_active_observed (M3c) — the active-cancel bridge
+    //   counter. Bumps once per rid that apply_queued_cancellations
+    //   matches against a live non-done active seq. The match sets
+    //   seq.cancel_requested under the engine task; the existing
+    //   cancel_should_observe → cancel_and_fulfill iter-boundary
+    //   pipeline performs the KV clear, stream close with
+    //   reason=cancelled, and promise fulfillment.
+    //
+    // cancel_unknown_request_id (M3b) — bumps at engine end for any
+    //   rid that was cancelled but never matched a queued/active
+    //   request (cancel-before-submit that never received a
+    //   submission, or cancel-after-completion).
+    //
+    // cancel_request_duplicates (M3b) — bumps when the engine
+    //   drains a cancel_inbox_ entry whose rid was already present
+    //   in cancelled_request_ids_.
+    int32_t              queued_cancelled            = 0;
+    int32_t              cancel_request_calls        = 0;
+    int32_t              cancel_active_not_supported = 0;
+    int32_t              cancel_active_observed      = 0;
+    int32_t              cancel_unknown_request_id   = 0;
+    int32_t              cancel_request_duplicates   = 0;
+
+    // M5a: epoch-aware stale-token counter. Bumps when the token-aware
+    // overload `engine::cancel_request(const cancel_token &)` resolves
+    // a (rid, epoch) entry whose rid is currently live in
+    // `live_epoch_by_rid_` but whose epoch does NOT match the live
+    // epoch — i.e. the token was issued for a prior incarnation of the
+    // rid that has since completed and been replaced by a fresh
+    // submission. Stale tokens do NOT cancel the live request. Stays
+    // 0 in every existing engine smoke and in every canonical gate
+    // shape (no stale token is fired there), so adding the counter is
+    // additive-only on the diff. Distinct from
+    // `cancel_unknown_request_id`, which bumps when the rid is not
+    // currently live at all (cancel-after-completion of an unrecycled
+    // rid). Not printed by the gate driver; consumed only by the M5a
+    // stale-token smoke via `eng.result().cancel_stale_epoch`.
+    int32_t              cancel_stale_epoch          = 0;
 
     engine_metrics       metrics;
 };

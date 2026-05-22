@@ -2399,3 +2399,1733 @@ M4:
 ```
 
 ---
+
+## 7. hpx-cb-gate: add reusable HPX engine submit API
+
+After M0, the HPX continuous-batch gate was maintainable, but it was still mostly a gate-shaped prototype.
+The engine lived in separate files, but the serving interface was not yet a reusable package interface.
+
+The next question became:
+
+```text
+Can the HPX continuous-batch engine become a reusable HPX-native serving component,
+with request-shaped submission, idle capacity, futures, and token streams,
+while preserving the existing gate behavior byte-for-byte?
+```
+
+Result:
+
+```text
+Yes.
+M1/M2 converted the componentized gate into a reusable HPX engine package.
+```
+
+This section records the work after M0:
+
+```text
+M1:
+  add per-request prompt plumbing
+  keep legacy shared-prompt behavior byte-identical
+
+M2:
+  add submit_request / submit_handle
+  split llama-hpx-engine into a static library
+  prove non-gate clients can consume the engine
+  add initial idle-slot admission
+  make submit_handle.stream real
+```
+
+This section is still correctness, lifecycle, and packaging provenance.
+It is not a performance claim.
+
+---
+
+### 7.1 M1 made requests carry their own prompt data
+
+Before M1, the gate used one shared prompt:
+
+```text
+cli_args::prompt
+  -> tokenized once in main
+  -> borrowed through engine_options::prompt_tokens
+  -> replayed for every seq_id
+```
+
+That meant the gate could run many request lifecycles, but all requests still had the same prompt.
+This was enough for lifecycle validation, but not enough for a real serving interface.
+
+Question:
+
+```text
+Can each request carry its own prompt tokens through the HPX serving lifecycle?
+```
+
+Result:
+
+```text
+Yes.
+Per-request prompt tokens now flow through initial active requests, waiting requests,
+scripted external arrivals, live admission, streaming, and repeat-determinism checks.
+```
+
+M1 added request-specific prompt ownership in stages:
+
+```text
+M1a:
+  add inert per-request prompt fields
+
+M1b:
+  initial active seqs own seq_state::prompt_tokens
+  initial prefill reads seq.prompt_tokens
+
+M1c:
+  waiting_request, arrival_msg, and scripted_arrival carry prompt_tokens
+  admitted prefill reads seq.prompt_tokens
+
+M1d:
+  add --request-prompts-file <path>
+  one prompt per line
+  line i maps to request_id i
+```
+
+The prompt-file mode assigns prompts as:
+
+```text
+request_id 0 .. n_active - 1:
+  initial active requests
+
+request_id n_active .. n_active + n_waiting - 1:
+  preloaded waiting requests
+
+request_id n_active + n_waiting .. n_active + n_waiting + n_external_arrivals - 1:
+  scripted external arrivals
+```
+
+The legacy no-file path remains:
+
+```text
+--prompt <text>
+  tokenized once
+  copied into every request prompt slot
+```
+
+Compatibility result:
+
+```text
+Legacy no-file mode stayed byte-identical across the canonical gate smokes.
+Prompt-file mode added a new behavior path without changing the old one.
+```
+
+Representative prompt-file smoke:
+
+```text
+n_seqs = 6
+n_active = 3
+n_waiting = 2
+n_external_arrivals = 1
+all prompts distinct
+stream_all = true
+reuse_completed = true
+repeat = 2
+```
+
+Observed result:
+
+```text
+HPX_CB_STREAM_STEP7: PASS
+```
+
+Important evidence:
+
+```text
+variable prompt lengths reached the engine
+pos_max_at_clear_set changed by prompt length
+repeat determinism still passed
+streamed hash matched request_result hash
+residual_kv_empty remained true
+```
+
+Interpretation:
+
+```text
+The gate no longer only proves many lifecycles for one shared prompt.
+It now proves request-shaped prompt ownership through the HPX control plane.
+```
+
+What M1 did not add:
+
+```text
+No sampling_config.
+No llama_sampler integration.
+No HTTP/server layer.
+No public cancellation handle.
+```
+
+---
+
+### 7.2 M2 introduced a public submit API
+
+After M1, requests could carry their own prompt data, but the engine still exposed mostly gate-shaped entry points.
+The next question was:
+
+```text
+Can a caller submit request-shaped work to the engine through an HPX-native public API?
+```
+
+Result:
+
+```text
+Yes.
+M2 added submit_request, submit_handle, and engine::submit_request(...).
+```
+
+The public request shape is:
+
+```cpp
+struct submit_request {
+    int32_t                  request_id    = -1;
+    std::vector<llama_token> prompt_tokens;
+    int32_t                  decode_budget = 0;
+    bool                     want_stream   = false;
+};
+```
+
+The public handle shape is:
+
+```cpp
+struct submit_handle {
+    hpx::future<request_result>          result;
+    std::optional<token_stream_receiver> stream;
+};
+```
+
+Semantics:
+
+```text
+submit_request:
+  caller-owned request metadata
+  no arrival_source field
+  no sampler field yet
+  no cancellation handle yet
+
+submit_handle.result:
+  HPX future for final request_result
+
+submit_handle.stream:
+  optional HPX local token stream receiver
+  present only when want_stream = true
+```
+
+The engine method:
+
+```cpp
+submit_handle engine::submit_request(submit_request req);
+```
+
+Important boundary:
+
+```text
+engine::submit_request does not call llama_decode.
+engine::submit_request does not mutate KV.
+engine::submit_request does not build llama_batch.
+engine::submit_request only creates HPX-side request handles and enqueues request metadata.
+```
+
+The runtime submission is internally stamped as:
+
+```text
+arrival_source::external
+```
+
+Interpretation:
+
+```text
+The public API is HPX-native: callers receive hpx::future<request_result>
+and, optionally, an HPX local receive_channel for token events.
+```
+
+---
+
+### 7.3 Scripted external arrivals moved onto submit_request
+
+Once the public submit API existed, the gate's scripted submitter was migrated to use it.
+
+Before M2c:
+
+```text
+main pre-created per-arrival promises
+submitter constructed arrival_msg directly
+submitter moved the promise into arrival_msg
+submitter called engine::submit(arrival_msg)
+```
+
+After M2c:
+
+```text
+submitter constructs submit_request
+submitter calls engine::submit_request(...)
+submitter stores submit_handle.result in external_futs
+engine creates the internal promise and arrival_msg
+engine routes through the existing inbox path
+```
+
+Important compatibility result:
+
+```text
+The external-arrival behavior stayed byte-identical.
+```
+
+The old gate-only path still exists:
+
+```text
+engine::submit(arrival_msg)
+take_admitted_futures()
+take_admitted_stream_handoffs()
+take_stream_receivers()
+```
+
+But external result futures now flow through the new public submit API.
+
+Interpretation:
+
+```text
+M2c proved submit_request is not just an unused public wrapper.
+The existing scripted external-arrival gate path can drive the engine through it.
+```
+
+---
+
+### 7.4 M2 split the engine into a reusable library target
+
+After the public submit API existed, the next package question was:
+
+```text
+Can the engine build as a reusable library target while the gate remains a validation client?
+```
+
+Result:
+
+```text
+Yes.
+M2d added llama-hpx-engine as a static library target.
+```
+
+Final target layout:
+
+```text
+llama-hpx-engine STATIC:
+  engine.cpp
+  hpx_runtime.cpp
+  trace.cpp
+
+llama-hpx-continuous-batch-gate executable:
+  hpx-continuous-batch-gate.cpp
+  cli.cpp
+  gate_validation.cpp
+  submitter.cpp
+
+smoke clients:
+  llama-hpx-engine-smoke
+  llama-hpx-engine-idle-smoke
+  llama-hpx-engine-stream-smoke
+```
+
+Engine/public/shared headers:
+
+```text
+engine.h
+types.h
+hpx_runtime.h
+trace.h
+token_hash.h
+```
+
+Gate-only files remain outside the library:
+
+```text
+cli.h / cli.cpp
+submitter.h / submitter.cpp
+gate_validation.h / gate_validation.cpp
+gate_emit.h
+hpx-continuous-batch-gate.cpp
+```
+
+The gate executable still has the same user-facing target name:
+
+```text
+llama-hpx-continuous-batch-gate
+```
+
+Validation result:
+
+```text
+All canonical gate smokes stayed byte-identical after the target split.
+```
+
+Interpretation:
+
+```text
+The engine is now a package boundary, not just a source-file boundary.
+The gate is now one client of the engine library.
+```
+
+---
+
+### 7.5 M2e proved a non-gate client can consume the engine library
+
+After the library target existed, the next question was:
+
+```text
+Can another executable link against llama-hpx-engine and use the public API
+without including gate CLI, submitter, validation, or gate_emit helpers?
+```
+
+Result:
+
+```text
+Yes.
+llama-hpx-engine-smoke passed.
+```
+
+Smoke target:
+
+```text
+llama-hpx-engine-smoke
+```
+
+What it proves:
+
+```text
+a non-gate translation unit can link llama-hpx-engine
+construct engine_options
+construct engine
+submit work through submit_request
+await submit_handle.result
+clean up without gate_validation or gate driver code
+```
+
+Known successful output:
+
+```text
+request_id=0 status=completed n_decoded=4 hash=0x6082b8ce0fec12ec
+request_id=1 status=completed n_decoded=8 hash=0x7af78f8741363b89
+HPX_ENGINE_SMOKE: PASS
+```
+
+The smoke intentionally used a small cooperating shape:
+
+```text
+one initial active request
+one submit_request external request
+reuse_completed = true
+```
+
+Interpretation:
+
+```text
+M2e proved the engine library is linkable and callable outside the gate,
+but it also exposed a limitation: submit_request still needed an already-active
+request to free a slot.
+```
+
+---
+
+### 7.6 M2f added initial idle-slot admission
+
+M2e exposed that the public submit API was usable, but not yet a natural serving shape.
+A caller still needed a dummy initial active request to create reusable capacity.
+
+Question:
+
+```text
+Can the engine start with real idle capacity and admit submit_request work directly?
+```
+
+Result:
+
+```text
+Yes.
+M2f added initial idle-slot admission.
+```
+
+New engine option:
+
+```cpp
+int32_t initial_idle_slots = 0;
+```
+
+New admission source:
+
+```cpp
+admission_source::initial_idle
+```
+
+New engine state:
+
+```text
+free_idle_
+```
+
+New behavior:
+
+```text
+The engine can start with zero initial active requests.
+Idle seq_ids are initialized as available capacity.
+submit_request pushes work into the inbox.
+inbox_has_pending() keeps the engine loop alive long enough to drain the inbox.
+The engine admits queued work into an initial idle slot.
+```
+
+Admission priority became:
+
+```text
+1. cancel-freed slots
+2. completion-freed slots
+3. initial-idle slots
+```
+
+Important compatibility point:
+
+```text
+initial_idle_slots defaults to 0.
+The existing gate never enters the initial_idle path.
+Existing gate trace labels and counters stayed byte-identical.
+```
+
+Smoke target:
+
+```text
+llama-hpx-engine-idle-smoke
+```
+
+Known successful output:
+
+```text
+request_id=42 status=completed n_decoded=8 hash=0x7af78f8741363b89 admission_source=initial_idle
+HPX_ENGINE_IDLE_SMOKE: PASS
+```
+
+Interpretation:
+
+```text
+M2f made submit_request usable in the shape a future server actually needs:
+start the engine with capacity, submit work, and complete through the public handle.
+No dummy active request is required.
+```
+
+---
+
+### 7.7 M2g made submit_handle.stream real
+
+After M2f, submit_request could complete through submit_handle.result.
+The last public API gap was streaming.
+
+Before M2g:
+
+```text
+submit_handle.stream existed as an optional token_stream_receiver,
+but submit_request(want_stream=true) still threw before committing state.
+```
+
+Question:
+
+```text
+Can submit_request(want_stream=true) return a real token stream receiver
+through submit_handle.stream?
+```
+
+Result:
+
+```text
+Yes.
+M2g implemented public per-request streaming through submit_handle.stream.
+```
+
+Implementation model:
+
+```text
+submit_request(want_stream=true):
+  creates token_stream_channel
+  creates token_stream_receiver
+  returns receiver through submit_handle.stream
+  moves channel into arrival_msg.stream_channel
+
+engine drain path:
+  moves arrival_msg.stream_channel into external_stream_channels_[request_id]
+
+admission path:
+  admit_one checks external_stream_channels_ for request_id
+  if present, moves the caller-supplied channel into seq_state::stream_channel
+  opens the stream
+  does not push admitted_stream_handoff for this request
+
+publish/close path:
+  existing publish_token and close_stream logic publishes token events
+  stream close happens before result promise fulfillment
+```
+
+Precedence rule:
+
+```text
+Caller-supplied submit_handle stream wins over the gate's stream_all_ handoff path.
+```
+
+Gate compatibility:
+
+```text
+The gate submitter still calls submit_request with want_stream=false.
+Therefore, the existing stream_all_ / admitted_stream_handoffs_ path remains unchanged.
+```
+
+Smoke target:
+
+```text
+llama-hpx-engine-stream-smoke
+```
+
+Known successful output:
+
+```text
+request_id=42 status=completed n_decoded=8 hash=0x7af78f8741363b89 admission_source=initial_idle streamed_tokens=8 streamed_hash=0x7af78f8741363b89
+HPX_ENGINE_STREAM_SMOKE: PASS
+```
+
+Important checks:
+
+```text
+streamed_tokens = 8
+streamed_hash == request_result.hash
+stream close reason = completed
+streams_opened = 1
+streams_closed_completed = 1
+stream_tokens_emitted_total = 8
+residual_kv_ok = true
+decode_failures = 0
+```
+
+Interpretation:
+
+```text
+A non-gate client can now submit a request and receive both:
+  an HPX future for final completion
+  an HPX token stream receiver for incremental token delivery
+```
+
+This is the public serving shape M3 can build on.
+
+---
+
+### 7.8 M2 package validation result
+
+Build targets:
+
+```text
+llama-hpx-engine
+llama-hpx-continuous-batch-gate
+llama-hpx-engine-smoke
+llama-hpx-engine-idle-smoke
+llama-hpx-engine-stream-smoke
+```
+
+Canonical gate smokes:
+
+```text
+1. Slice 7 multi-cycle streaming
+2. Slice 7 trace-on
+3. Streaming Slice 5 external arrival
+4. Streaming Slice 6 external × cancel-freed
+5. Default-mode regression
+6. Stream-off Live Admission Slice 7
+7. M1d prompt-file smoke
+```
+
+Canonical command caveat:
+
+```text
+Slice 6 external × cancel-freed requires:
+  --cancel-plan 0 --cancel-after 8
+
+Stream-off Live Admission Slice 7 requires:
+  --cancel-plan 1,4,7,2,5,8
+```
+
+Validation result:
+
+```text
+All seven canonical gate smokes passed.
+Normalized stdout diff remained byte-identical except timing fields:
+  wall_ms
+  ttc_ms_*
+  admitted_ttc_ms[*]
+```
+
+Trace result:
+
+```text
+Trace-off smokes:
+  0 [hpx-cb-gate] event= lines
+
+Trace-on smoke:
+  174 events
+  per-event-name totals matched baseline
+```
+
+Engine smoke result:
+
+```text
+HPX_ENGINE_SMOKE: PASS
+HPX_ENGINE_IDLE_SMOKE: PASS
+HPX_ENGINE_STREAM_SMOKE: PASS
+```
+
+HPX-native boundary checks:
+
+```text
+engine::submit_request:
+  no llama_decode
+  no common_batch_add
+  no llama mutable execution calls
+
+submitter.cpp:
+  no llama mutable execution calls
+
+engine smoke clients:
+  no llama_decode
+  no llama_batch_*
+  no llama_memory_seq_*
+  no llama_get_logits_ith
+  no common_batch_add
+```
+
+The only allowed llama/common calls outside the engine task are:
+
+```text
+model/context setup
+model/context cleanup
+tokenization
+```
+
+All llama execution and KV mutation remain inside:
+
+```text
+engine::run()
+and its private helpers
+```
+
+---
+
+### 7.9 Public API as of M2
+
+The reusable engine package now exposes the following serving-shaped API:
+
+```text
+engine_options:
+  ctx
+  vocab
+  n_vocab
+  batch_capacity
+  n_seq_max
+  initial_idle_slots
+  stream_all
+  plus legacy gate-shaped fields still used by the gate
+```
+
+```text
+submit_request:
+  request_id
+  prompt_tokens
+  decode_budget
+  want_stream
+```
+
+```text
+submit_handle:
+  hpx::future<request_result> result
+  optional HPX token stream receiver
+```
+
+```text
+request_result:
+  request_id
+  status
+  generated token count
+  hash
+  admission/source metadata
+  KV/position accounting
+```
+
+```text
+token_stream_event:
+  token event
+  closed event
+  close reason
+```
+
+The simplest M2 serving shape is now:
+
+```text
+engine_options.initial_idle_slots = N
+engine eng(std::move(opts));
+
+submit_request req;
+req.request_id = ...;
+req.prompt_tokens = ...;
+req.decode_budget = ...;
+req.want_stream = true or false;
+
+submit_handle h = eng.submit_request(std::move(req));
+
+hpx::async([&] { eng.run(); });
+
+if (h.stream) {
+  drain token_stream_event values
+}
+
+request_result rr = h.result.get();
+```
+
+Interpretation:
+
+```text
+M2 turns the previous gate-internal engine into a reusable in-process HPX serving component.
+```
+
+---
+
+### 7.10 What M2 intentionally does not claim
+
+M2 does not claim:
+
+```text
+No HTTP/server transport yet.
+No long-running engine loop yet.
+No shutdown signal yet.
+No public cancellation handle yet.
+No sampling_config yet.
+No llama_sampler integration yet.
+No production backpressure yet.
+No deadline or timeout API yet.
+No multi-engine orchestration yet.
+No metrics export from a running engine yet.
+No performance advantage claim.
+No comparison against llama-server yet.
+```
+
+Some public fields are still gate-shaped:
+
+```text
+engine_options::prompt_tokens
+engine_options::budgets
+engine_options::waiting_queue
+engine_options::per_active_prompt_tokens
+engine_options::cancel_plan
+engine_options::release_iter_set
+engine_options::stream_all
+engine_options::max_decode_iters
+```
+
+These are acceptable for M2 because the gate still uses them.
+They should be cleaned up later after M3 clarifies the server-facing surface.
+
+---
+
+### 7.11 Overall conclusion
+
+What was proven in this package:
+
+```text
+Requests can carry their own prompt tokens.
+A public submit_request can enqueue work.
+A public submit_handle returns an HPX future.
+A public submit_handle can return an HPX token stream receiver.
+The engine can start with idle capacity and admit submitted work.
+The engine can build as a reusable static library.
+Non-gate smoke clients can consume the engine package.
+The existing gate behavior remains byte-identical.
+Only the engine task touches llama.cpp mutable execution state.
+```
+
+The reusable package now contains:
+
+```text
+llama-hpx-engine
+llama-hpx-continuous-batch-gate
+llama-hpx-engine-smoke
+llama-hpx-engine-idle-smoke
+llama-hpx-engine-stream-smoke
+```
+
+This closes the M2 package.
+
+Next natural milestone:
+
+```text
+M3 planning.
+```
+
+M3 should decide the next serving surface before implementation:
+
+```text
+Option A:
+  long-running engine loop
+  shutdown signal
+  public cancellation handle
+
+Option B:
+  sampling_config
+  llama_sampler pass-through
+
+Option C:
+  HTTP/server wrapper around submit_request / submit_handle
+```
+
+Recommended caution:
+
+```text
+Do not jump directly into HTTP implementation without deciding engine lifetime,
+shutdown/cancellation, and sampling scope.
+```
+
+---
+
+## 8. hpx-cb-gate: long-running engine + cancellation control-plane
+
+After M2 the engine package was reusable and `submit_request` worked end-to-end,
+but the engine was still a one-shot loop:
+it ran until every initial active and waiting request was done,
+then it returned.
+
+The next question became:
+
+```text
+Can the HPX continuous-batch engine become a long-running serving component
+with a public shutdown signal and a public cancellation API,
+while preserving the existing gate behavior byte-for-byte?
+```
+
+Result:
+
+```text
+Yes.
+M3 added a keep-alive lifecycle, a public shutdown signal,
+and a uniform rid-based public cancellation API that covers
+both queued-before-admission and active/admitted requests.
+```
+
+This section records the work after M2:
+
+```text
+M3a:
+  add engine_options::keep_alive
+  add engine::request_shutdown()
+  add HPX-native idle-wait on hpx::condition_variable_any
+  keep inbox_mtx_ as hpx::spinlock
+
+M3b:
+  add engine::cancel_request(int32_t request_id)
+  cancel queued-before-admission requests
+  fulfill with status=cancelled, n_decoded=0, kv_cleared=false
+  close stream with reason=cancelled
+  no KV touched
+
+M3c:
+  extend engine::cancel_request to active/admitted requests
+  set seq.cancel_requested from the engine task
+  reuse cancel_should_observe / cancel_and_fulfill
+  KV clear + stream close + promise fulfillment at iter boundary
+  no interruption inside llama_decode
+```
+
+This section is still correctness, lifecycle, and packaging provenance.
+It is not a performance claim.
+
+---
+
+### 8.1 M3a added keep-alive and a public shutdown signal
+
+Before M3a, `eng.run()` returned as soon as every active and waiting request was done.
+For a long-running server that would force the caller to recreate the engine for every request batch.
+
+Question:
+
+```text
+Can the engine task stay alive between requests
+without burning a CPU spin-waiting,
+and exit cleanly only when the caller signals shutdown?
+```
+
+Result:
+
+```text
+Yes.
+With engine_options::keep_alive = true the engine task suspends on
+hpx::condition_variable_any when there is no work,
+wakes on submit() or request_shutdown(),
+and exits cleanly when request_shutdown() is observed on a fully-drained engine.
+```
+
+M3a wired:
+
+```text
+engine_options::keep_alive            (default false)
+engine::request_shutdown()
+hpx::condition_variable_any inbox_cv_
+inbox_mtx_ remains hpx::spinlock      (BasicLockable; condition_variable_any accepts it)
+engine_result::engine_idle_waits
+engine_result::engine_shutdown_observed
+```
+
+Idle-wait predicate (observed under inbox_mtx_):
+
+```text
+!inbox_.empty() || !cancel_inbox_.empty() || shutdown_requested_
+```
+
+Wake sources (each publishes its state under inbox_mtx_ before notifying inbox_cv_):
+
+```text
+engine::submit()           inbox push, then notify
+engine::cancel_request()   cancel_inbox_ push, then notify
+engine::request_shutdown() shutdown_requested_ = true, then notify
+```
+
+With `keep_alive = false` the entire keep-alive outer loop runs once and exits,
+matching the pre-M3 behavior byte-for-byte:
+
+```text
+engine_idle_waits          == 0
+engine_shutdown_observed   == 0
+```
+
+Smoke evidence:
+
+```text
+llama-hpx-engine-keepalive-smoke
+  request 42 (budget=8) -> completed
+  request 43 (budget=8) -> completed
+  engine_idle_waits >= 1
+  engine_shutdown_observed == 1
+```
+
+Interpretation:
+
+```text
+The engine task can now host a long-running serving lifecycle
+without changing how existing gate runs behave.
+```
+
+---
+
+### 8.2 M3b added queued-before-admission cancellation
+
+Before M3b, the only way to cancel a request was the scripted `cancel_plan` + `cancel_after` path,
+which is gate-test plumbing.
+A real serving caller needs a public way to cancel a request after submission but before admission.
+
+Question:
+
+```text
+Can a public cancel_request(rid) cancel a request that has been submitted
+but not yet admitted to a seq_id,
+without ever touching llama mutable state from the caller?
+```
+
+Result:
+
+```text
+Yes.
+engine::cancel_request(rid) is non-blocking, safe from any HPX task,
+and fulfills the matching request_result with status=cancelled
+without binding the request to a seq_id or touching KV.
+```
+
+M3b wired:
+
+```text
+engine::cancel_request(int32_t request_id)
+cancel_inbox_                              (engine-internal deque)
+cancelled_request_ids_                     (engine-task-only set)
+drain_cancel_inbox()                       (engine task only)
+apply_queued_cancellations()               (engine task only)
+fulfill_queued_cancelled()                 (engine task only)
+drain_external_inbox cancel-before-submit-drain shortcut
+```
+
+Queued-cancel snapshot:
+
+```text
+request_result.status                = cancelled
+request_result.n_decoded             = 0
+request_result.admitted_at_iter      = -1
+request_result.kv_cleared            = false
+stream terminal event.close_reason   = cancelled
+```
+
+Counters:
+
+```text
+queued_cancelled
+cancel_request_calls
+cancel_active_not_supported       (legacy stub; preserved by M3c, see 8.3)
+cancel_unknown_request_id
+cancel_request_duplicates
+```
+
+Smoke evidence:
+
+```text
+llama-hpx-engine-queued-cancel-smoke
+  request_id=42 status=cancelled n_decoded=0 admitted_at_iter=-1 stream_close=cancelled
+  queued_cancelled == 1
+  streams_opened == 1, streams_closed_cancelled == 1
+  residual_kv_ok == true
+  engine_shutdown_observed == 1
+```
+
+Boundary:
+
+```text
+engine::cancel_request has no llama_* call sites.
+drain_cancel_inbox has no llama_* call sites.
+apply_queued_cancellations has no llama_* call sites.
+fulfill_queued_cancelled has no llama_* call sites.
+No KV mutation on the queued-cancel path.
+```
+
+Interpretation:
+
+```text
+A caller can now cancel a request between submit_request and admission
+through a public API that never touches llama execution state.
+```
+
+---
+
+### 8.3 M3c extended cancel_request to active/admitted requests
+
+After M3b, a request that had already been admitted could not be cancelled through the public API.
+The engine still finished the request to its full decode budget, ignoring any incoming cancel.
+
+Question:
+
+```text
+Can engine::cancel_request(rid) cancel a request that has been admitted to a seq
+and is actively decoding,
+cooperatively at an iteration boundary,
+without interrupting llama_decode?
+```
+
+Result:
+
+```text
+Yes.
+M3c routes active cancellation through the same public API as M3b
+(engine::cancel_request(rid)),
+preserves the iter-boundary observation discipline,
+and reuses the existing cancel_should_observe / cancel_and_fulfill pipeline.
+```
+
+M3c bridge (apply_queued_cancellations (b) branch):
+
+```text
+find first non-done seq with seq.request_id == rid
+set seq.cancel_requested.store(true, std::memory_order_release)
+bump cancel_active_observed
+emit trace event cancel_active_observed
+erase rid from cancelled_request_ids_
+```
+
+Downstream (unchanged from Cancel Slice 2):
+
+```text
+cancel_should_observe(seq)
+  reads seq.cancel_requested.load(acquire)
+  returns true at iter top
+
+cancel_and_fulfill(seq, iter, mem)
+  clear KV via clear_and_check
+  close stream with reason=cancelled
+  push seq_id onto free_due_to_cancel_
+  fulfill request_result.status=cancelled exactly once
+```
+
+Active-cancel snapshot:
+
+```text
+request_result.status                = cancelled
+request_result.n_decoded             >= 1
+request_result.n_decoded             <  decode_budget
+request_result.cancel_observed_iter  >= 1
+request_result.n_decoded_at_cancel   == request_result.n_decoded
+request_result.kv_cleared            = true
+request_result.pos_max_at_clear      >= 0
+stream terminal event.close_reason   = cancelled
+```
+
+New counter:
+
+```text
+cancel_active_observed
+```
+
+Legacy counter:
+
+```text
+cancel_active_not_supported
+  retained for back-compat with archived M3b evidence
+  must stay zero in M3c+ runs
+  new code MUST NOT bump it
+```
+
+Smoke evidence:
+
+```text
+llama-hpx-engine-active-cancel-smoke
+  request_id=42 status=cancelled n_decoded=1 stream_close=cancelled
+  cancel_active_observed == 1
+  cancel_active_not_supported == 0
+  cancelled_count == 1
+  queued_cancelled == 0
+  residual_kv_ok == true
+  engine_shutdown_observed == 1
+```
+
+Trace evidence:
+
+```text
+cancel_drained request=42
+cancel_active_observed request=42 seq_id=0
+cancel_observed seq=0 iter=2 n_decoded=1
+token_stream_closed request=42 seq_id=0 n_tokens=1 reason=cancelled
+cancel_kv_cleared seq=0 pos_max_at_clear=4 cross_talk_ok=1
+cancel_future_fulfilled seq=0 status=cancelled
+```
+
+Boundary:
+
+```text
+cancel_request never touches llama_*.
+The seq.cancel_requested.store(true) call happens on the engine task
+inside apply_queued_cancellations.
+KV clear / stream close / promise fulfillment all happen on the engine task
+inside cancel_and_fulfill, at iter boundary, never inside llama_decode.
+```
+
+Interpretation:
+
+```text
+A caller can now cancel an admitted, mid-decode request
+through the same rid-based public API as queued cancellation,
+with no separate ergonomic surface.
+```
+
+---
+
+### 8.4 HPX-native boundary preserved across M3
+
+M3 added a long-running engine and a public cancellation API
+without changing who owns what:
+
+```text
+HPX owns:
+  request lifecycle
+  admission
+  futures/promises
+  stream handoff
+  keep-alive / shutdown
+  cancellation control-plane
+  orchestration
+  traces/counters
+
+llama.cpp owns:
+  llama_decode
+  KV implementation
+  tokenizer behavior
+  sampler math
+  ggml graph execution
+  kernels
+```
+
+Grep result on `engine.cpp` for `llama_` / `common_batch_` / `common_tokenize` call sites
+in the M3 control-plane methods:
+
+```text
+engine::submit_request              0
+engine::submit                      0
+engine::request_shutdown            0
+engine::cancel_request              0
+engine::drain_cancel_inbox          0
+engine::apply_queued_cancellations  0
+engine::fulfill_queued_cancelled    0
+```
+
+Smoke clients (`engine_smoke`, `engine_idle_smoke`, `engine_stream_smoke`,
+`engine_keepalive_smoke`, `engine_queued_cancel_smoke`,
+`engine_active_cancel_smoke`) call llama APIs only for backend / model / context
+setup, tokenization, and final cleanup. None of them call:
+
+```text
+llama_decode
+llama_batch_*
+llama_memory_seq_*
+llama_get_logits_ith
+common_batch_add
+```
+
+Only `engine::run` and the private execution helpers it calls touch llama mutable execution state.
+
+---
+
+### 8.5 M3 package validation result
+
+New engine smokes:
+
+```text
+llama-hpx-engine-keepalive-smoke
+llama-hpx-engine-queued-cancel-smoke
+llama-hpx-engine-active-cancel-smoke
+```
+
+Existing engine smokes (still pass byte-identical to M2):
+
+```text
+llama-hpx-engine-smoke
+llama-hpx-engine-idle-smoke
+llama-hpx-engine-stream-smoke
+```
+
+Seven canonical gate smokes (still PASS, normalized stdout diff against
+M3b baselines is empty modulo timing fields `wall_ms` / `ttc_ms_*` /
+`admitted_ttc_ms[*]` and the `model_path` / `request_prompts_file` lines):
+
+```text
+Slice 7 multi-cycle streaming
+Slice 7 trace-on
+Streaming Slice 5 external arrival
+Streaming Slice 6 external × cancel-freed
+Default-mode regression
+Stream-off Live Admission Slice 7
+M1d prompt-file smoke
+```
+
+Trace evidence:
+
+```text
+trace-off gate smokes have 0 [hpx-cb-gate] event= lines
+trace-on Slice 7 has the same per-event-name totals as the M3b baseline
+no cancel_active_not_supported_in_m3b event in any M3c+ run
+```
+
+Interpretation:
+
+```text
+The M3 control-plane additions do not regress any existing engine smoke
+or gate smoke. The new cancellation paths are covered end-to-end by
+dedicated smoke clients.
+```
+
+---
+
+### 8.6 Public API as of M3
+
+The engine package now exposes the following serving-shaped API:
+
+```text
+engine_options:
+  ctx
+  vocab
+  n_vocab
+  batch_capacity
+  n_seq_max
+  initial_idle_slots
+  stream_all
+  keep_alive                              (M3a)
+  plus legacy gate-shaped fields still used by the gate
+```
+
+```text
+submit_request:
+  request_id
+  prompt_tokens
+  decode_budget
+  want_stream
+```
+
+```text
+submit_handle:
+  hpx::future<request_result> result
+  optional HPX token stream receiver
+```
+
+```text
+engine::submit_request(submit_request)            (M2b)
+engine::request_shutdown()                        (M3a)
+engine::cancel_request(int32_t request_id)        (M3b + M3c)
+engine::run()
+```
+
+```text
+request_result:
+  request_id
+  status                  completed | cancelled | failed_reserved
+  n_decoded
+  hash
+  done_iter
+  kv_cleared
+  pos_max_at_clear
+  cancel_observed_iter
+  n_decoded_at_cancel
+  admission/source metadata
+  ttc_us
+```
+
+```text
+token_stream_event:
+  token event
+  closed event with close_reason  completed | cancelled | error
+```
+
+The simplest M3 long-running serving shape is now:
+
+```text
+engine_options.initial_idle_slots = N
+engine_options.keep_alive         = true
+engine eng(std::move(opts));
+
+hpx::async([&] { eng.run(); });
+
+for each work item:
+  submit_request req;
+  req.request_id    = ...;
+  req.prompt_tokens = ...;
+  req.decode_budget = ...;
+  req.want_stream   = true or false;
+  submit_handle h = eng.submit_request(std::move(req));
+  ...
+  optionally eng.cancel_request(req.request_id);
+  request_result rr = h.result.get();
+
+eng.request_shutdown();
+```
+
+Interpretation:
+
+```text
+M3 turns the M2 reusable engine into a long-running HPX serving component
+with a uniform public cancellation API.
+```
+
+---
+
+### 8.7 What M3 intentionally does not claim
+
+M3 does not claim:
+
+```text
+No submit_handle.cancel() ergonomic wrapper.
+No cancellation outcome return value on cancel_request (outcome is on request_result).
+No sampling_config.
+No llama_sampler integration.
+No HTTP / gRPC / Unix-socket / WebSocket server wrapper.
+No deadline / timeout API.
+No production backpressure on token streams.
+No engine-internal metrics export during a long-running engine.
+No engine_options cleanup separating library-public fields from gate-test fields.
+No multi-engine orchestration / pool.
+No reason=error stream-close semantics beyond the engine's bail-out path.
+No performance advantage claim.
+No comparison against llama-server.
+```
+
+Public fields and helpers still gate-shaped (acceptable for M3, candidate cleanup for the next milestone):
+
+```text
+engine_options::prompt_tokens
+engine_options::budgets
+engine_options::waiting_queue                  (must be non-null even when unused)
+engine_options::per_active_prompt_tokens
+engine_options::cancel_plan
+engine_options::cancel_after
+engine_options::release_iter_set
+engine_options::max_decode_iters
+engine_options::stream_all
+
+engine::submit(arrival_msg)                    (internal POD entry; submit_request preferred)
+engine::register_external_release_iter         (gate scripted release/ack barrier only)
+
+engine_result::cancel_active_not_supported     (legacy M3b counter, must remain 0 in M3c+)
+```
+
+---
+
+### 8.8 Overall conclusion
+
+What was proven in this package:
+
+```text
+The engine task can host a long-running serving lifecycle gated by keep_alive.
+The engine task can suspend on an HPX condition variable when idle and exit
+  cleanly on a public request_shutdown signal.
+A single public cancel_request(rid) API can resolve both
+  queued-before-admission and active/admitted requests.
+Queued cancellation never touches KV.
+Active cancellation reuses the existing iter-boundary cancellation pipeline
+  for KV clear, stream close, and promise fulfillment.
+No interruption ever happens inside llama_decode.
+Only the engine task touches llama.cpp mutable execution state.
+The existing gate behavior and the existing engine smokes remain byte-identical.
+```
+
+The reusable package now contains:
+
+```text
+llama-hpx-engine
+llama-hpx-continuous-batch-gate
+llama-hpx-engine-smoke
+llama-hpx-engine-idle-smoke
+llama-hpx-engine-stream-smoke
+llama-hpx-engine-keepalive-smoke
+llama-hpx-engine-queued-cancel-smoke
+llama-hpx-engine-active-cancel-smoke
+```
+
+This closes the M3 package.
+
+Next natural milestone candidates (planning only):
+
+```text
+engine_options cleanup:
+  split gate-flavored fields from library-public fields
+  make engine::submit / engine::register_external_release_iter gate-only
+
+submit_handle.cancel() ergonomic wrapper:
+  thin wrapper over engine::cancel_request(rid)
+  depends on engine_options cleanup
+
+sampling_config / llama_sampler pass-through:
+  per-request sampling on the engine task
+  argmax stays as the default
+
+HTTP / gRPC / Unix-socket server wrapper:
+  depends on sampling and the cleaned-up engine_options
+```
+
+Recommended caution:
+
+```text
+Do not skip engine_options cleanup before adding HTTP transport.
+Do not introduce backpressure or bounded channels without a real serving workload to measure.
+Do not remove the legacy cancel_active_not_supported counter while archived
+  M3b evidence is still consumed; deprecate first, remove later.
+```
+
+## 9. Add HPX serving layer M4-M8 milestones
+
+This section records the documentation update that adds the stable milestone summary for the HPX Serving Layer for llama.cpp.
+
+
+```text
+docs/hpx/hpx_serving_layer_m0_m8_milestone_summary.md
+```
+
+
+### 9.1 Scope
+
+The new milestone summary documents the serving-layer work from the engine cleanup milestones through the matched benchmark harness:
+
+```text
+M4  engine surface cleanup and library-vs-gate split
+M5  cancellation identity hardening
+M6  per-request sampling
+M7  hpx-server HTTP/SSE adapter
+M8  matched hpx-server vs llama-server benchmark harness
+```
+
+The document also includes a short orientation for the earlier foundation milestones M0-M3, but the commit is framed around the M4-M8 serving-layer progression.
+
+### 9.2 Ownership boundary recorded
+
+The summary records the current ownership boundary:
+
+```text
+HPX owns:
+  request lifecycle
+  admission
+  futures/promises
+  streaming handoff
+  cancellation
+  keep-alive/shutdown
+  backpressure
+  server adapter control path
+  matched benchmark harness
+
+llama.cpp owns:
+  llama_model / llama_context execution semantics
+  llama_decode
+  KV memory implementation
+  sampler math
+  tokenizer/vocab behavior
+  ggml graph
+  CPU/Metal/backend kernels
+```
+
+The document preserves the hard invariant:
+
+```text
+Only the engine task touches mutable llama.cpp execution state.
+```
+
+### 9.3 M4-M8 outcomes recorded
+
+M4 records the engine surface cleanup:
+
+```text
+engine_options split into opts.lib / opts.preload / opts.gate_test
+submit_request-only users no longer need fake waiting_queue or fake prompt_tokens
+HPX-native cleanup preserved
+canonical gate output stayed byte-identical
+```
+
+M5 records cancellation identity hardening:
+
+```text
+cancel_token { request_id, epoch }
+stale-token protection for reused request_id
+submit_handle::cancel(engine &) explicit-engine forwarder
+no zero-arg handle cancel
+no raw engine pointer observer
+```
+
+M6 records per-request sampling:
+
+```text
+sampling_config plumbed end-to-end
+stochastic mode uses per-seq llama_sampler chains
+top_k / top_p / temperature wired
+greedy/default path remains local argmax and byte-identical
+sampler isolation smoke passes
+```
+
+M7 records the HTTP/SSE serving adapter:
+
+```text
+tools/hpx-server/ added
+POST /completion non-streaming
+optional sampling JSON
+SSE streaming
+client-disconnect cancellation
+--max-concurrent backpressure
+stream-disconnect capacity release proof
+cpp-httplib documented as the explicit non-HPX HTTP adapter boundary
+```
+
+M8 records the matched benchmark harness:
+
+```text
+hpx-bench/experiments/12_hpx_vs_llama_server_pair/ added
+hpx-server --ctx-size precursor added for matched n_ctx
+minimal matched pair-run
+repeat stability
+non-streaming 2x2 matrix
+EOG-stop semantics correction
+canonical streaming TTFT capture
+streaming 2x2 matrix
+```
+
+### 9.4 Validation anchors recorded
+
+The milestone summary records these stable anchors:
+
+```text
+HPX canonical greedy p0_b8:
+  0x0619d4d1900c2365
+
+HPX greedy p0_b32:
+  0x6794e47fe0f84af1
+
+Default stochastic seed=42:
+  0xa8e14acb4094aa3f
+```
+
+M8 evidence run IDs recorded:
+
+```text
+20260521-231710-pair  # non-streaming 2x2 matrix, gates=PASS
+20260521-233521-pair  # canonical streaming, 10 repeats, gates=PASS
+20260521-234615-pair  # streaming 2x2 matrix, gates=PASS
+```
+
+The document states that the benchmark harness records raw values only. It does not publish aggregation, percentiles, averaged TTFT, throughput claims, or cross-server performance conclusions.
+
+### 9.5 EOG-stop and streaming semantics recorded
+
+The summary records the corrected serving and harness semantics:
+
+```text
+decode_budget / n_predict is an upper bound, not an exact-count guarantee.
+```
+
+For the EOG-sensitive p1 prompt, the documented behavior is:
+
+```text
+hpx-server:
+  n_decoded = 0
+  hash = 0x0000000000000000
+  empty text
+
+llama-server:
+  tokens_predicted = 1
+  empty content
+  stop_type = eos
+```
+
+The document records that:
+
+```text
+cross-server n_decoded equality is recorded, not gated
+cross-server text equality is not gated
+```
+
+For streaming mode, it records that:
+
+```text
+hpx-server streams per-token detokenized text
+llama-server streams chunk text
+streaming text reconstruction differs between the two servers
+streaming ok=True means a clean terminal stream record, not necessarily non-empty text
+```
+
+### 9.6 HPX nativity assessment recorded
+
+The summary records the current HPX-nativity assessment:
+
+```text
+No live std::thread / std::mutex / std::condition_variable /
+std::this_thread::sleep_for in authored HPX engine/server control-plane code,
+based on current validation reports.
+```
+
+Accepted boundaries and caveats:
+
+```text
+std::atomic appears only in accepted adapter-boundary/counter contexts
+cpp-httplib remains the explicit non-HPX HTTP adapter boundary
+Python benchmark harness is external measurement infrastructure, not HPX runtime code
+```
+
+### 9.7 Known limitations recorded
+
+The document records these limitations:
+
+```text
+No OpenAI-compatible endpoint yet.
+cpp-httplib remains the non-HPX HTTP adapter boundary.
+No auth, TLS, or production-grade shutdown.
+No multi-model loading or model swap.
+No HTTP-side queueing beyond strict door-cap rejection.
+hpx-server does not expose prompt-token count in /completion.
+Benchmark harness records raw values only.
+No performance claims.
+Handler/test duplication exists in server smokes.
+```
+

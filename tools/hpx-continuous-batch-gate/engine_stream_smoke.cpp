@@ -157,22 +157,27 @@ int main(int argc, char ** argv) {
     const int32_t batch_capacity = std::max<int32_t>(
         static_cast<int32_t>(shared_prompt.size()), 1);
 
-    std::vector<waiting_request> empty_waiting;
-
     engine_options opts;
-    opts.ctx                = ctx;
-    opts.vocab              = vocab;
-    opts.n_vocab            = n_vocab;
-    opts.prompt_tokens      = &shared_prompt;
-    opts.budgets            = {};
-    opts.batch_capacity     = batch_capacity;
-    opts.cancel_after       = -1;
-    opts.n_seq_max          = 1;
-    opts.waiting_queue      = &empty_waiting;
-    opts.reuse_completed    = false;
-    opts.max_decode_iters   = 0;
-    opts.stream_all         = false;
-    opts.initial_idle_slots = 1;
+    opts.lib.ctx                  = ctx;
+    opts.lib.vocab                = vocab;
+    opts.lib.n_vocab              = n_vocab;
+    opts.lib.batch_capacity       = batch_capacity;
+    opts.lib.n_seq_max            = 1;
+    opts.lib.initial_idle_slots   = 1;
+    // M4c: preload.prompt_tokens is optional when preload.budgets is
+    // empty. submit_request carries its own per-request prompt vector
+    // below.
+    opts.preload.prompt_tokens    = nullptr;
+    opts.preload.budgets          = {};
+    // M4b: exercise the null waiting_queue path together with the
+    // per-request streaming path. submit_request(want_stream=true)
+    // must work without preloaded waiting requests, stream_all, or
+    // take_admitted_stream_handoffs().
+    opts.preload.waiting_queue    = nullptr;
+    opts.preload.reuse_completed  = false;
+    opts.preload.stream_all       = false;
+    opts.gate_test.cancel_after     = -1;
+    opts.gate_test.max_decode_iters = 0;
 
     try {
         engine eng(std::move(opts));
