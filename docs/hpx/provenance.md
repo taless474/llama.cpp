@@ -4129,3 +4129,452 @@ No performance claims.
 Handler/test duplication exists in server smokes.
 ```
 
+
+## 10. Add HPX serving-control placement and responsiveness evidence
+
+This section records the post-M8 HPX serving-control checkpoint. It covers the
+HPX-native engine inbox, runtime placement, hpx-server placement support,
+responsiveness experiments, and the shutdown-liveness fix for queued-but-unadmitted
+requests.
+
+### 10.1 Engine inbox and phase-structured actor loop recorded
+
+This checkpoint records the N1 HPX-native inbox rewrite:
+
+```text
+producer-side mutex/cv/deque inbox removed
+HPX local channel inbox added
+typed inbox_msg used for arrivals, cancels, token cancels, and shutdown
+engine-task-only staged queues added
+submit_request preserves epoch assignment + publish ordering
+```
+
+The engine actor remains the only owner of llama.cpp mutable execution state:
+
+```text
+one llama_context
+one llama_batch
+one engine task
+many request ids / seq ids
+per-request futures/promises
+per-request stream channels
+```
+
+The N3.0 phase extraction is recorded as a structural refactor, not a semantic change:
+
+```text
+iter_observe_cancellations
+iter_run_admissions
+iter_build_batch
+iter_run_decode
+iter_sample_and_finalize
+iter_fire_release_ack_barrier
+```
+
+The documented phase-order invariants are preserved:
+
+```text
+cancel observation occurs outside llama_decode
+admission priority is preserved
+llama_decode remains between batch build and sampling
+publish_token occurs before n_decoded++
+close_stream occurs before set_value
+```
+
+### 10.2 Engine-pool runtime placement recorded
+
+This checkpoint records opt-in HPX runtime placement support:
+
+```text
+runtime_config { enable_engine_pool }
+hpx_runtime::start_once(os_threads, runtime_config)
+named single-PU "engine" pool via HPX resource partitioner
+hpx_runtime::async_on_engine(...)
+LLAMA_HPX_PLACEMENT_TRACE=1 placement evidence
+```
+
+The default path remains unchanged:
+
+```text
+--engine-pool off:
+  async_on_engine falls through to hpx::async
+
+--engine-pool on:
+  engine actor runs on the named "engine" pool
+```
+
+The gate exposes:
+
+```text
+--engine-pool
+--hpx-os-threads
+```
+
+The placement path is fail-closed:
+
+```text
+--engine-pool requires enough HPX OS threads
+engine-pool creation is checked after runtime start
+async_on_engine rechecks placement availability at spawn time
+no silent fallback to default pool when engine-pool was requested
+```
+
+### 10.3 Pump cooperativity and queued-cancel race fix recorded
+
+This checkpoint records placement-aware pump cooperativity:
+
+```text
+engine_options::lib.cooperative_yield_on_pump
+default-pool path keeps the cooperative yield
+engine-pool path disables the pump yield
+engine remains placement-agnostic except for ctor-time options
+```
+
+It also records the outer-tail staged-work fix for the queued-cancel race:
+
+```text
+after pump_inbox_nonblocking(), the engine must not park if staged work exists
+staged arrivals or staged cancels force the loop to continue
+request_shutdown remains governed by the shutdown predicate
+```
+
+The actor invariant recorded for this fix is:
+
+```text
+never suspend on the inbox while actionable staged work is already staged
+```
+
+The reproducer evidence came from queued-cancel and responsiveness-bench runs. The
+fixed path was validated by existing queued-cancel smokes, the engine-pool queued-cancel
+smoke, the default gate, and the placement-on gate.
+
+### 10.4 hpx-server engine-pool support recorded
+
+This checkpoint records N4 hpx-server placement support:
+
+```text
+tools/hpx-server/ accepts --engine-pool
+tools/hpx-server/ accepts --hpx-os-threads
+hpx-server uses hpx_runtime::start_once(..., runtime_config)
+hpx-server spawns the engine via hpx_runtime::async_on_engine
+cooperative_yield_on_pump is disabled when --engine-pool is active
+```
+
+Default behavior remains unchanged:
+
+```text
+--engine-pool is off by default
+hpx-server default path remains on the HPX default pool
+HTTP/SSE adapter semantics are unchanged
+cpp-httplib remains the explicit non-HPX HTTP adapter boundary
+```
+
+A dedicated N4 smoke was added:
+
+```text
+llama-hpx-server-engine-pool-smoke
+```
+
+The smoke covers:
+
+```text
+engine-pool placement
+canonical round-trip request
+SSE client-disconnect path
+post-disconnect sanity request
+clean engine/server shutdown
+```
+
+The recorded placement evidence includes:
+
+```text
+engine_task_placement pool=engine
+```
+
+### 10.5 Experiment 13 recorded: internal control-plane responsiveness
+
+Experiment 13 was added under:
+
+```text
+hpx-bench/experiments/13_control_plane_responsiveness/
+```
+
+It records internal HPX control-plane responsiveness, not decode speed or throughput.
+
+Experiment 13 Phase 1 measured:
+
+```text
+W2 queued-cancel responsiveness
+W3 multi-request streaming with serial stream drain
+```
+
+Experiment 13 Phase 2 corrected W3 measurement:
+
+```text
+W3 stream consumers changed to concurrent consumer-side draining
+token_publish_us renamed / reframed as token_receive_us
+inter-token gap now records adapter-observed receive cadence
+```
+
+Recorded interpretation:
+
+```text
+W2 queued-cancel:
+  engine-pool improves control-plane tail latency
+
+W3 streaming:
+  decode-dominated
+  engine-pool does not improve streaming completion or throughput
+```
+
+The valid performance claim is narrow:
+
+```text
+engine-pool placement improves queued-cancel / control-plane tail responsiveness
+in Experiment 13
+```
+
+The document does not claim:
+
+```text
+HPX improves llama_decode speed
+HPX improves token throughput
+HPX improves decode-dominated streaming completion
+HPX is faster than upstream llama.cpp
+```
+
+### 10.6 Experiment 14 recorded: end-to-end hpx-server responsiveness
+
+Experiment 14 was added under:
+
+```text
+hpx-bench/experiments/14_hpx_server_end_to_end_responsiveness/
+```
+
+It records client-visible hpx-server behavior, not internal engine timing.
+
+Experiment 14 Phase 1 compares hpx-server placement modes:
+
+```text
+default_os1
+default_os2
+engine_pool_os2
+```
+
+The Phase 1 scope intentionally excludes llama-server:
+
+```text
+no llama-server comparison in Phase 1
+no cross-server conclusion
+no upstream-vs-HPX performance claim
+```
+
+Recorded workloads include:
+
+```text
+W1 non-streaming round-trip
+W2 full SSE streaming
+W3 SSE disconnect / client-visible disconnect behavior
+```
+
+Recorded interpretation:
+
+```text
+default_os1 -> default_os2:
+  improves W1/W2 client-visible latency
+
+default_os2 -> engine_pool_os2:
+  neutral-to-slightly-negative on end-to-end client-visible metrics
+```
+
+The recorded conclusion is:
+
+```text
+engine-pool remains opt-in
+engine-pool is useful for placement/correctness diagnostics and internal control-plane
+tail behavior
+engine-pool is not an end-to-end latency win for this single-client decode-dominated
+Exp14 workload
+```
+
+### 10.7 N5b shutdown-liveness fix recorded
+
+This checkpoint records the N5b shutdown-liveness issue and fix.
+
+The isolated N5b bug shape is:
+
+```text
+request is queued
+no admission source exists
+request_shutdown() is issued
+engine must resolve queued work and join
+```
+
+A new smoke was added:
+
+```text
+llama-hpx-engine-shutdown-queued-unadmittable-smoke
+```
+
+The pre-fix red behavior was:
+
+```text
+request queued and not admitted
+request_shutdown issued
+engine did not join within bounded wait
+controlled FAIL, no crash, no SIGKILL, no uncaught exception
+```
+
+The accepted N5b fix records a shutdown contract:
+
+```text
+when shutdown is requested and no active seqs exist,
+drain queued-but-not-admitted requests,
+resolve their promises with a defined terminal status,
+close queued stream channels if present,
+observe shutdown,
+exit the engine loop,
+allow engine_fut.get() to return
+```
+
+Queued-at-shutdown requests resolve as:
+
+```text
+request_status::failed_reserved
+```
+
+This status is used to distinguish shutdown-aborted queued work from user cancellation:
+
+```text
+cancelled:
+  user/request cancellation
+
+failed_reserved:
+  shutdown-aborted queued work
+```
+
+The N5b fix does not change:
+
+```text
+llama_decode
+admission priority
+active request behavior
+cancel_and_fulfill
+finalize_and_fulfill
+stream close ordering for admitted/active requests
+hpx-server
+hpx_runtime
+```
+
+### 10.8 N5a remains deferred
+
+N5a remains documented but not fixed.
+
+The deferred N5a issue is:
+
+```text
+active cancel
+-> slot enters cancel_freed path
+-> next request admits from cancel_freed
+-> that request completes naturally
+-> later request may not be admitted because slot recovery is incomplete
+```
+
+The suspected root cause is in the completion-side slot repush logic:
+
+```text
+reuse_completed=false
+admission_src=cancel_freed
+finalize_and_fulfill does not return the seq_id to an admission pool
+```
+
+The proposed future fix is documented separately and was not applied in this checkpoint.
+
+The checkpoint explicitly records:
+
+```text
+N5b shutdown liveness is fixed
+N5a slot recovery remains deferred
+```
+
+### 10.9 Validation anchors recorded
+
+The checkpoint preserves the canonical HPX hash anchor:
+
+```text
+HPX canonical greedy p0_b8:
+  0x0619d4d1900c2365
+```
+
+Validated paths recorded for this checkpoint include:
+
+```text
+engine queued-cancel smoke
+engine active-cancel smoke
+engine keepalive multi-submit smoke
+engine idle smoke
+engine-pool queued-cancel smoke
+N5b shutdown queued-unadmittable smoke
+default continuous-batch gate
+placement-on continuous-batch gate
+hpx-server engine-pool smoke
+```
+
+The placement-on gate records:
+
+```text
+engine_task_placement pool=engine
+p0_b8 hash unchanged
+```
+
+The hpx-server engine-pool smoke records:
+
+```text
+canonical round-trip hash unchanged
+SSE disconnect path succeeds
+residual_kv_ok = 1
+decode_failures = 0
+```
+
+### 10.10 Documentation and experiment index recorded
+
+This checkpoint adds or updates documentation for discoverability:
+
+```text
+README.md
+docs/hpx/hpx_serving_layer_architecture.md
+docs/hpx/n5_deferred_slot_recovery_note.md
+hpx-bench/experiments/README.md
+hpx-bench/experiments/13_control_plane_responsiveness/
+hpx-bench/experiments/14_hpx_server_end_to_end_responsiveness/
+```
+
+The experiment index records:
+
+```text
+Experiment 13:
+  internal HPX control-plane responsiveness
+
+Experiment 14:
+  end-to-end hpx-server client-visible responsiveness
+```
+
+The architecture documentation records the layering distinction:
+
+```text
+Layer 1:
+  adapter boundary
+
+Layer 2:
+  runtime placement / engine-pool
+
+Layer 3:
+  engine actor
+
+Layer 4:
+  phase contracts
+
+Layer 5:
+  future dataflow evolution
+```
+

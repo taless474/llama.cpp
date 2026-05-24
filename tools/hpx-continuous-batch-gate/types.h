@@ -271,6 +271,31 @@ struct request_result {
     // waiters admitted via the Slice 2..5 path. external only for
     // arrivals that entered through engine::submit(). ---------------------
     arrival_source           arrival_src          = arrival_source::preloaded;
+
+    // ---- N3.1: control-plane responsiveness timestamps (Exp 13) ---------
+    // Absolute steady_clock::time_since_epoch() microseconds, written
+    // by the engine task ONLY when
+    // engine_options::lib.enable_responsiveness_timing == true.
+    // Default -1 means "field not populated for this result". All four
+    // fields default to -1 on every existing path (smokes, gate,
+    // hpx-server, M8 configs) because they leave the option off.
+    //
+    // Semantics:
+    //   t_admitted_us         set at admit_one bind site (live admission)
+    //   t_first_publish_us    set at the first publish_token call for
+    //                         this seq (streaming requests only)
+    //   t_complete_us         set in finalize_and_fulfill, just before
+    //                         the request_status::completed promise
+    //   t_cancel_observed_us  set in cancel_and_fulfill (active cancel)
+    //                         or fulfill_queued_cancelled (queued cancel)
+    //
+    // Preloaded actives keep t_admitted_us=-1: they are not admitted
+    // through submit_request and are not part of the responsiveness
+    // surface.
+    int64_t                  t_admitted_us        = -1;
+    int64_t                  t_first_publish_us   = -1;
+    int64_t                  t_complete_us        = -1;
+    int64_t                  t_cancel_observed_us = -1;
 };
 
 // ---- Per-seq state (engine-internal) ------------------------------------
@@ -328,6 +353,21 @@ struct seq_state {
     // (rid, epoch) pair, so a late completion of an older incarnation
     // cannot wipe the live entry of a newer same-rid submission.
     uint64_t                 epoch                        = 0;
+
+    // ---- N3.1: responsiveness timestamps (Exp 13) ----------------------
+    // Engine-task-only carriers; copied into the matching request_result
+    // fields at fulfill time. Default -1; only written when
+    // engine_options::lib.enable_responsiveness_timing == true.
+    // t_admitted_us and t_first_publish_us are reset to -1 on every
+    // admit_one rebind so a prior slot owner's stamps cannot leak. The
+    // fulfill-time fields (t_complete_us, t_cancel_observed_us) are
+    // written immediately before fulfill_promise; no rebind reset
+    // needed for them because they are produced and consumed in the
+    // same iteration's fulfill path.
+    int64_t                  t_admitted_us                = -1;
+    int64_t                  t_first_publish_us           = -1;
+    int64_t                  t_complete_us                = -1;
+    int64_t                  t_cancel_observed_us         = -1;
 
     // ---- streaming token channel (Slice 8: HPX-native local channel) ----
     // stream_enabled is set in engine ctor when --stream-all is on; it is

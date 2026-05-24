@@ -105,6 +105,15 @@ void print_usage(const char * argv0) {
         "                            published by the engine task; main\n"
         "                            drains the chain after engine_fut.\n"
         "                            OFF preserves Slice 7 semantics.\n"
+        "  --engine-pool             default: OFF\n"
+        "                            N2.5: opt into a single-PU named HPX\n"
+        "                            'engine' thread pool created by the\n"
+        "                            resource_partitioner at startup. The\n"
+        "                            engine HPX task runs on that pool;\n"
+        "                            producer/cancel tasks run on the\n"
+        "                            default pool. Requires --hpx-os-\n"
+        "                            threads >= 2. OFF preserves N3.0\n"
+        "                            spawn behavior byte-for-byte.\n"
         "  --request-prompts-file <path>   default: <unset>\n"
         "                            M1d: per-request prompt source.\n"
         "                            One prompt per line. Line i is the\n"
@@ -241,6 +250,10 @@ bool parse_args(int argc, char ** argv, cli_args & args) {
         } else if (a == "--stream-all") {
             // Slice 8 boolean flag, no value.
             args.stream_all = true;
+        } else if (a == "--engine-pool") {
+            // N2.5 boolean flag, no value. Validation happens in
+            // hpx_runtime::start_once (requires hpx_os_threads >= 2).
+            args.engine_pool = true;
         } else if (a == "--request-prompts-file") {
             const char * v = need("--request-prompts-file");
             if (!v) return false;

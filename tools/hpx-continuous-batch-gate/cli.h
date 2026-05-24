@@ -24,6 +24,11 @@ struct cli_args {
     int32_t              n_seqs        = 99;
     int32_t              hpx_os_threads = 1;
     int32_t              repeat        = 1;
+    // N2.5: opt into the named single-PU HPX engine thread pool
+    // created by hpx_runtime::start_once. Default OFF — behavior
+    // byte-identical to N3.0. ON requires --hpx-os-threads >= 2;
+    // hpx_runtime::start_once fails closed otherwise.
+    bool                 engine_pool   = false;
     std::vector<int32_t> decode_budget_mix = {8, 64, 256};
 
     // Cancel Slice 1: plan is parsed and printed, asserted against the

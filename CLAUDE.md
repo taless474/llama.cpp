@@ -195,7 +195,8 @@ Do not write outputs to `/tmp`.
 For current correctness-gate captures, use:
 
 ```text
-local/
+local//runs/<slice-or-experiment>/<short-label>/
+
 ```
 For simulator-generated outputs, use the simulator's own gitignored result directory:
 

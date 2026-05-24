@@ -1,0 +1,7 @@
+# Generated run artifacts (JSONL, logs, summary.csv, manifest.json) are
+# reproducible from bench.py + the hpx-server binary. Track only the
+# driver and docs; results land here and stay local unless explicitly
+# committed.
+results/
+__pycache__/
+*.pyc

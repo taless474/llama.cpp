@@ -78,6 +78,22 @@ add_executable(llama-hpx-engine-queued-cancel-smoke engine_queued_cancel_smoke.c
 target_compile_features(llama-hpx-engine-queued-cancel-smoke PRIVATE cxx_std_17)
 target_link_libraries(llama-hpx-engine-queued-cancel-smoke PRIVATE llama-hpx-engine)
 
+# N2.7: engine-pool variant of the queued-cancel smoke. Same scenario
+# as engine-queued-cancel-smoke but with the engine task running on
+# the named single-PU HPX engine pool (start_once with
+# enable_engine_pool=true; spawn via hpx_runtime::async_on_engine).
+# Sets engine_options::lib.cooperative_yield_on_pump=false. Acts as
+# the permanent regression guard for the N2.6b / N2.6c scheduler-
+# livelock hazard: a regression that re-enables the yield under
+# engine-pool placement will hang here. Built by default;
+# intentionally not installed.
+add_executable(llama-hpx-engine-queued-cancel-engine-pool-smoke
+    engine_queued_cancel_engine_pool_smoke.cpp)
+target_compile_features(llama-hpx-engine-queued-cancel-engine-pool-smoke
+    PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-queued-cancel-engine-pool-smoke
+    PRIVATE llama-hpx-engine)
+
 # M3c: active-request cancellation smoke client. Proves
 # engine::cancel_request(rid) cooperatively cancels a request that
 # has been admitted to a seq and is actively decoding — the engine
@@ -138,6 +154,19 @@ add_executable(llama-hpx-engine-keepalive-multi-submit-smoke engine_keepalive_mu
 target_compile_features(llama-hpx-engine-keepalive-multi-submit-smoke PRIVATE cxx_std_17)
 target_link_libraries(llama-hpx-engine-keepalive-multi-submit-smoke PRIVATE llama-hpx-engine)
 
+# N5b: shutdown-vs-queued-but-unadmittable liveness reproducer. Single
+# engine (n_seq_max=1, initial_idle_slots=0, budgets={}, keep_alive=true)
+# with one non-streaming request drained to waiting_queue_consumable_ but
+# never admittable. Tests whether request_shutdown() joins the engine.
+# Pre-fix: engine re-parks (outer-tail shutdown-break is gated on an
+# empty waiting queue), so the smoke FAILs cleanly via bounded join
+# timeout + _Exit(nonzero). Post-fix: engine joins and the queued
+# request resolves to a terminal status. Built by default; intentionally
+# not installed.
+add_executable(llama-hpx-engine-shutdown-queued-unadmittable-smoke engine_shutdown_queued_unadmittable_smoke.cpp)
+target_compile_features(llama-hpx-engine-shutdown-queued-unadmittable-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-shutdown-queued-unadmittable-smoke PRIVATE llama-hpx-engine)
+
 # M6b: seeded stochastic sampling smoke. Proves the four M6b
 # correctness properties on a single keep-alive engine:
 #   (1) same-seed reproducibility — two seed=42 requests collapse to
@@ -153,6 +182,22 @@ target_link_libraries(llama-hpx-engine-keepalive-multi-submit-smoke PRIVATE llam
 add_executable(llama-hpx-engine-sampling-stochastic-smoke engine_sampling_stochastic_smoke.cpp)
 target_compile_features(llama-hpx-engine-sampling-stochastic-smoke PRIVATE cxx_std_17)
 target_link_libraries(llama-hpx-engine-sampling-stochastic-smoke PRIVATE llama-hpx-engine)
+
+# N3.1 / Experiment 13: control-plane responsiveness benchmark.
+# Dedicated binary linked against llama-hpx-engine. Phase 1 supports
+# the W2 (queued-cancel) and W3 (multi-request streaming) workloads.
+# Always sets engine_options::lib.enable_responsiveness_timing=true
+# so the four request_result responsiveness timestamp fields are
+# populated. The gate, all existing smokes, and hpx-server leave that
+# option off, so they are unaffected by this binary. Built by
+# default; intentionally not installed (benchmark artifact, not a
+# deployable tool).
+add_executable(llama-hpx-continuous-batch-responsiveness-bench
+    hpx_continuous_batch_responsiveness_bench.cpp)
+target_compile_features(llama-hpx-continuous-batch-responsiveness-bench
+    PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-continuous-batch-responsiveness-bench
+    PRIVATE llama-hpx-engine)
 
 # M6c: per-seq sampler isolation smoke. Single keep_alive engine
 # with n_seq_max=2 and initial_idle_slots=2. Submits two stochastic

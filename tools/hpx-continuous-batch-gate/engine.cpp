@@ -32,6 +32,17 @@ namespace {
 
 using namespace token_hash;
 
+// N3.1 (Exp 13): absolute steady_clock microseconds since the
+// system's steady_clock epoch. Called only when
+// engine.enable_responsiveness_timing_ is true; with the flag off
+// no engine path executes this. Producers (benchmark binary) use
+// the same expression so engine-side and submitter-side stamps
+// share a single time domain.
+inline int64_t now_us() noexcept {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 llama_token argmax(const float * logits, int32_t n_vocab) {
     llama_token best   = 0;
     float       best_v = logits[0];
@@ -121,6 +132,8 @@ engine::engine(engine_options opts)
       waiting_queue_(opts.preload.waiting_queue),
       reuse_completed_(opts.preload.reuse_completed),
       keep_alive_(opts.lib.keep_alive),
+      cooperative_yield_on_pump_(opts.lib.cooperative_yield_on_pump),
+      enable_responsiveness_timing_(opts.lib.enable_responsiveness_timing),
       iter_release_set_(std::move(opts.gate_test.release_iter_set)),
       max_decode_iters_(opts.gate_test.max_decode_iters),
       stream_all_(opts.preload.stream_all)
@@ -287,35 +300,125 @@ std::vector<token_stream_receiver> engine::take_stream_receivers() {
 void engine::submit(arrival_msg msg) {
     const int32_t rid = msg.request_id;
     const int32_t bud = msg.decode_budget;
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        inbox_.push_back(std::move(msg));
-    }
-    // M3a: wake the engine task if it is idle-waiting on inbox_cv_
-    // under keep_alive=true. Notify outside the inbox_mtx_ critical
-    // section above; the predicated cv-wait form is lost-wakeup safe
-    // because the waiter re-acquires inbox_mtx_ and re-checks the
-    // predicate before sleeping. With keep_alive=false the engine
-    // never suspends on inbox_cv_, so this is a cheap no-op notify
-    // on every existing gate-smoke path.
-    inbox_cv_.notify_one();
+    // N1: publish a `submission` inbox_msg onto the HPX inbox
+    // channel. The engine task pumps the channel at its next
+    // predicate-evaluation site (inbox_has_pending or the outer-
+    // loop tail). channel<T>::set takes T by value with HPX_MOVE
+    // forwarding, supporting move-only inbox_msg (arrival is move-
+    // only via hpx::promise + optional<channel>).
+    inbox_msg im;
+    im.k = inbox_msg_kind::submission;
+    im.arrival.emplace(std::move(msg));
+    inbox_chan_.set(std::move(im));
     trace::event(
         "request_submitted_external request=%d budget=%d "
         "arrival_source=external",
         rid, bud);
 }
 
-// M2f: read-only inbox-non-empty probe used by the decode-loop
-// predicate. Acquires the existing inbox spinlock the same way
-// submit() does, then peeks deque::empty(). Engine task only. No
-// llama.cpp API call sites — pure HPX-side metadata access.
-// Non-const intentionally: hpx::spinlock is not a const-mutex type
-// (lock_guard requires a non-const mutex ref), and inbox_mtx_ is
-// declared without `mutable`. Marking inbox_mtx_ mutable was avoided
-// per M2f guidance.
+// M2f: engine-task-only. N1: pumps the HPX inbox channel non-
+// blocking into the staged_* deques, then reports whether any
+// staged arrival is now visible. Non-const because the pump
+// mutates pending_msg_ and staged_arrivals_. MUST NOT be called
+// from foreign/server threads — staged_* deques are unguarded and
+// accessed exclusively by run().
 bool engine::inbox_has_pending() {
-    std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-    return !inbox_.empty();
+    pump_inbox_nonblocking();
+    return !staged_arrivals_.empty();
+}
+
+// N1: stage one pumped inbox_msg into the engine-task-only
+// staged_* deque or the staged_shutdown_ latch. Engine task only.
+void engine::stage_one(inbox_msg m) {
+    switch (m.k) {
+        case inbox_msg_kind::submission:
+            // arrival is guaranteed populated for k=submission;
+            // every producer that publishes a submission emplaces
+            // the arrival_msg before set().
+            staged_arrivals_.push_back(std::move(*m.arrival));
+            break;
+        case inbox_msg_kind::cancel_rid:
+            staged_cancel_rids_.push_back(m.rid);
+            break;
+        case inbox_msg_kind::cancel_token:
+            staged_cancel_tokens_.push_back(m.token);
+            break;
+        case inbox_msg_kind::shutdown:
+            staged_shutdown_ = true;
+            break;
+    }
+}
+
+// N1: drain every channel-buffered message into staged_* without
+// blocking. Maintains the invariant that pending_msg_ is valid
+// (queued on the channel for the next not-yet-arrived message) at
+// function exit. Engine task only.
+//
+// N2.7 / N2.7b: placement-selected cooperativity. Two operating
+// modes, decided at spawn time by the caller (Layer 2) and carried
+// into the engine as `cooperative_yield_on_pump_` from
+// engine_options::lib.cooperative_yield_on_pump:
+//
+//   - Default-pool placement (default true). Under small HPX
+//     worker-thread counts (especially os_threads=1) the engine
+//     task and the producer/cancel tasks share workers; without
+//     yielding, a foreign-thread or HPX-task call to
+//     engine::cancel_request / engine::submit may not be observed
+//     in time and the engine_queued_cancel_smoke pattern can hang
+//     (N2.6 evidence). The yield gives the scheduler a chance to
+//     dispatch producer work between pump calls.
+//
+//   - Named engine-pool placement (caller sets false). When the
+//     engine runs on a dedicated single-PU HPX pool, yield causes
+//     a scheduler livelock (N2.6b / N2.6c evidence). Removing the
+//     yield alone is insufficient: pump becomes pure-userspace
+//     polling that can lose the race against a foreign-thread
+//     inbox_chan_.set(...) before the engine suspends in
+//     wait_inbox_blocking() (N2.7b evidence: 1/3 hang without any
+//     synchronization point). The engine-pool branch therefore
+//     issues one nonblocking pending_msg_.wait_for(0ns) as a
+//     future/channel readiness synchronization point. wait_for(0)
+//     touches the future's shared state, which propagates any
+//     just-published value into is_ready without re-pending the
+//     engine task.
+//
+// Cancellation semantics are unchanged in either mode: inbox
+// messages are still staged/pumped only at iteration boundaries
+// here and in wait_inbox_blocking(), and cancellation is still
+// not observed from inside llama_decode.
+void engine::pump_inbox_nonblocking() {
+    if (cooperative_yield_on_pump_) {
+        hpx::this_thread::yield();
+    }
+    if (!pending_msg_.valid()) {
+        pending_msg_ = inbox_chan_.get();
+    }
+    if (!cooperative_yield_on_pump_) {
+        pending_msg_.wait_for(std::chrono::nanoseconds(0));
+    }
+    while (pending_msg_.is_ready()) {
+        stage_one(pending_msg_.get());
+        pending_msg_ = inbox_chan_.get();
+    }
+}
+
+// N1: HPX-suspend the engine task on the inbox channel until at
+// least one new message arrives, stage it, then drain any follow-
+// up ready messages. Replaces the M3a condition_variable_any
+// idle-wait. Engine task only.
+void engine::wait_inbox_blocking() {
+    if (!pending_msg_.valid()) {
+        pending_msg_ = inbox_chan_.get();
+    }
+    // pending_msg_.get() parks the engine HPX task on the channel's
+    // shared state if no message is ready. HPX-native suspension —
+    // not std::condition_variable::wait.
+    stage_one(pending_msg_.get());
+    pending_msg_ = inbox_chan_.get();
+    while (pending_msg_.is_ready()) {
+        stage_one(pending_msg_.get());
+        pending_msg_ = inbox_chan_.get();
+    }
 }
 
 submit_handle engine::submit_request(struct submit_request req) {
@@ -323,21 +426,6 @@ submit_handle engine::submit_request(struct submit_request req) {
     // into the returned handle so the caller owns it directly.
     hpx::promise<request_result> promise;
     hpx::future<request_result>  fut = promise.get_future();
-
-    // M5a: bump next_epoch_ under inbox_mtx_ so concurrent
-    // submit_request callers each receive a unique monotonically
-    // increasing epoch. The same lock will be re-acquired briefly by
-    // submit() below for the inbox push; that's the existing pattern
-    // and we accept the two short critical sections rather than
-    // widening one to cover the rest of msg/handle assembly. Epoch
-    // starts at 1 (0 is the "unset" sentinel for arrivals that never
-    // came through submit_request, e.g. the gate's direct
-    // engine::submit(arrival_msg) submitter path).
-    uint64_t issued_epoch = 0;
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        issued_epoch = next_epoch_++;
-    }
 
     // Build the engine-internal arrival_msg. All llama-touching work
     // happens later inside the engine task; this method only moves
@@ -349,7 +437,6 @@ submit_handle engine::submit_request(struct submit_request req) {
     msg.src           = arrival_source::external;
     msg.promise       = std::move(promise);
     msg.want_stream   = req.want_stream;
-    msg.epoch         = issued_epoch;
     // M6a: carry per-request sampling configuration through the inbox.
     // `sampling_config` is a small POD; a copy here is cheap and keeps
     // `submit_request` reusable by the caller after this call returns.
@@ -361,7 +448,6 @@ submit_handle engine::submit_request(struct submit_request req) {
     h.result            = std::move(fut);
     h.stream            = std::nullopt;
     h.token.request_id  = req.request_id;
-    h.token.epoch       = issued_epoch;
     // M2g: per-request opt-in streaming. Build the HPX channel on the
     // caller's side, hand the receiver to the caller via
     // submit_handle.stream, and move the channel into arrival_msg.
@@ -375,55 +461,72 @@ submit_handle engine::submit_request(struct submit_request req) {
         msg.stream_channel.emplace(std::move(chan));
         h.stream.emplace(std::move(rx));
     }
-    submit(std::move(msg));
+
+    // N1: bump next_epoch_ AND publish the submission onto the HPX
+    // inbox channel under a single hpx::spinlock critical section.
+    // Holding the lock across submit() (which calls
+    // inbox_chan_.set(...)) preserves the M5a invariant that drain
+    // order matches epoch order for concurrent same-rid
+    // submissions. live_epoch_by_rid_ semantics are therefore
+    // unchanged — the older incarnation is always staged and
+    // processed before the newer one. Other producers
+    // (cancel_request rid/token, request_shutdown,
+    // engine::submit(arrival_msg) direct) do not bump next_epoch_
+    // and do not acquire submit_publish_mtx_. Epoch starts at 1
+    // (0 is the "unset" sentinel for arrivals that never came
+    // through submit_request).
+    {
+        std::lock_guard<hpx::spinlock> lk(submit_publish_mtx_);
+        const uint64_t issued_epoch = next_epoch_++;
+        msg.epoch          = issued_epoch;
+        h.token.epoch      = issued_epoch;
+        submit(std::move(msg));
+    }
     return h;
 }
 
-// M3a: public shutdown signal for keep-alive mode. Sets
-// shutdown_requested_ under inbox_mtx_ and notifies the single
-// engine waiter on inbox_cv_. Idempotent: re-setting an already-true
-// flag is a no-op and an extra notify on an idle (or non-waiting)
-// engine is harmless. Hard rule: no llama_* call sites here; this is
-// pure HPX-side control-plane wiring. Safe to call from any HPX task.
+// M3a: public shutdown signal for keep-alive mode. N1: publishes a
+// `shutdown` inbox_msg onto the HPX inbox channel. Idempotent:
+// multiple shutdown messages are folded into the engine-task-only
+// staged_shutdown_ latch by stage_one. Hard rule: no llama_* call
+// sites; pure HPX-side control-plane wiring. Safe to call from any
+// HPX or foreign thread.
 void engine::request_shutdown() {
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        shutdown_requested_ = true;
-    }
-    inbox_cv_.notify_one();
+    inbox_msg im;
+    im.k = inbox_msg_kind::shutdown;
+    inbox_chan_.set(std::move(im));
 }
 
-// M3b: public queued-before-admission cancellation. Pushes
-// request_id onto cancel_inbox_ under the existing inbox_mtx_ and
-// notifies inbox_cv_. The engine task drains cancel_inbox_ at
-// iteration boundaries (top of each iter AND outer-loop tail before
-// idle-wait / shutdown-drain) so cancellations are observed even if
-// no submit arrives to wake the engine. Idempotent — duplicate calls
-// re-push the rid; drain dedups via cancelled_request_ids_ (set) and
-// optionally bumps cancel_request_duplicates. Hard rule: no llama_*
-// call sites here; no seq_state lookup; no promise fulfillment.
-// Safe to call from any HPX task.
+// M3b: public queued-before-admission cancellation. N1: publishes a
+// `cancel_rid` inbox_msg onto the HPX inbox channel. The engine
+// pumps it into staged_cancel_rids_ at the next predicate-pump
+// site (inbox_has_pending or outer-loop tail);
+// drain_cancel_inbox() promotes it into cancelled_request_ids_ at
+// iteration boundaries (top of each iter AND outer-loop tail
+// before idle-wait / shutdown-drain). Idempotent — duplicates are
+// deduped by cancelled_request_ids_ (unordered_set) and bump
+// cancel_request_duplicates. Hard rule: no llama_* call sites; no
+// seq_state lookup; no promise fulfillment. Safe to call from any
+// HPX or foreign thread.
 void engine::cancel_request(int32_t rid) {
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        cancel_inbox_.push_back(rid);
-    }
-    inbox_cv_.notify_one();
+    inbox_msg im;
+    im.k   = inbox_msg_kind::cancel_rid;
+    im.rid = rid;
+    inbox_chan_.set(std::move(im));
 }
 
-// M5a: epoch-aware cancellation. Pushes `tok` onto cancel_token_inbox_
-// under the existing inbox_mtx_ and notifies inbox_cv_. Symmetric with
-// the legacy rid-only overload; the engine task drains both inboxes in
-// drain_cancel_inbox() under a single critical section and resolves
-// each entry through its own (rid, epoch)-keyed set. Hard rule: no
-// llama_* call sites here; no seq_state lookup; no promise
-// fulfillment. Safe to call from any HPX task.
+// M5a: epoch-aware cancellation. N1: publishes a `cancel_token`
+// inbox_msg onto the HPX inbox channel. The engine pumps it into
+// staged_cancel_tokens_ at the next predicate-pump site;
+// drain_cancel_inbox() promotes it into cancelled_tokens_ keyed by
+// (rid, epoch). Hard rule: no llama_* call sites; no seq_state
+// lookup; no promise fulfillment. Safe to call from any HPX or
+// foreign thread.
 void engine::cancel_request(const cancel_token & tok) {
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        cancel_token_inbox_.push_back(tok);
-    }
-    inbox_cv_.notify_one();
+    inbox_msg im;
+    im.k     = inbox_msg_kind::cancel_token;
+    im.token = tok;
+    inbox_chan_.set(std::move(im));
 }
 
 // M5b: explicit-engine convenience forwarder. Equivalent to
@@ -595,6 +698,14 @@ bool engine::clear_and_check(seq_state & seq, int32_t iter,
 
 void engine::publish_token(seq_state & seq, int32_t token_id) {
     if (!seq.stream_enabled || seq.stream_closed) return;
+    // N3.1 (Exp 13): stamp the first non-terminal token publish on
+    // this seq when the option is on. Guarded by the seq's prior
+    // -1 sentinel so each request's first publish is captured
+    // exactly once. Cost is one steady_clock::now() at most once
+    // per request. With the option off, zero added work.
+    if (enable_responsiveness_timing_ && seq.t_first_publish_us == -1) {
+        seq.t_first_publish_us = now_us();
+    }
     try {
         seq.stream_channel.set(
             token_stream_event{stream_event_kind::token, token_id,
@@ -680,6 +791,16 @@ bool engine::fulfill_promise(seq_state &     seq,
     // snapshot. preloaded for original actives and preloaded
     // waiters; external for arrivals that came through engine::submit().
     rr.arrival_src         = seq.arrival_src;
+    // N3.1 (Exp 13): propagate the responsiveness timestamps from
+    // the engine-internal seq_state carriers onto the public
+    // request_result snapshot. All four are -1 unless the engine
+    // was constructed with
+    // engine_options::lib.enable_responsiveness_timing == true and
+    // the corresponding write site fired for this request.
+    rr.t_admitted_us        = seq.t_admitted_us;
+    rr.t_first_publish_us   = seq.t_first_publish_us;
+    rr.t_complete_us        = seq.t_complete_us;
+    rr.t_cancel_observed_us = seq.t_cancel_observed_us;
 
     try {
         promises_[static_cast<size_t>(seq.seq_id)]
@@ -747,6 +868,14 @@ bool engine::finalize_and_fulfill(seq_state & seq, int32_t iter,
     const auto    now    = std::chrono::steady_clock::now();
     const int64_t ttc_us = std::chrono::duration_cast<
         std::chrono::microseconds>(now - t_start_).count();
+    // N3.1 (Exp 13): stamp completion time on the seq just before
+    // fulfill_promise copies it to the request_result. Use the
+    // same `now` instant as ttc_us above, just converted into the
+    // absolute time-since-epoch domain that producers also use.
+    if (enable_responsiveness_timing_) {
+        seq.t_complete_us = std::chrono::duration_cast<
+            std::chrono::microseconds>(now.time_since_epoch()).count();
+    }
 
     if (!fulfill_promise(seq, request_status::completed, ttc_us)) {
         return false;
@@ -825,6 +954,13 @@ bool engine::cancel_and_fulfill(seq_state & seq, int32_t iter,
     const auto    now    = std::chrono::steady_clock::now();
     const int64_t ttc_us = std::chrono::duration_cast<
         std::chrono::microseconds>(now - t_start_).count();
+    // N3.1 (Exp 13): stamp the cancel-observed instant on the seq
+    // before fulfill_promise copies it onto the request_result.
+    // Engine task only; iteration-boundary observation per design.
+    if (enable_responsiveness_timing_) {
+        seq.t_cancel_observed_us = std::chrono::duration_cast<
+            std::chrono::microseconds>(now.time_since_epoch()).count();
+    }
 
     if (!fulfill_promise(seq, request_status::cancelled, ttc_us)) {
         return false;
@@ -855,11 +991,14 @@ bool engine::cancel_and_fulfill(seq_state & seq, int32_t iter,
 }
 
 void engine::drain_external_inbox(int32_t iter) {
+    // N1: swap from the engine-task-only staged_arrivals_ deque
+    // (already populated by pump_inbox_nonblocking() at the
+    // predicate site). No channel pump here — cancels arriving on
+    // the channel mid-drain stay buffered and are observed only at
+    // the next cancel phase. No lock — engine task is the sole
+    // accessor of staged_arrivals_.
     std::deque<arrival_msg> drained;
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        drained.swap(inbox_);
-    }
+    drained.swap(staged_arrivals_);
     while (!drained.empty()) {
         arrival_msg msg = std::move(drained.front());
         drained.pop_front();
@@ -970,23 +1109,23 @@ void engine::drain_external_inbox(int32_t iter) {
     }
 }
 
-// M3b + M5a: lock-protected transfer of cancel_inbox_ ->
-// cancelled_request_ids_ and cancel_token_inbox_ -> cancelled_tokens_.
-// Engine task only. Acquires inbox_mtx_ once to swap both inbox deques
-// into local copies, then folds each side into its own engine-only
-// set. Each drained entry bumps cancel_request_calls (counter is
-// shared between rid-only and token-aware paths since it measures
-// drained cancel work). Duplicates on either side bump
-// cancel_request_duplicates — the rid-only path keys by rid, the
-// token-aware path keys by (rid, epoch).
+// M3b + M5a: transfer of staged cancels -> cancelled_request_ids_
+// and cancelled_tokens_. Engine task only. N1: swaps from the
+// engine-task-only staged_cancel_rids_ and staged_cancel_tokens_
+// deques (already populated by pump_inbox_nonblocking() at the
+// predicate site). No channel pump here — cancels arriving on the
+// channel mid-drain stay buffered and are observed only at the
+// next cancel phase. No lock. Each drained entry bumps
+// cancel_request_calls (counter is shared between rid-only and
+// token-aware paths since it measures drained cancel work).
+// Duplicates on either side bump cancel_request_duplicates — the
+// rid-only path keys by rid, the token-aware path keys by
+// (rid, epoch).
 void engine::drain_cancel_inbox() {
     std::deque<int32_t>      drained_rids;
     std::deque<cancel_token> drained_tokens;
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        drained_rids.swap(cancel_inbox_);
-        drained_tokens.swap(cancel_token_inbox_);
-    }
+    drained_rids.swap(staged_cancel_rids_);
+    drained_tokens.swap(staged_cancel_tokens_);
     while (!drained_rids.empty()) {
         const int32_t rid = drained_rids.front();
         drained_rids.pop_front();
@@ -1084,6 +1223,15 @@ bool engine::fulfill_queued_cancelled(
     rr.previous_request_id = -1;
     rr.admission_src       = admission_source::none;
     rr.arrival_src         = arrival_source::external;
+    // N3.1 (Exp 13): on the queued-cancel path the request never
+    // bound to a seq, so t_admitted_us / t_first_publish_us /
+    // t_complete_us stay at their -1 defaults (correct semantics:
+    // "not admitted; never published; not completed"). Only
+    // t_cancel_observed_us is meaningful here — stamped at the
+    // instant the engine fulfills the queued-cancel promise.
+    if (enable_responsiveness_timing_) {
+        rr.t_cancel_observed_us = now_us();
+    }
 
     try {
         promise.set_value(std::move(rr));
@@ -1101,6 +1249,132 @@ bool engine::fulfill_queued_cancelled(
         "queued_cancelled request=%d from=%s ttc_us=%lld",
         request_id, from_label, static_cast<long long>(ttc_us));
     return true;
+}
+
+// N5b: shutdown-aborted queued-request resolver. Engine task only. No
+// KV touch, no llama API. A request drained into
+// waiting_queue_consumable_ but never admitted is resolved on shutdown
+// with status=failed_reserved — shutdown-aborted queued work, NOT user
+// cancellation (so it does NOT bump queued_cancelled and stays
+// distinguishable from the M3b queued-cancel path). The "never decoded /
+// never admitted" sentinels match the queued-cancel result (n_decoded=0,
+// hash=empty, admitted_at_iter=-1, kv_cleared=false). A queued stream,
+// if present, is closed with reason=error: the request neither completed
+// nor was user-cancelled, so among the existing stream_close_reason
+// values `error` is the least-misleading (a `completed` close would be a
+// lie; `cancelled` would imply user intent). streams_opened/streams_
+// closed_error are bumped symmetrically so streams_opened == sum(closed_*)
+// still holds. Fulfills the moved-in promise exactly once.
+bool engine::fulfill_queued_shutdown_aborted(
+    int32_t                             request_id,
+    int32_t                             decode_budget,
+    hpx::promise<request_result>        promise,
+    std::optional<token_stream_channel> channel,
+    const char *                        from_label) {
+    if (channel.has_value()) {
+        try {
+            channel->set(token_stream_event{
+                stream_event_kind::closed, 0,
+                stream_close_reason::error});
+        } catch (...) {
+            // Receiver may have dropped its half; nothing to do.
+        }
+        try {
+            channel->close();
+        } catch (...) {
+            // Already closed; bookkeeping below fires regardless.
+        }
+        result_.streams_opened++;
+        result_.streams_closed_error++;
+        trace::event(
+            "token_stream_opened request=%d seq_id=-1", request_id);
+        trace::event(
+            "token_stream_closed request=%d seq_id=-1 n_tokens=0 "
+            "reason=error", request_id);
+    }
+
+    const auto    now    = std::chrono::steady_clock::now();
+    const int64_t ttc_us = std::chrono::duration_cast<
+        std::chrono::microseconds>(now - t_start_).count();
+
+    request_result rr;
+    rr.request_id          = request_id;
+    rr.seq_id              = -1;
+    rr.decode_budget       = decode_budget;
+    rr.n_decoded           = 0;
+    rr.hash                = token_hash::k_token_hash_empty;
+    rr.done_iter           = -1;
+    rr.pos_max_at_clear    = -1;
+    rr.kv_cleared          = false;
+    rr.ttc_us              = ttc_us;
+    rr.generated_tokens.clear();
+    rr.status              = request_status::failed_reserved;
+    rr.cancel_observed_iter = -1;
+    rr.n_decoded_at_cancel  = -1;
+    rr.admitted_at_iter    = -1;
+    rr.reused_seq_id       = -1;
+    rr.previous_request_id = -1;
+    rr.admission_src       = admission_source::none;
+    rr.arrival_src         = arrival_source::external;
+
+    try {
+        promise.set_value(std::move(rr));
+    } catch (const std::exception & e) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "fulfill_queued_shutdown_aborted.set_value threw for "
+            "request %d: %s", request_id, e.what());
+        if (result_.error.empty()) result_.error = buf;
+        return false;
+    }
+    result_.promises_fulfilled++;
+    trace::event(
+        "queued_shutdown_aborted request=%d from=%s ttc_us=%lld",
+        request_id, from_label, static_cast<long long>(ttc_us));
+    return true;
+}
+
+// N5b: drain ALL queued-but-unadmittable requests on shutdown. Engine
+// task only. For every entry still in waiting_queue_consumable_, move its
+// promise out of external_promises_ and any stream channel out of
+// external_stream_channels_ (both rid-keyed, populated by
+// drain_external_inbox), erase its live_epoch_by_rid_ entry, and resolve
+// it via fulfill_queued_shutdown_aborted. Leaves waiting_queue_consumable_
+// empty and the corresponding external_promises_ / external_stream_
+// channels_ / live_epoch_by_rid_ entries erased, so the run-end
+// "external_promises_ must be empty" guard holds. Preloaded gate waiters
+// carry no external promise and are simply dropped (nothing is owed to
+// them on this path; gates never reach shutdown with unadmitted preloaded
+// waiters).
+void engine::drain_waiting_queue_for_shutdown() {
+    while (!waiting_queue_consumable_.empty()) {
+        waiting_request w =
+            std::move(waiting_queue_consumable_.front());
+        waiting_queue_consumable_.pop_front();
+        const int32_t rid = w.request_id;
+
+        auto it_pr = external_promises_.find(rid);
+        if (it_pr == external_promises_.end()) {
+            // Preloaded waiter: no external promise to fulfill.
+            live_epoch_by_rid_.erase(rid);
+            continue;
+        }
+        hpx::promise<request_result> promise = std::move(it_pr->second);
+        external_promises_.erase(it_pr);
+
+        std::optional<token_stream_channel> channel;
+        auto it_ch = external_stream_channels_.find(rid);
+        if (it_ch != external_stream_channels_.end()) {
+            channel.emplace(std::move(it_ch->second));
+            external_stream_channels_.erase(it_ch);
+        }
+
+        live_epoch_by_rid_.erase(rid);
+
+        fulfill_queued_shutdown_aborted(
+            rid, w.decode_budget, std::move(promise),
+            std::move(channel), "shutdown");
+    }
 }
 
 // M3b/M3c: walk cancelled_request_ids_ and resolve each rid against
@@ -1358,6 +1632,18 @@ bool engine::admit_one(int32_t              reuse_seq,
     rseq.admitted_at_iter       = iter;
     rseq.admission_src          = src;
     rseq.arrival_src            = w.src;
+    // N3.1 (Exp 13): always reset the responsiveness stamps on
+    // every rebind so a prior owner of this slot cannot leak its
+    // timestamps into the new owner's request_result. Then stamp
+    // t_admitted_us when the option is on. With the option off,
+    // all four stay -1, byte-identical to pre-N3.1 behavior.
+    rseq.t_admitted_us          = -1;
+    rseq.t_first_publish_us     = -1;
+    rseq.t_complete_us          = -1;
+    rseq.t_cancel_observed_us   = -1;
+    if (enable_responsiveness_timing_) {
+        rseq.t_admitted_us = now_us();
+    }
     // M5a: carry the waiter's engine-issued epoch into the bound seq.
     // Used by guarded erase against live_epoch_by_rid_ at
     // finalize/cancel sites. Stays 0 for preloaded waiters and idle
@@ -1491,8 +1777,8 @@ bool engine::admit_one(int32_t              reuse_seq,
         // The push, the streams_opened++, and the trace
         // event all happen inside the same existing
         // admitted_futures_mtx_ critical section (M4d:
-        // hpx::spinlock, matches inbox_mtx_). No new
-        // synchronization primitive, no new CLI flag.
+        // hpx::spinlock — HPX-native result-handoff primitive).
+        // No new synchronization primitive, no new CLI flag.
         // The lock guards engine→main result-handoff
         // metadata only; it does NOT guard llama.cpp
         // execution state.
@@ -1595,6 +1881,322 @@ bool engine::admit_one(int32_t              reuse_seq,
     return true;
 }
 
+// N3.0 P6: per-iter cancellation observation walk. Iteration-
+// boundary only — cancel is never observed inside llama_decode.
+// Returns false if cancel_and_fulfill bails (KV clear failure);
+// caller frees the batch and finalizes.
+bool engine::iter_observe_cancellations(int32_t iter,
+                                        llama_memory_t mem) {
+    // Cancellation observation #2: top of each decode iter,
+    // BEFORE building active_idx. A cancelled seq becomes
+    // seq.done=true via clear_and_check, so the active_idx
+    // loop below skips it naturally. This makes
+    // wasted_decode_rows_after_cancel structurally 0.
+    // M2f: iterate over the full slot set so admitted-into-idle
+    // slots are reachable here too. Idle slots that have not
+    // been admitted carry done=true and short-circuit on the
+    // `if (seq.done) continue` line, so behavior is identical
+    // when initial_idle_slots == 0.
+    for (size_t s = 0; s < seqs_.size(); s++) {
+        seq_state & seq = seqs_[s];
+        if (seq.done) continue;
+        if (cancel_should_observe(seq)) {
+            if (!cancel_and_fulfill(seq, iter, mem)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// N3.0 P7: three-source admission priority drain. Order
+// cancel_freed → completion_freed → initial_idle is frozen
+// (Live Admission Slices 3 / 5 / M2f). The cancel_freed source
+// is bounded by admission_eligible_count — the snapshot the
+// caller took BEFORE iter_observe_cancellations — which is what
+// produces the one-iter cancel-to-admit delay
+// (admitted_at_iter == cancel_after + 1 on the smoke shape).
+engine::iter_admission_result engine::iter_run_admissions(
+    int32_t iter, llama_memory_t mem,
+    size_t admission_eligible_count) {
+    iter_admission_result r;
+    // Source priority: drain free_due_to_cancel_ first so the
+    // Slice-3 cancel-freed mapping is preserved when both
+    // sources are present (out-of-scope for Slice 5 itself,
+    // which uses only completion_freed).
+    for (size_t i = 0; i < admission_eligible_count; i++) {
+        if (free_due_to_cancel_.empty()) break;
+        if (waiting_queue_consumable_.empty()) break;
+        const int32_t reuse_seq = free_due_to_cancel_.front();
+        free_due_to_cancel_.pop_front();
+
+        if (!admit_one(reuse_seq, admission_source::cancel_freed,
+                       "cancel_freed", iter, mem)) {
+            r.ok = false;
+            return r;
+        }
+        r.admitted++;
+    }
+
+    // Live Admission Slice 5: drain free_due_to_completion_
+    // AFTER the cancel queue. Entries here were pushed at the
+    // end of an earlier iter's decode (or post-prefill argmax),
+    // so no snapshot is required — the queue is settled at the
+    // top of this iter. Gated by --reuse-completed; off by
+    // default to preserve Slice-4 behavior.
+    if (reuse_completed_) {
+        while (!free_due_to_completion_.empty()
+            && !waiting_queue_consumable_.empty()) {
+            const int32_t reuse_seq =
+                free_due_to_completion_.front();
+            free_due_to_completion_.pop_front();
+
+            if (!admit_one(reuse_seq,
+                           admission_source::completion_freed,
+                           "completion_freed", iter, mem)) {
+                r.ok = false;
+                return r;
+            }
+            r.admitted++;
+        }
+    }
+
+    // M2f: drain free_idle_ AFTER cancel-freed and completion-freed
+    // so the existing source priority for the gate's smokes is
+    // preserved. No --reuse-completed gate: idle slots have no
+    // prior occupant to demand-pair against. With
+    // initial_idle_slots == 0 (every existing gate run), free_idle_
+    // is empty and this loop is a no-op, so no new
+    // `admission_source=initial_idle` trace event ever fires on
+    // the seven canonical gate smokes.
+    while (!free_idle_.empty()
+        && !waiting_queue_consumable_.empty()) {
+        const int32_t reuse_seq = free_idle_.front();
+        free_idle_.pop_front();
+
+        if (!admit_one(reuse_seq,
+                       admission_source::initial_idle,
+                       "initial_idle", iter, mem)) {
+            r.ok = false;
+            return r;
+        }
+        r.admitted++;
+    }
+    return r;
+}
+
+// N3.0 P9: build the per-iter llama_batch. Emits prefill rows
+// for freshly admitted seqs (admitted_at_iter == iter &&
+// n_decoded == 0), regular decode rows otherwise. Sets
+// seq.i_batch / seq.pos_next as it goes. Returns the resulting
+// batch row count — 0 means "no rows" and the caller breaks
+// defensively. No bail path.
+int32_t engine::iter_build_batch(int32_t iter, llama_batch & batch,
+                                 std::vector<int32_t> & active_idx) {
+    common_batch_clear(batch);
+    // M2f: walk the full slot set so admitted-into-idle slots get
+    // picked up for prefill/decode. Initial active loops at engine
+    // start (request_admitted trace, prefill batch build) still use
+    // n_seqs = budgets_.size() because those events only describe
+    // the preloaded initial population.
+    active_idx.reserve(seqs_.size());
+    for (size_t s = 0; s < seqs_.size(); s++) {
+        seq_state & seq = seqs_[s];
+        if (seq.done) continue;
+        // Live Admission Slice 3: a freshly admitted seq has
+        // admitted_at_iter == iter && n_decoded == 0 in the
+        // same iter as its admission. Emit prompt/prefill rows
+        // (logits=true on the last only) instead of a single
+        // decode row. The post-decode argmax then produces its
+        // first token via the same path as a normal
+        // post-prefill argmax, after which n_decoded == 1.
+        if (seq.admitted_at_iter == iter && seq.n_decoded == 0) {
+            // M1c: admitted prefill reads the per-seq owned
+            // prompt vector that admit_one moved in from the
+            // waiter. In M1c every waiter's prompt is still a
+            // copy of the shared prompt source, so prompt.size()
+            // equals the outer n_prompt and the emitted rows /
+            // pos / logits selection are byte-identical to the
+            // M1b path. M1d+ will diverge when CLI flags allow
+            // per-request prompts.
+            const auto &  prompt       = seq.prompt_tokens;
+            const int32_t n_seq_prompt =
+                static_cast<int32_t>(prompt.size());
+            for (int32_t p = 0; p < n_seq_prompt; p++) {
+                const bool last = (p == n_seq_prompt - 1);
+                common_batch_add(batch, prompt[p],
+                                 /*pos=*/p,
+                                 /*seq_ids=*/{seq.seq_id},
+                                 /*logits=*/last);
+                if (last) {
+                    seq.i_batch = batch.n_tokens - 1;
+                }
+            }
+            seq.pos_next = n_seq_prompt;
+            active_idx.push_back(static_cast<int32_t>(s));
+            // No decode_row trace for prefill rows; Slice 4
+            // owns admitted-prefill trace events.
+        } else {
+            common_batch_add(batch, seq.last_token,
+                             /*pos=*/seq.pos_next,
+                             /*seq_ids=*/{seq.seq_id},
+                             /*logits=*/true);
+            seq.i_batch = batch.n_tokens - 1;
+            seq.pos_next++;
+            active_idx.push_back(static_cast<int32_t>(s));
+            trace::event("decode_row iter=%d seq=%d pos=%d",
+                         iter, seq.seq_id, seq.pos_next - 1);
+            // Live Admission Slice 4: fine-grained event for
+            // admitted seqs only. Fires IN ADDITION TO the
+            // generic decode_row above so the 1:1
+            // decode_row-per-row invariant is preserved.
+            if (seq.admission_src != admission_source::none) {
+                trace::event(
+                    "admitted_decode_row request=%d seq_id=%d "
+                    "iter=%d pos=%d admission_source=%s",
+                    seq.request_id, seq.seq_id, iter,
+                    seq.pos_next - 1,
+                    admission_source_name(seq.admission_src));
+            }
+        }
+    }
+    return batch.n_tokens;
+}
+
+// N3.0 P10: per-iter decode site. Records the per-iter
+// active_seqs_per_iter / rows_per_batch / decode_calls metrics,
+// then calls llama_decode + llama_synchronize. Returns false on
+// llama_decode != 0 with result_.decode_failures and
+// result_.error set; caller frees the batch and finalizes.
+bool engine::iter_run_decode(llama_batch & batch,
+                             const std::vector<int32_t> & active_idx) {
+    result_.metrics.active_seqs_per_iter.push_back(
+        static_cast<int32_t>(active_idx.size()));
+    result_.metrics.rows_per_batch.push_back(batch.n_tokens);
+    result_.decode_calls++;
+    result_.metrics.decode_calls = result_.decode_calls;
+
+    if (llama_decode(ctx_, batch) != 0) {
+        result_.decode_failures++;
+        result_.error = "llama_decode failed during decode loop";
+        return false;
+    }
+    llama_synchronize(ctx_);
+    return true;
+}
+
+// N3.0 P11: per-iter sample + EOG + publish + finalize. For each
+// active seq: sample (greedy argmax or per-seq sampler chain),
+// check EOG and finalize, otherwise publish the token, fold the
+// hash, bump n_decoded, and finalize on budget. The ordering
+// inside the loop body is hash-relevant — publish_token runs
+// BEFORE n_decoded mutates (Streaming Slice 8). Returns false on
+// logits/finalize bail; caller frees the batch and finalizes.
+bool engine::iter_sample_and_finalize(
+    int32_t iter,
+    const std::vector<int32_t> & active_idx,
+    llama_memory_t mem) {
+    for (int32_t s : active_idx) {
+        seq_state & seq = seqs_[s];
+        // M6b: select the next token via per-seq sampler chain
+        // when stochastic, otherwise fall through to the
+        // bit-identical greedy argmax path. This is the site
+        // where stochastic requests actually pick tokens in M6b
+        // (the post-prefill site stays greedy because preloaded
+        // actives carry no sampling_config). On greedy slots,
+        // `seq.sampler_chain` is null and the path is byte-
+        // identical to the pre-M6b argmax. `llama_sampler_sample`
+        // internally calls `llama_sampler_accept`; do NOT call
+        // accept separately or the dist RNG double-advances and
+        // breaks same-seed reproducibility.
+        llama_token next_id;
+        if (seq.sampler_chain) {
+            next_id = llama_sampler_sample(
+                seq.sampler_chain.get(), ctx_, seq.i_batch);
+        } else {
+            const float * logits = llama_get_logits_ith(ctx_, seq.i_batch);
+            if (logits == nullptr) {
+                result_.error =
+                    "llama_get_logits_ith returned null during decode";
+                return false;
+            }
+            next_id = argmax(logits, n_vocab_);
+        }
+        // Live Admission Slice 4: capture the admitted-prefill-
+        // argmax predicate BEFORE n_decoded changes, so the
+        // event fires exactly once per admitted request (at the
+        // post-decode argmax of its admission iter, where it
+        // saw its prefill rows). Mirrors the existing
+        // seq_prefilled placement (before EOG check).
+        const bool is_admitted_prefill_argmax =
+            seq.admission_src != admission_source::none
+         && seq.admitted_at_iter == iter
+         && seq.n_decoded == 0;
+        if (is_admitted_prefill_argmax) {
+            trace::event(
+                "admitted_prefilled request=%d seq_id=%d "
+                "first_token=%d admission_source=%s",
+                seq.request_id, seq.seq_id,
+                static_cast<int>(next_id),
+                admission_source_name(seq.admission_src));
+            result_.admitted_prefill_events++;
+        }
+        if (llama_vocab_is_eog(vocab_, next_id)) {
+            if (!finalize_and_fulfill(seq, iter, mem)) {
+                return false;
+            }
+            continue;
+        }
+        // Streaming Slice 8: publish the same int32 fed to the
+        // hash BEFORE n_decoded mutates.
+        publish_token(seq, static_cast<int32_t>(next_id));
+        seq.generated_tokens.push_back(next_id);
+        seq.hash_state = fold_token_hash(seq.hash_state,
+                                         static_cast<int32_t>(next_id));
+        seq.n_decoded++;
+        seq.last_token = next_id;
+        if (seq.n_decoded >= seq.decode_budget) {
+            if (!finalize_and_fulfill(seq, iter, mem)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// N3.0 P12: gate-test release/ack barrier at end of iter K. If
+// K is in iter_release_set_, fire the release promise and block
+// on the matching submitter ack future. The .get() on the ack
+// future is intentionally synchronous on the engine task —
+// scheduling order is deterministic on a single HPX worker
+// because the engine only proceeds past this point after every
+// K-arrival is in the inbox. Returns false on ack-future
+// exception with result_.error set; caller frees the batch and
+// finalizes.
+bool engine::iter_fire_release_ack_barrier(int32_t iter) {
+    if (!iter_release_set_.count(iter)) {
+        return true;
+    }
+    trace::event("iter_release_fired iter=%d", iter);
+    iter_release_promises_[static_cast<size_t>(iter)]
+        .set_value();
+    result_.iter_release_fired_set.push_back(iter);
+    try {
+        submitter_ack_futures_[
+            static_cast<size_t>(iter)].get();
+    } catch (const std::exception & e) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "submitter ack future for iter %d threw: %s",
+            iter, e.what());
+        if (result_.error.empty()) result_.error = buf;
+        return false;
+    }
+    result_.submitter_ack_set.push_back(iter);
+    trace::event("submitter_ack_observed iter=%d", iter);
+    return true;
+}
+
 void engine::run_body() {
     result_.ok = false;
     result_.error.clear();
@@ -1626,39 +2228,28 @@ void engine::run_body() {
     // smokes are byte-identical to M2.
     result_.engine_idle_waits           = 0;
     result_.engine_shutdown_observed    = 0;
-    // M3a: clear the shutdown latch under inbox_mtx_ so a
+    // M3a: clear the engine-observed shutdown latch so a
     // request_shutdown() observed at the end of a prior repeat does
-    // not poison the next repeat. M3a assumes request_shutdown() is
-    // called AFTER run() has started; this reset addresses repeat
-    // discipline only and does not attempt to solve pre-run
-    // shutdown ordering.
-    // M3b: cancel_inbox_ is intentionally NOT cleared here. It is
-    // symmetric with inbox_ (also not cleared), so cancel_request()
-    // calls made BEFORE the engine task actually picks up run() are
-    // honored — clearing them would race with the producer and
-    // silently drop pre-run cancellations. End-of-run residue is
-    // drained into cancelled_request_ids_ and accounted as
-    // cancel_unknown_request_id at the run_body tail, then
-    // cancelled_request_ids_ is cleared, so no entries leak into a
-    // subsequent repeat through this path. cancelled_request_ids_
-    // is engine-task-only and is reset here defensively in case a
-    // prior run_body bailed out early before its tail cleanup.
-    {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        shutdown_requested_ = false;
-    }
+    // not poison the next repeat. N1: staged_shutdown_ is engine-
+    // task-only; no lock. The inbox_chan_ buffer and the staged_*
+    // arrival/cancel deques are intentionally NOT cleared (they are
+    // symmetric with the legacy `inbox_` / `cancel_inbox_` / `cancel_
+    // token_inbox_` deques that were also not cleared), so
+    // submit()/cancel_request() calls made BEFORE the engine task
+    // actually picks up run() are honored — clearing them would
+    // race with the producer and silently drop pre-run work. End-
+    // of-run residue is drained into cancelled_request_ids_ and
+    // accounted as cancel_unknown_request_id at the run_body tail,
+    // then cancelled_request_ids_ is cleared, so no entries leak
+    // into a subsequent repeat through this path.
+    // cancelled_request_ids_ is engine-task-only and is reset here
+    // defensively in case a prior run_body bailed out early before
+    // its tail cleanup. live_epoch_by_rid_ is engine-task-only and
+    // reset defensively. next_epoch_ is NOT reset — it is
+    // monotonic for the lifetime of the engine so tokens issued on
+    // one repeat cannot collide with submissions on the next.
+    staged_shutdown_ = false;
     cancelled_request_ids_.clear();
-    // M5a: per-repeat reset of the token-aware structures. Mirrors
-    // the legacy cancel_request_ids_ reset above. cancel_token_inbox_
-    // is intentionally NOT cleared here for the same reason
-    // cancel_inbox_ is not: pre-run token cancellations must be
-    // honored. End-of-run residue is drained at the run_body tail
-    // and accounted as cancel_unknown_request_id, then
-    // cancelled_tokens_ is cleared, so no entries leak across
-    // repeats. live_epoch_by_rid_ is engine-task-only and reset
-    // defensively. next_epoch_ is NOT reset — it is monotonic for
-    // the lifetime of the engine so tokens issued on one repeat
-    // cannot collide with submissions on the next.
     cancelled_tokens_.clear();
     live_epoch_by_rid_.clear();
     result_.queued_cancelled            = 0;
@@ -1947,25 +2538,25 @@ void engine::run_body() {
     // ---- Decode loop (one row per still-active seq per iter) -------
     // M2f: predicate widened to also peek the async inbox so the loop
     // can enter / re-enter even when there are no active seqs yet and
-    // no waiters have been drained. inbox_has_pending() acquires the
-    // existing inbox_mtx_ and reads inbox_.empty(); no llama.cpp API
-    // call sites. With the gate's existing smokes (initial_idle_slots=0
-    // and inbox empty outside the release-barrier window), the new
-    // term flips only during the one-iter drain window where
-    // any_active() is already true, so the predicate is behaviorally
-    // identical and the gate's smoke output remains byte-for-byte the
-    // same.
+    // no waiters have been drained. N1: inbox_has_pending() pumps the
+    // HPX inbox channel into staged_arrivals_ and reports
+    // !staged_arrivals_.empty(); no llama.cpp API call sites. With the
+    // gate's existing smokes (initial_idle_slots=0 and inbox empty
+    // outside the release-barrier window), the new term flips only
+    // during the one-iter drain window where any_active() is already
+    // true, so the predicate is behaviorally identical and the gate's
+    // smoke output remains byte-for-byte the same.
     int32_t iter = 0;
     // M3a: keep-alive outer loop. With keep_alive_=false this body
     // executes once — the inner finite while drains all work, the
     // !keep_alive_ short-circuit fires, and the outer loop exits.
-    // Behavior in that case is byte-identical to M2: no cv touch,
-    // no counter bumps, no lock acquisition beyond the inner
-    // predicate's existing inbox_has_pending(). With keep_alive_=
-    // true the engine returns here when there is no work, predicates
-    // on the shutdown latch under inbox_mtx_, and either reports
-    // engine_shutdown_observed=1 + breaks (drained shutdown) or
-    // increments engine_idle_waits and idle-waits on inbox_cv_
+    // Behavior in that case is byte-identical to M2: no idle-wait,
+    // no counter bumps, just the inner predicate's pump call.
+    // N1: with keep_alive_=true the engine returns to the outer
+    // tail when there is no work, pumps the channel, observes
+    // staged_shutdown_, and either reports engine_shutdown_observed=1
+    // + breaks (drained shutdown) or increments engine_idle_waits and
+    // HPX-suspends on the inbox channel via wait_inbox_blocking()
     // until a new arrival or shutdown wakes us. The inner finite
     // loop is intentionally NOT reindented — it is the unchanged M2
     // decode/admission body wrapped verbatim.
@@ -1974,6 +2565,19 @@ void engine::run_body() {
         || !waiting_queue_consumable_.empty()
         || inbox_has_pending()) {
         iter++;
+
+        // N1: unconditional channel pump at iter top. The inner-
+        // while predicate short-circuits on any_active() and never
+        // calls inbox_has_pending() during a mid-decode iter, so
+        // cancels/submissions published on the channel while the
+        // engine is actively decoding would not be staged without
+        // this call. drain_cancel_inbox + drain_external_inbox
+        // below then operate on the snapshot of staged_* taken
+        // here. Pump is NOT called inside drain_external_inbox,
+        // so cancels arriving on the channel mid-arrival-drain
+        // stay buffered and are observed only at the next iter's
+        // cancel phase.
+        pump_inbox_nonblocking();
 
         // M3b: drain the public cancel inbox BEFORE the external
         // arrival inbox, so any cancel_request(rid) for an rid that
@@ -2010,336 +2614,85 @@ void engine::run_body() {
         const size_t admission_eligible_count =
             free_due_to_cancel_.size();
 
-        // Cancellation observation #2: top of each decode iter,
-        // BEFORE building active_idx. A cancelled seq becomes
-        // seq.done=true via clear_and_check, so the active_idx
-        // loop below skips it naturally. This makes
-        // wasted_decode_rows_after_cancel structurally 0.
-        // M2f: iterate over the full slot set so admitted-into-idle
-        // slots are reachable here too. Idle slots that have not
-        // been admitted carry done=true and short-circuit on the
-        // `if (seq.done) continue` line, so behavior is identical
-        // when initial_idle_slots == 0.
-        for (size_t s = 0; s < seqs_.size(); s++) {
-            seq_state & seq = seqs_[s];
-            if (seq.done) continue;
-            if (cancel_should_observe(seq)) {
-                if (!cancel_and_fulfill(seq, iter, mem)) {
-                    llama_batch_free(batch);
-                    result_.metrics.update_iterations = iter;
-                    finalize_wall_ms();
-                    return;
-                }
-            }
-        }
-
-        // Live Admission Slice 3: admission boundary. After the
-        // cancellation observation pass for this iter and after
-        // every cancelled seq's KV clear has succeeded, before any
-        // batch build. Consume at most admission_eligible_count
-        // entries (snapshot taken above) from free_due_to_cancel_
-        // in deterministic ascending order, binding FIFO from
-        // waiting_queue_consumable_. The KV-empty assertion is
-        // fail-closed (design §3 invariant). Admission body lives
-        // in the private engine::admit_one method (see below).
-
-        int32_t admitted_this_iter = 0;
-        // Source priority: drain free_due_to_cancel_ first so the
-        // Slice-3 cancel-freed mapping is preserved when both
-        // sources are present (out-of-scope for Slice 5 itself,
-        // which uses only completion_freed).
-        for (size_t i = 0; i < admission_eligible_count; i++) {
-            if (free_due_to_cancel_.empty()) break;
-            if (waiting_queue_consumable_.empty()) break;
-            const int32_t reuse_seq = free_due_to_cancel_.front();
-            free_due_to_cancel_.pop_front();
-
-            if (!admit_one(reuse_seq, admission_source::cancel_freed,
-                           "cancel_freed", iter, mem)) {
-                llama_batch_free(batch);
-                result_.metrics.update_iterations = iter;
-                finalize_wall_ms();
-                return;
-            }
-            admitted_this_iter++;
-        }
-
-        // Live Admission Slice 5: drain free_due_to_completion_
-        // AFTER the cancel queue. Entries here were pushed at the
-        // end of an earlier iter's decode (or post-prefill argmax),
-        // so no snapshot is required — the queue is settled at the
-        // top of this iter. Gated by --reuse-completed; off by
-        // default to preserve Slice-4 behavior.
-        if (reuse_completed_) {
-            while (!free_due_to_completion_.empty()
-                && !waiting_queue_consumable_.empty()) {
-                const int32_t reuse_seq =
-                    free_due_to_completion_.front();
-                free_due_to_completion_.pop_front();
-
-                if (!admit_one(reuse_seq,
-                               admission_source::completion_freed,
-                               "completion_freed", iter, mem)) {
-                    llama_batch_free(batch);
-                    result_.metrics.update_iterations = iter;
-                    finalize_wall_ms();
-                    return;
-                }
-                admitted_this_iter++;
-            }
-        }
-
-        // M2f: drain free_idle_ AFTER cancel-freed and completion-freed
-        // so the existing source priority for the gate's smokes is
-        // preserved. No --reuse-completed gate: idle slots have no
-        // prior occupant to demand-pair against. With
-        // initial_idle_slots == 0 (every existing gate run), free_idle_
-        // is empty and this loop is a no-op, so no new
-        // `admission_source=initial_idle` trace event ever fires on
-        // the seven canonical gate smokes.
-        while (!free_idle_.empty()
-            && !waiting_queue_consumable_.empty()) {
-            const int32_t reuse_seq = free_idle_.front();
-            free_idle_.pop_front();
-
-            if (!admit_one(reuse_seq,
-                           admission_source::initial_idle,
-                           "initial_idle", iter, mem)) {
-                llama_batch_free(batch);
-                result_.metrics.update_iterations = iter;
-                finalize_wall_ms();
-                return;
-            }
-            admitted_this_iter++;
-        }
-
-        // Live Admission Slice 4: record this iter in
-        // admission_iter_set (one push per iter that admitted at
-        // least one waiting request). Then sample the queue depth
-        // AFTER admission, so iter 17 in the smoke records 0
-        // (admission consumed all 6 waiters this iter).
-        if (admitted_this_iter > 0) {
-            result_.metrics.admission_iter_set.push_back(iter);
-        }
-        result_.metrics.waiting_queue_depth_after_admission_per_iter
-            .push_back(static_cast<int32_t>(
-                waiting_queue_consumable_.size()));
-
-        // If every still-active seq was just cancelled AND no
-        // admission happened, end the loop cleanly without trying
-        // to decode an empty batch. Admitted seqs re-trigger
-        // any_active() = true via done=false above.
-        if (!any_active()) {
-            result_.metrics.update_iterations = iter;
-            break;
-        }
-
-        common_batch_clear(batch);
-        std::vector<int32_t> active_idx;
-        // M2f: walk the full slot set so admitted-into-idle slots get
-        // picked up for prefill/decode. Initial active loops at engine
-        // start (request_admitted trace, prefill batch build) still use
-        // n_seqs = budgets_.size() because those events only describe
-        // the preloaded initial population.
-        active_idx.reserve(seqs_.size());
-        for (size_t s = 0; s < seqs_.size(); s++) {
-            seq_state & seq = seqs_[s];
-            if (seq.done) continue;
-            // Live Admission Slice 3: a freshly admitted seq has
-            // admitted_at_iter == iter && n_decoded == 0 in the
-            // same iter as its admission. Emit prompt/prefill rows
-            // (logits=true on the last only) instead of a single
-            // decode row. The post-decode argmax then produces its
-            // first token via the same path as a normal
-            // post-prefill argmax, after which n_decoded == 1.
-            if (seq.admitted_at_iter == iter && seq.n_decoded == 0) {
-                // M1c: admitted prefill reads the per-seq owned
-                // prompt vector that admit_one moved in from the
-                // waiter. In M1c every waiter's prompt is still a
-                // copy of the shared prompt source, so prompt.size()
-                // equals the outer n_prompt and the emitted rows /
-                // pos / logits selection are byte-identical to the
-                // M1b path. M1d+ will diverge when CLI flags allow
-                // per-request prompts.
-                const auto &  prompt       = seq.prompt_tokens;
-                const int32_t n_seq_prompt =
-                    static_cast<int32_t>(prompt.size());
-                for (int32_t p = 0; p < n_seq_prompt; p++) {
-                    const bool last = (p == n_seq_prompt - 1);
-                    common_batch_add(batch, prompt[p],
-                                     /*pos=*/p,
-                                     /*seq_ids=*/{seq.seq_id},
-                                     /*logits=*/last);
-                    if (last) {
-                        seq.i_batch = batch.n_tokens - 1;
-                    }
-                }
-                seq.pos_next = n_seq_prompt;
-                active_idx.push_back(static_cast<int32_t>(s));
-                // No decode_row trace for prefill rows; Slice 4
-                // owns admitted-prefill trace events.
-            } else {
-                common_batch_add(batch, seq.last_token,
-                                 /*pos=*/seq.pos_next,
-                                 /*seq_ids=*/{seq.seq_id},
-                                 /*logits=*/true);
-                seq.i_batch = batch.n_tokens - 1;
-                seq.pos_next++;
-                active_idx.push_back(static_cast<int32_t>(s));
-                trace::event("decode_row iter=%d seq=%d pos=%d",
-                             iter, seq.seq_id, seq.pos_next - 1);
-                // Live Admission Slice 4: fine-grained event for
-                // admitted seqs only. Fires IN ADDITION TO the
-                // generic decode_row above so the 1:1
-                // decode_row-per-row invariant is preserved.
-                if (seq.admission_src != admission_source::none) {
-                    trace::event(
-                        "admitted_decode_row request=%d seq_id=%d "
-                        "iter=%d pos=%d admission_source=%s",
-                        seq.request_id, seq.seq_id, iter,
-                        seq.pos_next - 1,
-                        admission_source_name(seq.admission_src));
-                }
-            }
-        }
-        if (batch.n_tokens == 0) break;  // defensive
-
-        result_.metrics.active_seqs_per_iter.push_back(
-            static_cast<int32_t>(active_idx.size()));
-        result_.metrics.rows_per_batch.push_back(batch.n_tokens);
-        result_.decode_calls++;
-        result_.metrics.decode_calls = result_.decode_calls;
-
-        if (llama_decode(ctx_, batch) != 0) {
-            result_.decode_failures++;
-            result_.error = "llama_decode failed during decode loop";
+        // P6: cancellation observation #2.
+        if (!iter_observe_cancellations(iter, mem)) {
             llama_batch_free(batch);
             result_.metrics.update_iterations = iter;
             finalize_wall_ms();
             return;
         }
-        llama_synchronize(ctx_);
 
-        for (int32_t s : active_idx) {
-            seq_state & seq = seqs_[s];
-            // M6b: select the next token via per-seq sampler chain
-            // when stochastic, otherwise fall through to the
-            // bit-identical greedy argmax path. This is the site
-            // where stochastic requests actually pick tokens in M6b
-            // (the post-prefill site stays greedy because preloaded
-            // actives carry no sampling_config). On greedy slots,
-            // `seq.sampler_chain` is null and the path is byte-
-            // identical to the pre-M6b argmax. `llama_sampler_sample`
-            // internally calls `llama_sampler_accept`; do NOT call
-            // accept separately or the dist RNG double-advances and
-            // breaks same-seed reproducibility.
-            llama_token next_id;
-            if (seq.sampler_chain) {
-                next_id = llama_sampler_sample(
-                    seq.sampler_chain.get(), ctx_, seq.i_batch);
-            } else {
-                const float * logits = llama_get_logits_ith(ctx_, seq.i_batch);
-                if (logits == nullptr) {
-                    result_.error = "llama_get_logits_ith returned null during decode";
-                    llama_batch_free(batch);
-                    result_.metrics.update_iterations = iter;
-                    finalize_wall_ms();
-                    return;
-                }
-                next_id = argmax(logits, n_vocab_);
-            }
-            // Live Admission Slice 4: capture the admitted-prefill-
-            // argmax predicate BEFORE n_decoded changes, so the
-            // event fires exactly once per admitted request (at the
-            // post-decode argmax of its admission iter, where it
-            // saw its prefill rows). Mirrors the existing
-            // seq_prefilled placement (before EOG check).
-            const bool is_admitted_prefill_argmax =
-                seq.admission_src != admission_source::none
-             && seq.admitted_at_iter == iter
-             && seq.n_decoded == 0;
-            if (is_admitted_prefill_argmax) {
-                trace::event(
-                    "admitted_prefilled request=%d seq_id=%d "
-                    "first_token=%d admission_source=%s",
-                    seq.request_id, seq.seq_id,
-                    static_cast<int>(next_id),
-                    admission_source_name(seq.admission_src));
-                result_.admitted_prefill_events++;
-            }
-            if (llama_vocab_is_eog(vocab_, next_id)) {
-                if (!finalize_and_fulfill(seq, iter, mem)) {
-                    llama_batch_free(batch);
-                    result_.metrics.update_iterations = iter;
-                    finalize_wall_ms();
-                    return;
-                }
-                continue;
-            }
-            // Streaming Slice 8: publish the same int32 fed to the
-            // hash BEFORE n_decoded mutates.
-            publish_token(seq, static_cast<int32_t>(next_id));
-            seq.generated_tokens.push_back(next_id);
-            seq.hash_state = fold_token_hash(seq.hash_state,
-                                             static_cast<int32_t>(next_id));
-            seq.n_decoded++;
-            seq.last_token = next_id;
-            if (seq.n_decoded >= seq.decode_budget) {
-                if (!finalize_and_fulfill(seq, iter, mem)) {
-                    llama_batch_free(batch);
-                    result_.metrics.update_iterations = iter;
-                    finalize_wall_ms();
-                    return;
-                }
-            }
+        // P7: three-source admission priority drain.
+        const iter_admission_result adm =
+            iter_run_admissions(iter, mem, admission_eligible_count);
+        if (!adm.ok) {
+            llama_batch_free(batch);
+            result_.metrics.update_iterations = iter;
+            finalize_wall_ms();
+            return;
         }
 
-        // Live Admission Slice 6: release + ack barrier at END of
-        // iter K. If K is in iter_release_set_, set the release
-        // promise (the submitter is waiting on its future), then
-        // suspend the engine task on the matching ack future. The
-        // submitter pushes all K-arrivals via engine::submit() and
-        // calls ack_promise.set_value() to resume us. With the ack
-        // barrier, scheduling order is deterministic even on a
-        // single HPX worker: engine only proceeds past this point
-        // after every K-arrival is in inbox_. The drain at the top
-        // of iter K+1 then exposes them to admission.
-        if (iter_release_set_.count(iter)) {
-            trace::event("iter_release_fired iter=%d", iter);
-            iter_release_promises_[static_cast<size_t>(iter)]
-                .set_value();
-            result_.iter_release_fired_set.push_back(iter);
-            try {
-                submitter_ack_futures_[
-                    static_cast<size_t>(iter)].get();
-            } catch (const std::exception & e) {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf),
-                    "submitter ack future for iter %d threw: %s",
-                    iter, e.what());
-                if (result_.error.empty()) result_.error = buf;
-                llama_batch_free(batch);
-                result_.metrics.update_iterations = iter;
-                finalize_wall_ms();
-                return;
-            }
-            result_.submitter_ack_set.push_back(iter);
-            trace::event("submitter_ack_observed iter=%d", iter);
+        // P8: admission metrics + early break if no active. Live
+        // Admission Slice 4: one push to admission_iter_set per iter
+        // that admitted at least one waiting request; then sample
+        // queue depth AFTER admission. If every still-active seq was
+        // just cancelled AND no admission happened, end the loop
+        // cleanly without trying to decode an empty batch.
+        if (adm.admitted > 0) {
+            result_.metrics.admission_iter_set.push_back(iter);
+        }
+        result_.metrics.waiting_queue_depth_after_admission_per_iter
+            .push_back(static_cast<int32_t>(
+                waiting_queue_consumable_.size()));
+        if (!any_active()) {
+            result_.metrics.update_iterations = iter;
+            break;
+        }
+
+        // P9: build per-iter llama_batch (admitted-prefill rows OR
+        // regular decode rows). Returns 0 → defensive break.
+        std::vector<int32_t> active_idx;
+        if (iter_build_batch(iter, batch, active_idx) == 0) break;
+
+        // P10: per-iter decode site + per-iter decode metrics.
+        if (!iter_run_decode(batch, active_idx)) {
+            llama_batch_free(batch);
+            result_.metrics.update_iterations = iter;
+            finalize_wall_ms();
+            return;
+        }
+
+        // P11: sample + EOG + publish + finalize per active seq.
+        if (!iter_sample_and_finalize(iter, active_idx, mem)) {
+            llama_batch_free(batch);
+            result_.metrics.update_iterations = iter;
+            finalize_wall_ms();
+            return;
+        }
+
+        // P12: gate-test release/ack barrier at end of iter K.
+        if (!iter_fire_release_ack_barrier(iter)) {
+            llama_batch_free(batch);
+            result_.metrics.update_iterations = iter;
+            finalize_wall_ms();
+            return;
         }
     }
     // M3a: keep-alive outer-loop tail. With keep_alive_=false this
-    // breaks immediately. With keep_alive_=true: acquire inbox_mtx_
-    // and observe shutdown_requested_ on a fully-drained engine —
-    // any_active() and waiting_queue_consumable_.empty() are
-    // tautologically true here because the inner predicate just
-    // returned false, but include them explicitly to match the M3a
-    // §6 invariant verbatim. If shutdown is observed on a drained
-    // engine, set engine_shutdown_observed=1 and break. Otherwise
-    // increment engine_idle_waits and wait on inbox_cv_ with the
-    // predicated form — spurious wakeups are absorbed by the
-    // predicate, and lost wakeups are impossible because submit()
-    // and request_shutdown() both notify after publishing their
-    // state under inbox_mtx_.
+    // breaks immediately. With keep_alive_=true: N1: pump the HPX
+    // inbox channel into the staged_* deques and observe
+    // staged_shutdown_ on an engine with no active sequences.
+    // any_active() is false here (either the inner predicate returned
+    // false or the no-active early break fired); waiting_queue_
+    // consumable_ may still be NON-empty when the early break fired
+    // with a queued-but-unadmittable request, so N5b drains that queue
+    // on the shutdown branch rather than gating shutdown on it. If
+    // shutdown is observed, set engine_shutdown_observed=1 and break.
+    // Otherwise increment
+    // engine_idle_waits and HPX-suspend on the inbox channel via
+    // wait_inbox_blocking() — the engine task parks on the
+    // channel's shared state until a new message arrives, with no
+    // condition_variable_any.
     // M3b: process any pending queued cancellations BEFORE the
     // shutdown-drain / idle-wait decision. This is required for
     // the smoke shape (budgets={}, initial_idle_slots=0, one
@@ -2348,35 +2701,52 @@ void engine::run_body() {
     // requested; the only way the queued request can be cancelled
     // is at the outer-loop tail before the engine idle-waits.
     // drain_cancel_inbox + apply_queued_cancellations are engine-
-    // task-only and incur no lock beyond the brief inbox_mtx_
-    // window in drain_cancel_inbox.
+    // task-only. The pump call after them folds any messages that
+    // arrived while we were applying queued cancellations into the
+    // predicate.
     if (!keep_alive_) break;
     drain_cancel_inbox();
     apply_queued_cancellations();
-    std::unique_lock<hpx::spinlock> lk(inbox_mtx_);
-    if (shutdown_requested_
-        && inbox_.empty()
-        && cancel_inbox_.empty()
-        && cancel_token_inbox_.empty()
-        && !any_active()
-        && waiting_queue_consumable_.empty()) {
+    pump_inbox_nonblocking();
+    if (staged_shutdown_
+        && staged_arrivals_.empty()
+        && staged_cancel_rids_.empty()
+        && staged_cancel_tokens_.empty()
+        && !any_active()) {
+        // N5b: once there are no active sequences and no staged work,
+        // shutdown is total — a queued-but-unadmittable request must
+        // NOT suppress it (the inner loop's no-active early break can
+        // reach here with waiting_queue_consumable_ non-empty). Resolve
+        // every still-queued waiting request with status=failed_reserved
+        // (shutdown-aborted) and close any queued stream before exiting,
+        // so no submitter future is left unfulfilled and the run-end
+        // external_promises_-empty guard holds. With an empty waiting
+        // queue (every existing gate and smoke shape) this drain is a
+        // no-op and the break fires exactly as before, preserving all
+        // canonical anchors.
+        drain_waiting_queue_for_shutdown();
         result_.engine_shutdown_observed = 1;
         break;
     }
+    // The pump above may stage arrivals/cancels that landed AFTER this
+    // tail's drain_cancel_inbox()/apply_queued_cancellations() pass. Do
+    // not park on the inbox while actionable staged work exists — loop
+    // back so the inner-loop drain/apply/drain_external sites consume it
+    // (actor-style: never suspend on a mailbox with pending work). A
+    // late queued cancel would otherwise be stranded until some future
+    // message wakes the engine. staged_shutdown_ is intentionally
+    // excluded — shutdown stays governed by the predicate above.
+    if (!staged_arrivals_.empty()
+        || !staged_cancel_rids_.empty()
+        || !staged_cancel_tokens_.empty()) {
+        continue;
+    }
     result_.engine_idle_waits++;
-    // M3b + M5a: cv-wait predicate wakes on either cancel inbox
-    // (rid-only or token-aware) so cancellations of either flavor
-    // observably wake an idle keep-alive engine. Lost-wakeup proof
-    // from M3a holds — every producer (submit, cancel_request(rid),
-    // cancel_request(token), request_shutdown) publishes its state
-    // under inbox_mtx_ before notifying, and the predicate is
-    // checked under the same lock.
-    inbox_cv_.wait(lk, [&] {
-        return !inbox_.empty()
-            || !cancel_inbox_.empty()
-            || !cancel_token_inbox_.empty()
-            || shutdown_requested_;
-    });
+    // N1: HPX-native suspension on the inbox channel. Wakes on any
+    // submission, cancel (rid or token), or shutdown — channel
+    // FIFO; no lost-wakeup risk because the producer publishes
+    // before its set() returns.
+    wait_inbox_blocking();
     }
 
     result_.metrics.update_iterations = iter;
@@ -2427,18 +2797,17 @@ void engine::run_body() {
         static_cast<int32_t>(free_due_to_completion_.size());
 
     // Live Admission Slice 6: inbox and external_promises_ MUST be
-    // empty at engine end. Non-empty inbox means an arrival was
-    // pushed after the engine's last drain (a barrier-discipline
-    // bug). Non-empty external_promises_ means an arrival was
-    // drained but never admitted, which would leak the submitter's
-    // future. Fail closed before the residual-KV sweep so the
-    // diagnostic is unambiguous.
+    // empty at engine end. Non-empty staged arrivals means an
+    // arrival was pushed after the engine's last drain (a barrier-
+    // discipline bug). Non-empty external_promises_ means an
+    // arrival was drained but never admitted, which would leak the
+    // submitter's future. Fail closed before the residual-KV sweep
+    // so the diagnostic is unambiguous. N1: pump the channel first
+    // to catch any arrival that landed since the last predicate
+    // pump; then read staged_arrivals_ without a lock.
     {
-        size_t inbox_residual = 0;
-        {
-            std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-            inbox_residual = inbox_.size();
-        }
+        pump_inbox_nonblocking();
+        size_t inbox_residual = staged_arrivals_.size();
         if (inbox_residual != 0) {
             char buf[200];
             std::snprintf(buf, sizeof(buf),
@@ -2465,22 +2834,22 @@ void engine::run_body() {
     // received a matching submission, or cancel-after-completion).
     // Each residue entry bumps cancel_unknown_request_id and emits
     // a trace; do NOT fail-close on residue so existing smokes
-    // (which never call cancel_request) remain byte-identical. Also
-    // drain any cancel_inbox_ entry that arrived after the last
-    // outer-loop tail drain — the engine has stopped its keep-alive
-    // loop here, so flush these as residue too.
+    // (which never call cancel_request) remain byte-identical. N1:
+    // pump the channel once more to catch any cancel that arrived
+    // since the last predicate pump; then drain the staged cancel
+    // deques as residue. No lock — staged_* are engine-task-only.
     {
-        std::lock_guard<hpx::spinlock> lk(inbox_mtx_);
-        while (!cancel_inbox_.empty()) {
-            const int32_t rid = cancel_inbox_.front();
-            cancel_inbox_.pop_front();
+        pump_inbox_nonblocking();
+        while (!staged_cancel_rids_.empty()) {
+            const int32_t rid = staged_cancel_rids_.front();
+            staged_cancel_rids_.pop_front();
             result_.cancel_request_calls++;
             cancelled_request_ids_.insert(rid);
         }
-        // M5a: symmetric flush of cancel_token_inbox_ as residue.
-        while (!cancel_token_inbox_.empty()) {
-            const cancel_token tok = cancel_token_inbox_.front();
-            cancel_token_inbox_.pop_front();
+        // M5a: symmetric flush of staged_cancel_tokens_ as residue.
+        while (!staged_cancel_tokens_.empty()) {
+            const cancel_token tok = staged_cancel_tokens_.front();
+            staged_cancel_tokens_.pop_front();
             result_.cancel_request_calls++;
             cancelled_tokens_.insert(
                 std::make_pair(tok.request_id, tok.epoch));

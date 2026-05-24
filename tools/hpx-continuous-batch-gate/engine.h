@@ -23,12 +23,13 @@
 //                 `register_external_release_iter(K)`.
 // PRELOAD applies to ctor-time fields only (see engine_options).
 //
-// All private members (queues, mutexes, the per-seq state vector, the
-// admitted-handoff vector, the inbox, the release/ack barrier slots,
-// the streaming receivers vector, the per-engine result struct, etc.)
-// are declared here because they must be visible to compile any TU
-// that constructs an `engine`; their definitions and the bodies of
-// every method live in `engine.cpp`.
+// All private members (queues, the per-seq state vector, the
+// admitted-handoff vector, the HPX inbox channel + staged deques,
+// the release/ack barrier slots, the streaming receivers vector,
+// the per-engine result struct, etc.) are declared here because
+// they must be visible to compile any TU that constructs an
+// `engine`; their definitions and the bodies of every method live
+// in `engine.cpp`.
 
 #pragma once
 
@@ -38,7 +39,6 @@
 
 #include <hpx/hpx.hpp>
 #include <hpx/lcos_local/channel.hpp>
-#include <hpx/synchronization/condition_variable.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -128,6 +128,34 @@ struct engine_options {
         // been called AND all work is drained. No new behavior unless
         // the caller opts in.
         bool                keep_alive         = false;
+        // N2.7: placement-selected cooperativity yield in
+        // pump_inbox_nonblocking(). Default true matches the legacy
+        // behavior for every default-pool spawn site (gate without
+        // --engine-pool, all existing engine smokes, hpx-server): the
+        // yield is the foreign-thread → engine cooperativity point
+        // that lets producer/cancel tasks make progress under
+        // os_threads=1. When the caller spawns this engine on the
+        // named HPX `engine` pool via hpx_runtime::async_on_engine
+        // (i.e. start_once was called with enable_engine_pool=true),
+        // set this to false: N2.6b/N2.6c proved that
+        // hpx::this_thread::yield() on a single-PU named pool causes
+        // a scheduler-livelock that prevents channel observation
+        // from foreign-thread producers. The decision is made at the
+        // spawn site (Layer 2 placement); the engine itself does not
+        // query runtime placement state.
+        bool                cooperative_yield_on_pump = true;
+        // N3.1 (Exp 13): opt into control-plane responsiveness
+        // timestamp collection on `request_result.t_admitted_us`,
+        // `t_first_publish_us`, `t_complete_us`, and
+        // `t_cancel_observed_us`. Default false matches every
+        // existing call site (smokes, gate, hpx-server, M8 configs)
+        // byte-for-byte: with the option off, no `steady_clock::now()`
+        // calls are added on any hot engine path, and all four
+        // request_result fields stay -1.
+        // Set this true ONLY from the dedicated responsiveness
+        // benchmark binary so existing gates do not pay extra clock
+        // reads.
+        bool                enable_responsiveness_timing = false;
     } lib;
 
     // M4e: preload bucket. Ctor-time seeding for the gate / preload
@@ -217,11 +245,11 @@ public:
     // Live Admission Slice 6: async external arrival inbox push.
     // Called from the external submitter HPX task — never from the
     // engine task. Per Correction 1, this method is intentionally
-    // read-only on engine_result: it only acquires the inbox spinlock,
-    // moves the message into inbox_, and (optionally) emits a trace
-    // event. Counters are bumped by the engine when it drains.
-    // Hard rule: this body must not call any llama_* API. The grep
-    // gate in main asserts that.
+    // read-only on engine_result: N1: it publishes a `submission`
+    // inbox_msg onto the HPX inbox channel and emits a trace event.
+    // Counters are bumped by the engine when it drains. Hard rule:
+    // this body must not call any llama_* API. The grep gate in
+    // main asserts that.
     void submit(arrival_msg msg);
 
     // M4a: LIBRARY — stable public submit API.
@@ -241,23 +269,27 @@ public:
     submit_handle submit_request(struct submit_request req);
 
     // M4a: LIBRARY — stable shutdown signal for keep-alive engines.
-    // M3a: public shutdown signal for long-running keep-alive mode.
-    // Sets the engine's `shutdown_requested_` flag under inbox_mtx_
-    // and notifies inbox_cv_, so the engine task wakes from an idle
-    // wait. Idempotent and safe to call from any HPX task (including
-    // the same task that submitted requests). Does not touch any
-    // llama_* state. When `engine_options::lib.keep_alive` was false this
-    // method is harmless (the engine exits naturally on work drain);
-    // when keep_alive was true, the engine drains any active work at
+    // N1: publishes a `shutdown` inbox_msg onto the HPX inbox channel.
+    // The engine task observes it during its next pump (inner-loop
+    // predicate via inbox_has_pending, or outer-loop tail pump). Same
+    // iteration-boundary semantics as before. Idempotent: multiple
+    // shutdown messages are folded into the engine-task-only
+    // staged_shutdown_ latch by stage_one(). Safe to call from any
+    // HPX or foreign thread. Does not touch any llama_* state. When
+    // `engine_options::lib.keep_alive` was false the method is
+    // harmless (the engine exits naturally on work drain); when
+    // keep_alive was true, the engine drains any active work at
     // iteration boundaries and then exits the decode loop cleanly.
     // Never interrupts a llama_decode in progress.
     void request_shutdown();
 
     // M4a: LIBRARY — stable public cancellation.
-    // M3b/M3c: public cancellation. Pushes `request_id` onto
-    // cancel_inbox_ under inbox_mtx_ and notifies inbox_cv_. The
-    // engine task drains cancel_inbox_ at iteration boundaries and
-    // at the outer-loop tail, then matches the rid against
+    // M3b/M3c: public cancellation. N1: publishes a `cancel_rid`
+    // inbox_msg onto the HPX inbox channel. The engine task pumps
+    // it into staged_cancel_rids_ at the next predicate-pump site;
+    // drain_cancel_inbox() promotes the rid into
+    // cancelled_request_ids_ at iteration boundaries and at the
+    // outer-loop tail, then matches the rid against
     // (a) arrivals not yet drained from inbox_ — M3b queued path:
     //     drain_external_inbox short-circuits the queue push and
     //     fulfill_queued_cancelled resolves the promise + stream
@@ -363,15 +395,20 @@ private:
                    int32_t              iter,
                    llama_memory_t       mem);
 
-    // M3b: cancel_inbox_ → cancelled_request_ids_ transfer. Engine
-    // task only. Acquires inbox_mtx_ to swap cancel_inbox_ into a
-    // local deque, then folds every rid into cancelled_request_ids_
-    // (unordered_set: duplicates collapse, bumping
-    // cancel_request_duplicates if a rid was already present).
-    // Bumps cancel_request_calls once per drained entry. No llama
-    // call sites; no promise fulfillment here — see
-    // apply_queued_cancellations() and the drain_external_inbox()
-    // arrival-side guard.
+    // M3b + M5a: staged-cancel → cancelled_request_ids_ /
+    // cancelled_tokens_ transfer. Engine task only. N1: swaps
+    // staged_cancel_rids_ and staged_cancel_tokens_ (already pumped
+    // off the HPX inbox channel by inbox_has_pending() or the
+    // outer-loop pump) into local deques, then folds every rid /
+    // token into the engine-task-only sets (unordered_set / set:
+    // duplicates collapse, bumping cancel_request_duplicates if
+    // already present). Bumps cancel_request_calls once per drained
+    // entry. No channel pump inside this function — pump happens
+    // only at predicate sites, so cancels arriving on the channel
+    // during this drain stay buffered until the next pump and are
+    // observed only at the next cancel phase. No llama call sites;
+    // no promise fulfillment here — see apply_queued_cancellations()
+    // and the drain_external_inbox() arrival-side guard.
     void drain_cancel_inbox();
 
     // M3b/M3c: walk cancelled_request_ids_ and resolve each rid
@@ -406,14 +443,117 @@ private:
         std::optional<token_stream_channel> channel,
         const char *                        from_label);
 
-    // M2f: non-const because it acquires `inbox_mtx_` (the existing
-    // engine-internal spinlock). Engine task only. Pure metadata
-    // probe — no llama.cpp API call sites in the body.
+    // N5b: shutdown-aborted queued-request resolver. Engine task only.
+    // Modeled on fulfill_queued_cancelled but resolves with status=
+    // failed_reserved (shutdown-aborted queued work, NOT user
+    // cancellation) and closes any queued stream with reason=error. No
+    // KV touch, no llama API. Returns true on successful set_value,
+    // false if set_value throws (caller stamps result_.error).
+    bool fulfill_queued_shutdown_aborted(
+        int32_t                             request_id,
+        int32_t                             decode_budget,
+        hpx::promise<request_result>        promise,
+        std::optional<token_stream_channel> channel,
+        const char *                        from_label);
+
+    // N5b: drain ALL queued-but-unadmittable requests on shutdown.
+    // Engine task only. For each entry in waiting_queue_consumable_,
+    // moves its promise out of external_promises_ and any stream channel
+    // out of external_stream_channels_, erases its live_epoch_by_rid_
+    // entry, and resolves it via fulfill_queued_shutdown_aborted. Leaves
+    // waiting_queue_consumable_ empty so the outer-tail shutdown break
+    // can no longer be suppressed by a stranded queued request.
+    void drain_waiting_queue_for_shutdown();
+
+    // M2f: engine-task-only. N1: pumps the HPX inbox channel
+    // non-blocking into the staged_* deques, then reports whether
+    // any staged arrival is now visible. Non-const because the pump
+    // mutates pending_msg_ and staged_arrivals_. Must NOT be called
+    // from foreign/server threads — staged_* deques are unguarded
+    // and accessed exclusively by run().
     bool inbox_has_pending();
+
+    // N3.0: per-iter phase helpers extracted from run_body()'s
+    // inner-while body. Engine task only. Call order each iter:
+    //   P1  pump_inbox_nonblocking
+    //   P2  drain_cancel_inbox
+    //   P3  drain_external_inbox(iter)
+    //   P4  apply_queued_cancellations
+    //   P5  admission_eligible_count snapshot   (inline in run_body)
+    //   P6  iter_observe_cancellations
+    //   P7  iter_run_admissions
+    //   P8  admission metrics + !any_active break (inline in run_body)
+    //   P9  iter_build_batch
+    //   P10 iter_run_decode
+    //   P11 iter_sample_and_finalize
+    //   P12 iter_fire_release_ack_barrier
+    // Bodies are verbatim moves of the prior inline blocks. Helpers
+    // return false / ok=false on bail; the orchestrator performs the
+    // shared llama_batch_free + update_iterations + finalize_wall_ms
+    // cleanup at each call site (matches the legacy bail pattern).
+    struct iter_admission_result {
+        int32_t admitted = 0;
+        bool    ok       = true;
+    };
+
+    bool iter_observe_cancellations(int32_t iter, llama_memory_t mem);
+
+    iter_admission_result iter_run_admissions(
+        int32_t iter, llama_memory_t mem,
+        size_t admission_eligible_count);
+
+    int32_t iter_build_batch(int32_t iter, llama_batch & batch,
+                             std::vector<int32_t> & active_idx);
+
+    bool iter_run_decode(llama_batch & batch,
+                         const std::vector<int32_t> & active_idx);
+
+    bool iter_sample_and_finalize(
+        int32_t iter,
+        const std::vector<int32_t> & active_idx,
+        llama_memory_t mem);
+
+    bool iter_fire_release_ack_barrier(int32_t iter);
 
     void run_body();
 
     void finalize_wall_ms();
+
+    // N1: HPX inbox protocol — engine-internal types and helpers.
+    // inbox_msg is a tagged-union over the four producer kinds. It
+    // is move-only (because arrival_msg is move-only) and travels
+    // through hpx::lcos::local::channel<inbox_msg>. The type is a
+    // private nested member so the wire format never leaks into
+    // public engine headers.
+    enum class inbox_msg_kind : uint8_t {
+        submission   = 0,
+        cancel_rid   = 1,
+        cancel_token = 2,
+        shutdown     = 3,
+    };
+    struct inbox_msg {
+        inbox_msg_kind             k       = inbox_msg_kind::shutdown;
+        std::optional<arrival_msg> arrival;        // valid iff k == submission
+        int32_t                    rid     = -1;   // valid iff k == cancel_rid
+        ::cancel_token             token   = {};   // valid iff k == cancel_token
+    };
+
+    // pump_inbox_nonblocking: pull every channel message that is
+    // currently ready into the staged_* deques. Engine-task-only.
+    // Maintains the invariant that pending_msg_ is a valid future
+    // for the next-not-yet-arrived message at function exit.
+    void pump_inbox_nonblocking();
+
+    // wait_inbox_blocking: park the engine HPX task on the channel
+    // until at least one new message arrives, stage it, then drain
+    // any follow-up ready messages. Engine-task-only. Replaces the
+    // old condition_variable_any wait.
+    void wait_inbox_blocking();
+
+    // stage_one: route a single inbox_msg into the appropriate
+    // staged_* deque (or set the staged_shutdown_ latch). Engine-
+    // task-only.
+    void stage_one(inbox_msg m);
 
 private:
     llama_context *                  ctx_;
@@ -470,80 +610,80 @@ private:
     // Streaming Slice 3: parallel per-admission stream handoff vector,
     // guarded by the SAME admitted_futures_mtx_ critical section that
     // already serializes admitted-future handoff. As of M4d that
-    // primitive is hpx::spinlock (matches inbox_mtx_); this is
-    // gate-local synchronization around result handoff only, never
-    // around llama.cpp execution state. Populated by admit_one when
-    // stream_all_ is on and
+    // primitive is hpx::spinlock; this is gate-local synchronization
+    // around result handoff only, never around llama.cpp execution
+    // state. Populated by admit_one when stream_all_ is on and
     // src == admission_source::completion_freed; drained by main via
     // take_admitted_stream_handoffs() strictly after engine_fut.get().
     std::vector<admitted_stream_handoff>     admitted_stream_handoffs_;
-    // M4d: was std::mutex; swapped to hpx::spinlock to match the
-    // HPX-native primitive already used by inbox_mtx_. Guards the
-    // same gate-local result-handoff vectors as before; no behavior
+    // M4d: was std::mutex; swapped to hpx::spinlock to keep the
+    // result-handoff synchronization HPX-native. Guards the same
+    // gate-local result-handoff vectors as before; no behavior
     // change beyond the primitive type.
     hpx::spinlock                    admitted_futures_mtx_;
-    // Live Admission Slice 6: async external arrival inbox + release/ack
-    // barrier state. inbox_ is a passive engine-owned deque guarded by
-    // an HPX-aware spinlock (no new std::mutex per Correction 1/2 rules).
-    // Submitter pushes via engine::submit(); engine task drains under
-    // the spinlock at the top of each decode iter. external_promises_
-    // stashes the submitter-created promise keyed by request_id between
-    // drain and admission; the admission step moves it into the slot's
-    // promise position. iter_release_promises_/submitter_ack_futures_
-    // are sized at ctor time and indexed by decode iter K.
-    hpx::spinlock                                   inbox_mtx_;
-    // M3a: condition variable paired with inbox_mtx_ for keep-alive
-    // mode. condition_variable_any accepts any BasicLockable, so
-    // inbox_mtx_ stays an hpx::spinlock (the existing four
-    // lock-guard sites are unchanged). Both `submit()` and
-    // `request_shutdown()` notify on this cv; the engine task waits
-    // on it via the predicated overload only when keep_alive_ is on
-    // and there is no other work to do. Engine-task-only mutator
-    // outside the lock; lock-guarded mutators are documented below.
-    hpx::condition_variable_any                     inbox_cv_;
-    // M3a: public shutdown signal. Guarded by inbox_mtx_ on every
-    // writer and on the cv waiter's predicate check; readers outside
-    // the wait (the decode-loop while-predicate and the
-    // post-no-active continue path) read it through the same lock
-    // path the inbox itself uses (`inbox_has_pending()` already
-    // acquires inbox_mtx_, so reading shutdown_requested_ right
-    // before/after it pays for the lock once per iter at most).
-    // request_shutdown() sets it under inbox_mtx_ and notifies the
-    // cv; run_body's per-repeat reset clears it.
-    bool                                            shutdown_requested_ = false;
+    // N1: HPX-native async inbox. Replaces the M3a/M3b/M5a
+    // spinlock+cv+deque triad with a single move-only-capable HPX
+    // local channel. Producers (submit, submit_request,
+    // cancel_request rid/token, request_shutdown) publish typed
+    // inbox_msg values into inbox_chan_; the engine task pumps the
+    // channel into the engine-task-only staged_* deques at every
+    // predicate-evaluation site (inbox_has_pending() and the outer-
+    // loop tail). drain_external_inbox / drain_cancel_inbox swap
+    // from staged_* into local deques without pumping, so cancels
+    // arriving on the channel mid-arrival-drain stay buffered until
+    // the next predicate pump — preserving the existing
+    // iteration-boundary cancel-then-arrival phase order.
+    //
+    // pending_msg_ is the next-message future used by
+    // pump_inbox_nonblocking / wait_inbox_blocking. Engine-task-
+    // only; not accessed outside run().
+    //
+    // submit_publish_mtx_ is held briefly around the next_epoch_
+    // bump AND the channel publish inside engine::submit_request().
+    // This preserves M5a's "drain order matches epoch order"
+    // invariant for concurrent same-rid submissions without
+    // changing live_epoch_by_rid_ semantics. Other producers
+    // (cancel rid/token, request_shutdown, engine::submit) do not
+    // bump next_epoch_ and do not acquire this lock.
+    hpx::lcos::local::channel<inbox_msg>            inbox_chan_;
+    hpx::future<inbox_msg>                          pending_msg_;
+    std::deque<arrival_msg>                         staged_arrivals_;
+    std::deque<int32_t>                             staged_cancel_rids_;
+    std::deque<cancel_token>                        staged_cancel_tokens_;
+    bool                                            staged_shutdown_ = false;
+    hpx::spinlock                                   submit_publish_mtx_;
     // M3a: keep-alive latch, copied once from engine_options::
     // lib.keep_alive at construction. With keep_alive_=false the decode
-    // loop is byte-identical to M2. With keep_alive_=true the loop
-    // does not exit on natural work drain and the engine idle-waits
-    // on inbox_cv_ until new work arrives or shutdown is requested.
+    // loop exits as soon as no active seq, waiting queue empty, and
+    // inbox empty — byte-identical to M2. With keep_alive_=true the
+    // loop does not exit on natural work drain and the engine
+    // HPX-suspends on the inbox channel via wait_inbox_blocking()
+    // until new work arrives or shutdown is requested.
     bool                                            keep_alive_         = false;
-    std::deque<arrival_msg>                                      inbox_;
-    // M3b: queued-before-admission cancellation transport. cancel_inbox_
-    // is the producer-side deque that engine::cancel_request() pushes
-    // request_ids onto under inbox_mtx_ (sharing the existing M3a
-    // lock); the same notify on inbox_cv_ wakes a keep-alive engine.
-    // cancelled_request_ids_ is the engine-task-only persistent set
-    // populated by drain_cancel_inbox(). Both are cleared in
-    // run_body's per-repeat reset. The cv-wait predicate and the
-    // drained-shutdown predicate both treat cancel_inbox_ as work,
-    // so cancellations can never be lost across an idle suspend.
-    std::deque<int32_t>                                          cancel_inbox_;
+    // N2.7: copied once from engine_options::lib.cooperative_yield_on_pump
+    // at construction. Default true matches legacy behavior for every
+    // default-pool spawn site. The gate sets this to false when
+    // --engine-pool is on so the engine task running on the named
+    // single-PU engine pool skips the yield in pump_inbox_nonblocking
+    // (N2.6c-proved scheduler livelock).
+    bool                                            cooperative_yield_on_pump_ = true;
+    // N3.1 (Exp 13): copied once from
+    // engine_options::lib.enable_responsiveness_timing at construction.
+    // Gates the four responsiveness timestamp writes
+    // (t_admitted_us / t_first_publish_us / t_complete_us /
+    // t_cancel_observed_us). False on every existing caller (smokes,
+    // gate, hpx-server, M8 configs); set true only by the dedicated
+    // responsiveness benchmark binary.
+    bool                                            enable_responsiveness_timing_ = false;
+    // M3b: queued-before-admission cancellation set, engine-task-
+    // only. Populated by drain_cancel_inbox() from
+    // staged_cancel_rids_; consumed by apply_queued_cancellations
+    // and the drain_external_inbox() arrival-side guard. Cleared in
+    // run_body's per-repeat reset.
     std::unordered_set<int32_t>                                  cancelled_request_ids_;
-    // M5a: epoch-aware cancellation transport. Sits alongside the
-    // legacy M3b rid-only structures above; no field on those is
-    // repurposed. `cancel_token_inbox_` is the producer-side deque
-    // that `engine::cancel_request(const cancel_token &)` pushes
-    // tokens onto under the existing `inbox_mtx_`; the same notify
-    // on `inbox_cv_` wakes a keep-alive engine. `cancelled_tokens_`
-    // is the engine-task-only persistent set populated by
-    // `drain_cancel_inbox()` after the legacy rid drain — duplicate
-    // `(rid, epoch)` insertions bump `cancel_request_duplicates`.
-    // Both are cleared in `run_body`'s per-repeat reset. The cv-wait
-    // predicate and the drained-shutdown predicate treat
-    // `cancel_token_inbox_` as work alongside the legacy
-    // `cancel_inbox_`, so token cancellations cannot be lost across
-    // an idle suspend.
-    std::deque<cancel_token>                                     cancel_token_inbox_;
+    // M5a: epoch-aware cancellation set, engine-task-only. Populated
+    // by drain_cancel_inbox() from staged_cancel_tokens_. Cleared in
+    // run_body's per-repeat reset.
     std::set<std::pair<int32_t, uint64_t>>                       cancelled_tokens_;
     // M5a: engine-task-owned "currently live" map keyed by rid. An
     // entry exists iff the rid has an arrival that has been drained
@@ -560,15 +700,21 @@ private:
     // an older same-rid incarnation from wiping the live entry of a
     // newer submission. Engine task only; no locking.
     std::unordered_map<int32_t, uint64_t>                        live_epoch_by_rid_;
-    // M5a: monotonic engine-issued epoch source. Bumped under
-    // `inbox_mtx_` inside `engine::submit_request` so the same lock
-    // that serializes inbox pushes also serializes epoch issuance.
-    // Starts at 1; the value 0 is the "unset" sentinel reserved for
-    // default-constructed `cancel_token` and for arrival_msg /
-    // seq_state / waiting_request paths that never went through
-    // `submit_request`. Monotonic for the lifetime of the engine
-    // (not reset across `--repeat` iterations) so tokens issued on
-    // one repeat cannot collide with submissions on the next.
+    // M5a: monotonic engine-issued epoch source. N1: bumped under
+    // `submit_publish_mtx_` inside `engine::submit_request`. The
+    // same critical section also publishes the matching `submission`
+    // inbox_msg onto `inbox_chan_`, so two concurrent
+    // submit_request callers produce a totally ordered
+    // (epoch, channel-position) pair. This preserves the M5a
+    // assumption that drain order matches epoch order, keeping
+    // `live_epoch_by_rid_` semantically correct without any
+    // tracking changes. Starts at 1; the value 0 is the "unset"
+    // sentinel reserved for default-constructed `cancel_token` and
+    // for arrival_msg / seq_state / waiting_request paths that
+    // never went through `submit_request`. Monotonic for the
+    // lifetime of the engine (not reset across `--repeat`
+    // iterations) so tokens issued on one repeat cannot collide
+    // with submissions on the next.
     uint64_t                                                     next_epoch_ = 1;
     std::unordered_map<int32_t, hpx::promise<request_result>>    external_promises_;
     // M2g: engine-task-only stash of per-request stream channels

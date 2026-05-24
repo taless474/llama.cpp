@@ -142,6 +142,23 @@ target_link_libraries(llama-hpx-server-backpressure-smoke
             HPX::hpx
             ${CMAKE_THREAD_LIBS_INIT})
 
+# N4: in-process placement smoke that runs the round-trip and SSE
+# client-disconnect paths with the engine HPX task scheduled on the
+# named single-PU "engine" thread pool (start_once with
+# enable_engine_pool=true; spawn via hpx_runtime::async_on_engine;
+# engine_options::lib.cooperative_yield_on_pump=false). Acts as the
+# permanent regression guard for the cpp-httplib + engine-pool
+# integration path. Built by default; intentionally not installed.
+add_executable(llama-hpx-server-engine-pool-smoke hpx_server_engine_pool_smoke.cpp)
+target_compile_features(llama-hpx-server-engine-pool-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-server-engine-pool-smoke
+    PRIVATE llama-hpx-engine
+            llama-common
+            llama
+            cpp-httplib
+            HPX::hpx
+            ${CMAKE_THREAD_LIBS_INIT})
+
 # M7f: composition of M7d (SSE client-disconnect → cancel) and M7e
 # (HTTP-door capacity lease). Boots in-process server with
 # --n-seq-max=1 --max-concurrent=1; drives a streaming holder POST

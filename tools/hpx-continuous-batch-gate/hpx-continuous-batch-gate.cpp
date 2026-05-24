@@ -171,7 +171,11 @@ int main(int argc, char ** argv) {
     trace::init();
 
     // ---- Start HPX runtime first; fail closed if unavailable. -----------
-    if (!hpx_runtime::start_once(args.hpx_os_threads)) {
+    // N2.5: optionally request the named single-PU "engine" pool. When
+    // --engine-pool is not passed, behavior is byte-identical to N3.0.
+    hpx_runtime::runtime_config rt_cfg;
+    rt_cfg.enable_engine_pool = args.engine_pool;
+    if (!hpx_runtime::start_once(args.hpx_os_threads, rt_cfg)) {
         emit_fail("hpx runtime start failed");
         return 1;
     }
@@ -531,6 +535,13 @@ int main(int argc, char ** argv) {
         eng_opts.lib.n_vocab              = n_vocab;
         eng_opts.lib.batch_capacity       = batch_capacity;
         eng_opts.lib.n_seq_max            = args.n_seqs;
+        // N2.7: disable the pump cooperativity yield when this engine
+        // instance will run on the named single-PU engine pool. The
+        // yield is load-bearing on default-pool placement (N2.6 evidence)
+        // but causes a scheduler livelock on a dedicated single-PU named
+        // pool (N2.6c evidence). Decision is made at the spawn site so
+        // engine.cpp does not need to query runtime placement state.
+        eng_opts.lib.cooperative_yield_on_pump = !args.engine_pool;
         eng_opts.preload.prompt_tokens    = &prompt_tokens;
         eng_opts.preload.budgets          = budgets;
         eng_opts.preload.waiting_queue    = &waiting_queue;
@@ -640,9 +651,12 @@ int main(int argc, char ** argv) {
 
         // Schedule engine::run() as exactly one HPX task; main thread
         // waits via wait_all on per-request futures + engine_fut.get().
-        hpx::future<void> engine_fut = hpx::async([&eng]() {
-            eng.run();
-        });
+        // N2.5: async_on_engine spawns on the named "engine" pool when
+        // --engine-pool was passed (and start_once created it); falls
+        // through to bare hpx::async otherwise. Throws if engine pool
+        // was requested but is not available.
+        hpx::future<void> engine_fut = hpx_runtime::async_on_engine(
+            [&eng]() { eng.run(); });
 
         hpx::wait_all(futs);
 

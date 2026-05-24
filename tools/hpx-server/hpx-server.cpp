@@ -174,6 +174,16 @@ struct server_args {
     // `parse_args` normalizes a zero/negative value to n_seq_max at the
     // end of argv parsing so the default tracks the engine concurrency.
     int32_t     max_concurrent    = 0;
+    // N4: HPX worker count for hpx_runtime::start_once. Default 2
+    // preserves M7a behavior byte-for-byte. Independent of --n-threads
+    // (libllama compute). Must be >= 2 when --engine-pool is on; the
+    // hpx_runtime::start_once preflight enforces that.
+    int32_t     hpx_os_threads    = 2;
+    // N4: opt into the single-PU named HPX "engine" thread pool created
+    // by hpx_runtime::start_once. Default OFF — async_on_engine falls
+    // through to bare hpx::async, byte-identical to M7a. ON requires
+    // --hpx-os-threads >= 2.
+    bool        engine_pool       = false;
 };
 
 void print_usage(const char * argv0) {
@@ -186,7 +196,16 @@ void print_usage(const char * argv0) {
         "  --max-prompt-tokens <int> default: 512\n"
         "  --n-threads <int>         default: 2  (libllama compute)\n"
         "  --max-concurrent <int>    default: --n-seq-max  (M7e: HTTP-layer in-flight cap)\n"
-        "  --ctx-size <int>          default: 2048  (llama_context n_ctx)\n",
+        "  --ctx-size <int>          default: 2048  (llama_context n_ctx)\n"
+        "  --hpx-os-threads <int>    default: 2  (N4: HPX worker count;\n"
+        "                            independent of --n-threads. Must be\n"
+        "                            >= 2 when --engine-pool is on.)\n"
+        "  --engine-pool             default: OFF  (N4: opt into the\n"
+        "                            single-PU named HPX 'engine' thread\n"
+        "                            pool. Engine HPX task runs on that\n"
+        "                            pool; cpp-httplib workers and request\n"
+        "                            futures stay on default. OFF preserves\n"
+        "                            M7a spawn behavior byte-for-byte.)\n",
         argv0);
 }
 
@@ -224,6 +243,14 @@ bool parse_args(int argc, char ** argv, server_args & out) {
         } else if (a == "--ctx-size") {
             if (!need_value("--ctx-size")) return false;
             out.n_ctx = std::atoi(argv[++i]);
+        } else if (a == "--hpx-os-threads") {
+            if (!need_value("--hpx-os-threads")) return false;
+            out.hpx_os_threads = std::atoi(argv[++i]);
+        } else if (a == "--engine-pool") {
+            // N4 boolean flag, no value. Validation against
+            // --hpx-os-threads happens inside
+            // hpx_runtime::start_once (requires os_threads >= 2).
+            out.engine_pool = true;
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return false;
@@ -246,6 +273,10 @@ bool parse_args(int argc, char ** argv, server_args & out) {
     }
     if (out.n_ctx < 1) {
         fprintf(stderr, "error: --ctx-size must be >= 1\n");
+        return false;
+    }
+    if (out.hpx_os_threads < 1) {
+        fprintf(stderr, "error: --hpx-os-threads must be >= 1\n");
         return false;
     }
     // M7e: zero/negative => default to n_seq_max (one HTTP slot per
@@ -378,11 +409,19 @@ int main(int argc, char ** argv) {
 
     trace::init();
 
-    // os_threads=2 leaves one HPX worker for the engine task and one
-    // for other HPX work (e.g. promise fulfilment continuations).
-    // cpp-httplib's internal worker pool is separate and not driven
-    // by these.
-    if (!hpx_runtime::start_once(/*os_threads=*/2)) {
+    // os_threads >= 2 leaves one HPX worker for the engine task and at
+    // least one for other HPX work (e.g. promise fulfilment
+    // continuations). cpp-httplib's internal worker pool is separate
+    // and not driven by these.
+    //
+    // N4: when --engine-pool is on, start_once installs an rp_callback
+    // that creates a single-PU named "engine" thread pool. The
+    // preflight inside start_once fails closed if os_threads < 2 while
+    // engine_pool is requested, so the bad config never reaches
+    // hpx::start.
+    hpx_runtime::runtime_config rt_cfg;
+    rt_cfg.enable_engine_pool = args.engine_pool;
+    if (!hpx_runtime::start_once(args.hpx_os_threads, rt_cfg)) {
         fprintf(stderr, "error: hpx runtime start failed\n");
         return 1;
     }
@@ -441,6 +480,12 @@ int main(int argc, char ** argv) {
     opts.lib.n_seq_max            = args.n_seq_max;
     opts.lib.initial_idle_slots   = args.n_seq_max;
     opts.lib.keep_alive           = true;
+    // N4: disable the pump cooperativity yield when this engine will
+    // run on the named single-PU engine pool. Mirrors the gate's
+    // decision at the spawn site: yield is load-bearing on default
+    // placement; it causes a scheduler livelock on a dedicated single-
+    // PU named pool (N2.6c evidence).
+    opts.lib.cooperative_yield_on_pump = !args.engine_pool;
     opts.preload.prompt_tokens    = nullptr;
     opts.preload.budgets          = {};
     opts.preload.waiting_queue    = &empty_waiting;
@@ -453,8 +498,16 @@ int main(int argc, char ** argv) {
     try {
         engine eng(std::move(opts));
 
+        // N4: async_on_engine spawns on the named "engine" pool when
+        // --engine-pool was passed (and start_once created it); falls
+        // through to bare hpx::async otherwise — byte-identical to
+        // the legacy M7a spawn form. Throws std::runtime_error if the
+        // engine pool was requested but is unavailable at spawn; the
+        // surrounding catch (const std::exception &) sets rc=1 and
+        // cleanup() tears everything down before any handler is
+        // registered or any per-request promise/stream exists.
         hpx::future<void> engine_fut =
-            hpx::async([&] { eng.run(); });
+            hpx_runtime::async_on_engine([&] { eng.run(); });
 
         std::atomic<int32_t> next_rid{1};
 
