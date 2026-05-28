@@ -167,6 +167,91 @@ add_executable(llama-hpx-engine-shutdown-queued-unadmittable-smoke engine_shutdo
 target_compile_features(llama-hpx-engine-shutdown-queued-unadmittable-smoke PRIVATE cxx_std_17)
 target_link_libraries(llama-hpx-engine-shutdown-queued-unadmittable-smoke PRIVATE llama-hpx-engine)
 
+# N5a: cancel_freed -> natural-completion -> later-admission slot-recovery
+# reproducer. Single slot (n_seq_max=1, initial_idle_slots=1, budgets={},
+# reuse_completed=false, keep_alive=true): streaming request A is
+# cancelled while active (slot -> cancel_freed), non-streaming request B
+# is admitted from cancel_freed and completes naturally, then
+# non-streaming request C probes admission. Pre-fix C is never admitted
+# (the cancel_freed slot is leaked by finalize_and_fulfill) and is
+# resolved as failed_reserved by the N5b shutdown drain, so the smoke
+# FAILs cleanly (engine joins; no _Exit on the expected path). Post-fix C
+# admits from the recovered free_idle_ slot and completes with the
+# canonical b8 hash. Built by default; intentionally not installed.
+add_executable(llama-hpx-engine-cancel-freed-completion-admit-smoke engine_cancel_freed_completion_admit_smoke.cpp)
+target_compile_features(llama-hpx-engine-cancel-freed-completion-admit-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-cancel-freed-completion-admit-smoke PRIVATE llama-hpx-engine)
+
+# Slice C: gated single-request chunked-prefill correctness smoke. Drives
+# one greedy request ("Hello, my name is", budget=8) through the
+# live-admission build path (Path A) on a single-slot keep-alive engine
+# with engine_options::lib.prefill_budget_rows set to several values:
+#   B=0 (unbounded) and B>=prompt_len (collapse) must reproduce the
+#   canonical b8 hash 0x0619d4d1900c2365 (one-chunk == whole-prompt);
+#   B=2 and B=4 must split prefill across multiple iters (verified via the
+#   in-memory Phase-1 prefill_rows_per_iter / tokens_emitted_per_iter
+#   diagnostics, which the smoke self-enables), complete with n_decoded==8
+#   and no token before prefill completes, leave no residual KV, and be
+#   deterministic across same-B repeats. A chunked hash differing from b8
+#   is allowed (batch-shape FP) and recorded, not gated. Path B (preloaded)
+#   is not exercised. Built by default; intentionally not installed.
+add_executable(llama-hpx-engine-chunked-prefill-smoke engine_chunked_prefill_smoke.cpp)
+target_compile_features(llama-hpx-engine-chunked-prefill-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-chunked-prefill-smoke PRIVATE llama-hpx-engine)
+
+# Slice D: cancel-during-partial-prefill correctness smoke. A single-slot
+# keep-alive engine (prefill_budget_rows=2, prompt "Hello, my name is")
+# admits one streaming request and is parked at the end of the first work
+# iter (K0=1) via the gate release/ack barrier, with the seq mid-prefill
+# (partial KV, no token). The submitter cancels the active seq and releases
+# the barrier; the cancel is observed in iter 2. Asserts: status=cancelled,
+# n_decoded=0, n_decoded_at_cancel=0, no token_stream_event before a
+# terminal close=cancelled; partial-prefill proof (0 < prefill rows < n,
+# 0 tokens) snapshotted BEFORE the follow-up so it cannot be contaminated;
+# then a follow-up non-streaming request reuses the freed slot and
+# completes with canonical b8 0x0619d4d1900c2365; cancel_active_observed=1,
+# cancelled_count=1, queued_cancelled=0, decode_failures=0,
+# residual_kv_ok=true. Built by default; intentionally not installed.
+add_executable(llama-hpx-engine-cancel-mid-prefill-smoke engine_cancel_mid_prefill_smoke.cpp)
+target_compile_features(llama-hpx-engine-cancel-mid-prefill-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-cancel-mid-prefill-smoke PRIVATE llama-hpx-engine)
+
+# Slice E: concurrent chunked-prefill correctness smoke (n_seq_max=2). One
+# anchor request A (admitted before run, prefilled to a decoding state via a
+# gate barrier at K=ceil(n/B)) decodes while a probe request B does chunked
+# prefill in the SAME llama_decode. Proves per-seq causal masking: with the
+# batch shape fixed, varying B's prompt content (same token length) must NOT
+# change A's hash, and varying A's content must NOT change B's hash. Also
+# gates within-shape repeat determinism, an actual overlap iter
+# (prefill_rows>0 & decode_rows>0 & active_seqs==2), B prefill chunks <= B
+# attributed via barrier snapshot (aggregate prefill_rows is not per-seq),
+# decode_failures==0, residual_kv_ok, no cancelled/error. Solo-vs-concurrent
+# hashes are NOT gated (cross-shape FP). Built by default; not installed.
+add_executable(llama-hpx-engine-concurrent-chunked-prefill-smoke engine_concurrent_chunked_prefill_smoke.cpp)
+target_compile_features(llama-hpx-engine-concurrent-chunked-prefill-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-concurrent-chunked-prefill-smoke PRIVATE llama-hpx-engine)
+
+# Slice F (Option A): engine-only W1c-style PrefillBudgetPolicy comparison
+# harness. NOT an apples-to-apples rerun of the original server-driven W1c
+# (no HTTP, no SSE, no llama-server). Drives the same d2-staggered SHAPE —
+# one anchor sequence decoding while a long-prefill probe is admitted —
+# across engine_options::lib.prefill_budget_rows values B in {0,32,64,128}.
+# Probe classes (L8/L64/L256/L1024) mirror the W1c driver's prompts. Per-B
+# fresh llama_context per scenario, no cross-scenario KV carryover. Uses
+# the gate release/ack barrier at iter K=1 (anchor "Hello, my name is"
+# fits in one prefill chunk for every tested B) to deterministically
+# stagger the probe so it lands while the anchor is decoding, then
+# validates: anchor+probe completed with budgets exhausted, decode_failures
+# ==0, cancelled_count==0, residual_kv_ok, at least one interference iter
+# (prefill_rows>0 AND decode_rows>0 AND active_seq_count==2) is present
+# post-barrier, and for B>0 the max per-iter prefill rows is <= B (policy
+# bound). Emits Phase-1 diag JSONL via LLAMA_HPX_DIAG_METRICS_PATH plus
+# its own scenario_begin / scenario_end marker lines for analyzer
+# splitting. Built by default; intentionally not installed.
+add_executable(llama-hpx-engine-w1c-policy-smoke engine_w1c_policy_smoke.cpp)
+target_compile_features(llama-hpx-engine-w1c-policy-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-w1c-policy-smoke PRIVATE llama-hpx-engine)
+
 # M6b: seeded stochastic sampling smoke. Proves the four M6b
 # correctness properties on a single keep-alive engine:
 #   (1) same-seed reproducibility — two seed=42 requests collapse to

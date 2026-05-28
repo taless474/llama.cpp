@@ -718,6 +718,32 @@ def run_w3_trial(host, port, prompt, decode_budget, timeout_s=30.0):
     return row
 
 
+def make_w3_probe_row(mode, decode_budget, iteration, is_warmup,
+                      probe_phase, probe_ok, probe_elapsed_ms,
+                      probe_timeout_s):
+    """Build a workload=\"w3_probe\" JSONL row describing one
+    wait_for_cap_free probe call. Only emitted in capfree mode.
+
+    probe_phase is either \"between_trial\" (probe ran between two W3
+    trials; iteration is the index of the trial just completed and
+    is_warmup matches that trial) or \"pre_sanity\" (probe ran before
+    the W3 post-cell sanity POST; iteration=-1 and is_warmup=False).
+
+    The aggregator in write_summary_csv() must skip these rows."""
+    return {
+        "mode":             mode,
+        "workload":         "w3_probe",
+        "decode_budget":    decode_budget,
+        "iteration":        iteration,
+        "is_warmup":        is_warmup,
+        "ts_utc":           utc_iso(),
+        "probe_phase":      probe_phase,
+        "probe_ok":         probe_ok,
+        "probe_elapsed_ms": probe_elapsed_ms,
+        "probe_timeout_s":  probe_timeout_s,
+    }
+
+
 def run_cell(cfg, mode, workload, decode_budget,
              cell_index, total_cells,
              run_dir, manifest_cells, jsonl_paths_seen):
@@ -773,6 +799,11 @@ def run_cell(cfg, mode, workload, decode_budget,
         "trials_done_seen":   0,
         "w3_sanity_ok":       None,
         "w3_sanity_hash_ok":  None,
+        # W3 capfree-mode counters; remain None for non-W3 cells and
+        # for W3 cells running in sleep mode.
+        "w3_probe_attempts":  None,
+        "w3_probe_ok":        None,
+        "w3_probe_max_ms":    None,
         "exit_code":          None,
         "term_method":        "",
         "placement_trace_seen": False,
@@ -799,6 +830,14 @@ def run_cell(cfg, mode, workload, decode_budget,
               .format(cell_index + 1, total_cells, elapsed_s,
                       cfg["warmup_trials"], cfg["trials"]), flush=True)
 
+        # W3 capfree mode: convert the None-initialized probe counters
+        # to 0 so increments are well-typed; w3_probe_max_ms stays None
+        # until the first probe records a measurement.
+        if (workload == "w3"
+            and cfg["w3_between_trial_mode"] == "capfree"):
+            entry["w3_probe_attempts"] = 0
+            entry["w3_probe_ok"] = 0
+
         with open(jsonl_path, "w", encoding="utf-8") as jf:
             jsonl_paths_seen.add(str(jsonl_path))
             total_iter = cfg["warmup_trials"] + cfg["trials"]
@@ -811,20 +850,53 @@ def run_cell(cfg, mode, workload, decode_budget,
                     row = run_w2_trial(host, port,
                                        cfg["prompt"], decode_budget)
                 elif workload == "w3":
-                    # W3 only: between iterations, sleep for a fixed
-                    # configurable delay instead of probing with a
-                    # warmup POST. The warmup probe was a budget=1
-                    # natural-completion request, which exposed a
-                    # separate admission issue (cancelled -> completed
-                    # -> later request queued-not-admitted) and made
-                    # the multi-disconnect cell hang. Phase 1 measures
-                    # client-visible disconnect behavior only, so we
-                    # bypass that probe; the admission bug is left for
-                    # a future dedicated smoke. Skipped on iteration 0
-                    # because cell readiness already proved capacity
-                    # was free.
-                    if i > 0 and cfg["w3_post_disconnect_sleep_s"] > 0:
-                        time.sleep(cfg["w3_post_disconnect_sleep_s"])
+                    # W3 only. Between trials, either:
+                    #   sleep mode (default; preserves Phase 1
+                    #     behavior): wait --w3-post-disconnect-sleep
+                    #     seconds. The wait was originally introduced
+                    #     because the wait_for_cap_free probe was a
+                    #     decode_budget=1 natural-completion request
+                    #     and exposed the N5a admission bug (cancelled
+                    #     -> completed -> later request queued-not-
+                    #     admitted), making the cell hang.
+                    #   capfree mode: run the wait_for_cap_free probe
+                    #     and record its outcome as a workload=
+                    #     "w3_probe" JSONL row. Safe to re-enable now
+                    #     that N5a/N5b are fixed; intended for refresh
+                    #     validation. Probe failure is recorded loudly
+                    #     (manifest counters + PASS/FAIL gate).
+                    # Skipped on iteration 0 because cell readiness
+                    # already proved capacity was free.
+                    if i > 0:
+                        if cfg["w3_between_trial_mode"] == "capfree":
+                            t0 = time.monotonic()
+                            probe_ok = wait_for_cap_free(
+                                host, port, timeout_s=30.0)
+                            elapsed_ms = (
+                                time.monotonic() - t0) * 1000.0
+                            entry["w3_probe_attempts"] += 1
+                            if probe_ok:
+                                entry["w3_probe_ok"] += 1
+                            if (entry["w3_probe_max_ms"] is None
+                                or elapsed_ms
+                                   > entry["w3_probe_max_ms"]):
+                                entry["w3_probe_max_ms"] = elapsed_ms
+                            just_completed = i - 1
+                            probe_row = make_w3_probe_row(
+                                mode=mode,
+                                decode_budget=decode_budget,
+                                iteration=just_completed,
+                                is_warmup=(
+                                    just_completed
+                                    < cfg["warmup_trials"]),
+                                probe_phase="between_trial",
+                                probe_ok=probe_ok,
+                                probe_elapsed_ms=elapsed_ms,
+                                probe_timeout_s=30.0)
+                            jf.write(json.dumps(probe_row) + "\n")
+                        elif cfg["w3_post_disconnect_sleep_s"] > 0:
+                            time.sleep(
+                                cfg["w3_post_disconnect_sleep_s"])
                     row = run_w3_trial(host, port,
                                        cfg["prompt"], decode_budget)
                 else:
@@ -867,12 +939,35 @@ def run_cell(cfg, mode, workload, decode_budget,
 
             # W3 sanity request (one per W3 cell, runs after trial loop)
             if workload == "w3":
-                # Sleep before the sanity POST instead of probing with
-                # wait_for_cap_free; the probe would itself be a
-                # natural-completion request and could expose the
-                # cancelled -> completed admission issue. See known
-                # issue note in facts.md / results.md.
-                if cfg["w3_post_disconnect_sleep_s"] > 0:
+                # Spacing before the sanity POST mirrors the between-
+                # trial behavior:
+                #   sleep mode: sleep --w3-post-disconnect-sleep
+                #     seconds (original Phase 1 behavior).
+                #   capfree mode: run wait_for_cap_free and emit a
+                #     workload="w3_probe" row with probe_phase=
+                #     "pre_sanity"; failure is recorded loudly.
+                if cfg["w3_between_trial_mode"] == "capfree":
+                    t0 = time.monotonic()
+                    probe_ok = wait_for_cap_free(
+                        host, port, timeout_s=30.0)
+                    elapsed_ms = (time.monotonic() - t0) * 1000.0
+                    entry["w3_probe_attempts"] += 1
+                    if probe_ok:
+                        entry["w3_probe_ok"] += 1
+                    if (entry["w3_probe_max_ms"] is None
+                        or elapsed_ms > entry["w3_probe_max_ms"]):
+                        entry["w3_probe_max_ms"] = elapsed_ms
+                    probe_row = make_w3_probe_row(
+                        mode=mode,
+                        decode_budget=decode_budget,
+                        iteration=-1,
+                        is_warmup=False,
+                        probe_phase="pre_sanity",
+                        probe_ok=probe_ok,
+                        probe_elapsed_ms=elapsed_ms,
+                        probe_timeout_s=30.0)
+                    jf.write(json.dumps(probe_row) + "\n")
+                elif cfg["w3_post_disconnect_sleep_s"] > 0:
                     time.sleep(cfg["w3_post_disconnect_sleep_s"])
                 try:
                     status, _, raw, complete_ms, t_sent = http_post_json(
@@ -1034,18 +1129,18 @@ def write_summary_csv(run_dir, jsonl_paths):
                     continue
         if not rows:
             continue
-        # Skip w3_sanity records when aggregating; they belong to the
-        # manifest counters, not the latency tables.
+        # Skip w3_sanity and w3_probe records when aggregating; they
+        # belong to the manifest counters, not the latency tables.
         meta = rows[0]
         workload = meta["workload"]
-        if workload == "w3_sanity":
+        if workload in ("w3_sanity", "w3_probe"):
             continue
         for metric in metrics_for(workload):
             values = []
             for r in rows:
                 if r.get("is_warmup"):
                     continue
-                if r.get("workload") == "w3_sanity":
+                if r.get("workload") in ("w3_sanity", "w3_probe"):
                     continue
                 # W1/W2 latency rows excluded if request did not complete
                 if workload in ("w1", "w2"):
@@ -1139,6 +1234,18 @@ def main(argv):
                         "(and before the W3 post-cell sanity POST). "
                         "Replaces the older wait_for_cap_free probe; "
                         "see facts.md known-issue note.")
+    p.add_argument("--w3-between-trial-mode",
+                   choices=["sleep", "capfree"], default="sleep",
+                   help="W3 between-trial behavior. 'sleep' (default) "
+                        "preserves Phase 1 behavior and honors "
+                        "--w3-post-disconnect-sleep. 'capfree' restores "
+                        "the original wait_for_cap_free probe between "
+                        "trials and before the W3 post-cell sanity POST; "
+                        "each probe outcome is recorded as a "
+                        "workload=\"w3_probe\" JSONL row and a manifest "
+                        "counter, and a probe failure is treated as a "
+                        "loud cell failure. The capfree path is intended "
+                        "for post-N5a/N5b refresh validation.")
     p.add_argument("--prompt", default=CANONICAL_PROMPT)
     p.add_argument("--n-seq-max", type=int, default=1)
     p.add_argument("--max-prompt-tokens", type=int, default=512)
@@ -1194,8 +1301,10 @@ def main(argv):
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
     with open(run_dir / "commands.txt", "w", encoding="utf-8") as f:
         f.write("# harness_version={}\n".format(HARNESS_VERSION))
-        f.write("# w3_post_disconnect_sleep_s={}\n\n".format(
+        f.write("# w3_post_disconnect_sleep_s={}\n".format(
             float(args.w3_post_disconnect_sleep)))
+        f.write("# w3_between_trial_mode={}\n\n".format(
+            args.w3_between_trial_mode))
 
     cfg = {
         "binary":             binary,
@@ -1213,6 +1322,8 @@ def main(argv):
             bool(args.placement_trace_engine_pool),
         "w3_post_disconnect_sleep_s":
             float(args.w3_post_disconnect_sleep),
+        "w3_between_trial_mode":
+            args.w3_between_trial_mode,
     }
 
     # Build cell list: 3 modes x (budgets for W1) + (budgets for W2)
@@ -1251,6 +1362,8 @@ def main(argv):
         "w3_decode_budget":   args.w3_decode_budget,
         "w3_post_disconnect_sleep_s":
             float(args.w3_post_disconnect_sleep),
+        "w3_between_trial_mode":
+            args.w3_between_trial_mode,
         "trials":             args.trials,
         "warmup_trials":      args.warmup_trials,
         "placement_trace_engine_pool":
@@ -1320,6 +1433,18 @@ def main(argv):
                     "{}_{}_b{}:w3_sanity_hash_ok=false".format(
                         cell["mode"], cell["workload"],
                         cell["decode_budget"]))
+            # capfree-mode probe gate: fail loudly if any wait_for_cap_free
+            # probe returned False. Inert in sleep mode (counters stay
+            # None).
+            pa = cell.get("w3_probe_attempts")
+            po = cell.get("w3_probe_ok")
+            if (pa is not None and po is not None
+                and pa > 0 and po != pa):
+                ok = False
+                failures.append(
+                    "{}_{}_b{}:w3_probe_ok={}/{}".format(
+                        cell["mode"], cell["workload"],
+                        cell["decode_budget"], po, pa))
 
     if ok:
         print("EXP14_PHASE1: PASS run_id={}".format(run_id))

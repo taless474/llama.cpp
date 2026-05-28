@@ -4578,3 +4578,1218 @@ Layer 5:
   future dataflow evolution
 ```
 
+## 11. PrefillBudgetPolicy and server comparison checkpoint
+
+Section 10 recorded the HPX serving-control placement work, the engine-pool / placement-on gates, the N5b shutdown-liveness fix, and the fact that N5a slot recovery remained deferred.
+
+This checkpoint records the follow-up work that happened after that point:
+
+```text
+N5a deferred slot recovery:
+  fixed and guarded by a dedicated smoke
+
+PrefillBudgetPolicy:
+  designed, implemented, and validated in the HPX continuous-batch engine
+
+hpx-server surface:
+  --prefill-budget-rows <B> added and validated
+
+server-path policy result:
+  Experiment 16 records that the prefill budget bounds per-iteration
+  prefill/decode interference in the real hpx-server path
+
+cross-server comparison evidence:
+  Experiment 17 records a small llama-server vs llama-hpx-server B=0 throughput
+  smoke, diagnostics-off control, and c={1,2,4,8} scaling follow-up
+```
+
+The implementation and validation are recorded across these source files:
+
+```text
+tools/hpx-continuous-batch-gate/engine.cpp
+tools/hpx-continuous-batch-gate/engine.h
+tools/hpx-continuous-batch-gate/types.h
+tools/hpx-continuous-batch-gate/CMakeLists.txt
+tools/hpx-server/hpx-server.cpp
+tools/hpx-server/hpx_server_stream_smoke.cpp
+```
+
+The new regression and validation smokes are:
+
+```text
+llama-hpx-engine-cancel-freed-completion-admit-smoke
+llama-hpx-engine-chunked-prefill-smoke
+llama-hpx-engine-cancel-mid-prefill-smoke
+llama-hpx-engine-concurrent-chunked-prefill-smoke
+llama-hpx-engine-w1c-policy-smoke
+```
+
+The design and result documentation added or updated for this checkpoint is:
+
+```text
+docs/hpx/hpx_native_serving_control_plane_design.md
+docs/hpx/serving_overhead_diagnostics_roadmap.md
+docs/hpx/prefill_budget_policy_design.md
+docs/hpx/prefill_budget_policy_result.md
+docs/hpx/n5_deferred_slot_recovery_note.md
+```
+
+The experiment documentation added or updated for this checkpoint is:
+
+```text
+hpx-bench/experiments/14_hpx_server_end_to_end_responsiveness/
+hpx-bench/experiments/15_hpx_vs_llama_server_semantics/
+hpx-bench/experiments/16_prefill_budget_policy_server_w1c/
+hpx-bench/experiments/17_hpx_vs_llama_server_throughput_smoke/
+```
+
+The main local evidence directories used while preparing this checkpoint are:
+
+```text
+local/runs/w1-mixed-short-long-2026-05-26/
+local/runs/w1b-varied-prefill-2026-05-26/
+local/runs/w1c-staggered-prefill-2026-05-26/
+local/runs/slice-f-engine-A-2026-05-27/
+local/runs/w1c-staggered-prefill-policy-2026-05-27/
+local/runs/hpx-vs-llama-server-throughput-2026-05-27/
+local/runs/hpx-vs-llama-server-throughput-scaling-2026-05-27/
+local/runs/n6-phase1-diag/
+local/runs/exp14/
+local/runs/exp15/
+```
+
+This checkpoint keeps the same architectural boundary as section 10:
+
+```text
+HPX owns:
+  request lifecycle
+  admission
+  batch composition policy
+  cancellation
+  streaming delivery
+  futures/promises
+  serving diagnostics
+
+llama.cpp still owns:
+  llama_decode
+  graph construction
+  ggml scheduling
+  backend execution
+  tokenizer/model loading
+  sampler math
+  KV internals
+```
+
+The central new result is:
+
+```text
+HPX can bound per-iteration prefill/decode interference by controlling
+how many live-admitted prompt rows enter each engine iteration.
+```
+
+This is not a claim that total work disappears. The prefill budget redistributes work across more iterations. It is a serving-control policy, not a ggml/backend optimization.
+
+This checkpoint does not claim:
+
+```text
+throughput improvement
+total latency improvement
+production readiness
+default-enable recommendation
+Llama 3 generalization
+general HPX faster/slower conclusion
+llama_decode or ggml replacement
+```
+
+### 11.1 N5a deferred slot recovery is now fixed
+
+Section 10.8 recorded N5a as deferred.
+
+This checkpoint supersedes that part of section 10. N5a is now fixed and guarded by a dedicated regression smoke.
+
+The N5a bug shape was:
+
+```text
+active cancel
+-> slot enters cancel_freed path
+-> next request admits from cancel_freed
+-> that request completes naturally
+-> later request may not be admitted because slot recovery is incomplete
+```
+
+The suspected root cause was in the completion-side slot recovery path:
+
+```text
+reuse_completed = false
+admission_src = cancel_freed
+finalize_and_fulfill did not return the seq_id to an admission pool
+```
+
+The accepted fix re-keys the relevant completion-side recovery so that a request admitted from the cancel-freed path can complete naturally and still leave the slot usable for later admission.
+
+The regression guard is:
+
+```text
+llama-hpx-engine-cancel-freed-completion-admit-smoke
+```
+
+The smoke covers:
+
+```text
+Phase A:
+  active request is cancelled
+
+Phase B:
+  next request admits from cancel_freed and completes naturally
+
+Phase C:
+  later request must be admitted and complete with the canonical b8 hash
+```
+
+The pre-fix behavior was:
+
+```text
+Phase C failed to admit
+queued work eventually resolved as failed_reserved during shutdown
+```
+
+The post-fix behavior is:
+
+```text
+Phase C admits successfully
+Phase C completes
+canonical greedy b8 hash is preserved
+```
+
+The canonical anchor remains:
+
+```text
+HPX canonical greedy p0_b8:
+  0x0619d4d1900c2365
+```
+
+This N5a fix is separate from the PrefillBudgetPolicy mechanism, but it is important for the same serving-control layer because it closes a slot-recovery hole in the request lifecycle.
+
+### 11.2 Serving-overhead diagnostics checkpoint recorded
+
+Before changing policy, this checkpoint added an observation layer for the HPX serving engine.
+
+The diagnostics objective was:
+
+```text
+attribute c > 1 behavior to a concrete phase before proposing a scheduling change
+```
+
+The diagnostic surface records per-iteration engine measurements such as:
+
+```text
+prefill_rows_per_iter
+decode_rows_per_iter
+active_seqs_per_iter
+admitted_per_iter
+completed_per_iter
+cancelled_per_iter
+tokens_emitted_per_iter
+llama_decode_wall_us_per_iter
+iter_wall_us_per_iter
+idle_wait_us_per_iter
+```
+
+The server side also records request-level information for the real hpx-server path.
+
+The diagnostic design rules were:
+
+```text
+default OFF
+no public API change
+no scheduling-policy change
+no ggml/backend change
+append-only JSONL when enabled
+source attribution before optimization
+```
+
+The Phase-1 implementation checkpoint recorded:
+
+```text
+env unset:
+  zero diagnostic JSONL emitted
+
+LLAMA_HPX_DIAG_METRICS=1:
+  valid JSONL emitted
+  engine iter rows emitted
+  engine summary rows emitted
+  server request rows emitted for real hpx-server paths
+
+canonical anchors:
+  held under both default and diagnostics-enabled passes
+```
+
+The diagnostic substrate was later used by the W1/W1b/W1c evidence chain, the engine-only Slice F policy run, and the server-path Exp16 policy run.
+
+### 11.3 W1 / W1b / W1c evidence chain
+
+The policy was not introduced first. It was motivated by the W1 family of diagnostics.
+
+The W1a mixed short/long-output diagnostic showed:
+
+```text
+fixed short prompt
+mixed output lengths
+weak batch filling not the main signal
+HPX service-layer overhead not the dominant visible cost
+prefill-present iterations were heavier
+```
+
+The W1b varied-prefill diagnostic showed:
+
+```text
+larger prompt prefill rows increase llama_decode_wall_us
+HPX non_decode_us remains small relative to llama_decode_wall_us
+low-prefill cells are noisy / tied
+```
+
+The W1c staggered-prefill diagnostic forced the key interference shape:
+
+```text
+prefill_rows_in_iter > 0
+decode_rows_in_iter > 0
+active_seq_count == 2
+```
+
+W1c showed:
+
+```text
+interference cost increases with prefill rows
+the effect is additive:
+  interference iteration cost ≈ isolated prefill + isolated decode
+```
+
+The interpretation was:
+
+```text
+the visible cost is inside llama_decode when a long prefill occupies an iteration,
+not primarily HPX non-decode control-plane overhead.
+```
+
+That evidence justified a serving-control policy:
+
+```text
+cap how many live-admitted prompt rows can enter a single engine iteration
+```
+
+### 11.4 PrefillBudgetPolicy design recorded
+
+The policy is called:
+
+```text
+PrefillBudgetPolicy
+```
+
+The implemented option is:
+
+```text
+engine_options::lib.prefill_budget_rows
+```
+
+The server CLI surface is:
+
+```text
+--prefill-budget-rows <B>
+```
+
+The meaning of `B` is:
+
+```text
+B = maximum number of live-admitted prompt rows allowed into one engine iteration
+```
+
+The default is:
+
+```text
+B = 0
+```
+
+and means:
+
+```text
+unbounded
+current behavior
+whole live-admitted prompt prefill can enter one iteration
+```
+
+For `B > 0`, the live-admission path chunks prompt prefill:
+
+```text
+long prompt:
+  rows 0..B-1
+  rows B..2B-1
+  rows 2B..3B-1
+  ...
+```
+
+The policy is deliberately scoped:
+
+```text
+Path A / live admission:
+  chunked by prefill_budget_rows when B > 0
+
+Path B / preloaded path:
+  remains whole-prompt
+```
+
+The design introduced or relies on per-sequence state:
+
+```text
+prefill_cursor
+prefill_complete
+prompt_tokens
+pos_next
+i_batch
+n_decoded
+generated_tokens
+hash_state
+cancel state
+stream state
+```
+
+The key state-machine rule is:
+
+```text
+a sequence may remain active while mid-prefill,
+but it must not sample, hash, stream, or increment n_decoded
+until prefill_complete is true.
+```
+
+The BUILD phase was re-keyed from the old one-iteration prefill assumption:
+
+```text
+old assumption:
+  admitted_at_iter == iter && n_decoded == 0
+
+new chunked-prefill predicate:
+  !prefill_complete
+```
+
+The SAMPLE phase skips mid-prefill sequences:
+
+```text
+if (!seq.prefill_complete) {
+  continue;
+}
+```
+
+The accepted correctness invariant is not:
+
+```text
+chunked prefill must reproduce whole-prompt hash
+```
+
+The accepted correctness invariant is:
+
+```text
+B=0 / unbounded:
+  must preserve existing anchors exactly
+
+B>0 / chunked:
+  must be deterministic within the same chunk shape
+  must return no residual KV
+  must not sample before prefill completes
+  must preserve per-seq masking under concurrent overlap
+```
+
+A chunked run may legitimately differ from a whole-prompt run because changing chunk shape can change batching and floating-point behavior. Cross-shape hash equality is not a correctness gate.
+
+### 11.5 PrefillBudgetPolicy implementation recorded
+
+The implementation added the option surface:
+
+```text
+engine_options::lib.prefill_budget_rows
+engine::prefill_budget_rows_
+```
+
+The HPX engine uses this value only in the live-admission BUILD path.
+
+The core chunking logic is:
+
+```text
+start = seq.prefill_cursor
+remaining = prompt_tokens.size() - start
+chunk = remaining
+
+if (prefill_budget_rows_ > 0 && chunk > prefill_budget_rows_) {
+  chunk = prefill_budget_rows_
+}
+
+for each row in the chunk:
+  add prompt token to shared llama_batch
+  use absolute position start + local_offset
+  set logits=true only on the final prompt token
+
+seq.prefill_cursor += chunk
+seq.pos_next = seq.prefill_cursor
+seq.prefill_complete = (seq.prefill_cursor >= prompt_tokens.size())
+```
+
+The policy preserves the single-owner engine invariant:
+
+```text
+one HPX engine task mutates:
+  llama_context
+  shared llama_batch
+  KV / llama_memory state
+  per-seq generation state
+```
+
+The HTTP server worker threads submit and cancel work, but do not directly mutate llama_context.
+
+The implementation does not modify:
+
+```text
+llama_decode
+ggml graph builder
+ggml backend scheduler
+backend kernels
+tokenizer
+model loader
+sampler math
+KV internals
+```
+
+### 11.6 hpx-server surface recorded
+
+The hpx-server CLI now accepts:
+
+```text
+--prefill-budget-rows <int>
+```
+
+The option is validated as:
+
+```text
+prefill_budget_rows >= 0
+```
+
+The default is:
+
+```text
+0
+```
+
+The server wires the parsed value into:
+
+```text
+opts.lib.prefill_budget_rows
+```
+
+The server logs the configured value at startup.
+
+The server-surface validation included:
+
+```text
+default absent flag:
+  B=0 behavior unchanged
+
+--prefill-budget-rows 32:
+  value reaches the engine
+  long prompt prefill is split into capped chunks
+```
+
+A server diagnostic run with `B=32` on an L256-class prompt confirmed:
+
+```text
+prefill chunk rows:
+  32, 32, 32, 32, 32, 32, 32, 27
+
+sum:
+  251 rows
+
+token emitted before prefill complete:
+  no
+```
+
+This confirms the server flag reaches the engine policy and is not merely parsed.
+
+### 11.7 Streaming contract strengthened
+
+The streaming smoke was upgraded to cover the cumulative-delta detokenization contract.
+
+The smoke now covers two budgets:
+
+```text
+p0_b8
+p0_b16
+```
+
+The recorded b16 anchor is:
+
+```text
+HPX canonical greedy p0_b16:
+  0x833045f1e2ebf49f
+```
+
+The streaming gate checks:
+
+```text
+one SSE event per engine token event
+prefix stability
+delta consistency
+in-stream identity
+same-shape equality against direct in-process engine result
+streamed token-id vector equals direct generated_tokens
+terminal status completed
+n_decoded equals requested decode budget
+canonical hash holds for each budget
+```
+
+The purpose of this strengthened gate is to make sure that chunked prefill and future serving-control changes do not hide streaming/detokenization regressions behind successful final hashes.
+
+### 11.8 Slice B/C/D/E/F correctness validation recorded
+
+The PrefillBudgetPolicy was validated in slices.
+
+Slice B recorded state-only prep:
+
+```text
+prefill_cursor
+prefill_complete
+prefill_budget_rows default 0
+```
+
+The default path remained behavior-neutral:
+
+```text
+B=0 == unbounded
+canonical b8 anchor held
+existing registered smoke matrix passed
+```
+
+Slice C recorded single-request chunked prefill:
+
+```text
+smoke:
+  llama-hpx-engine-chunked-prefill-smoke
+```
+
+It validated:
+
+```text
+B=0:
+  canonical b8 holds
+
+B >= prompt length:
+  collapse to whole-prompt
+  canonical b8 holds
+
+B=2:
+  prompt split [2, 2, 2]
+
+B=4:
+  prompt split [4, 2]
+
+same-B repeats:
+  deterministic
+
+token emitted before prefill complete:
+  no
+
+residual KV:
+  clean
+```
+
+Slice D recorded cancellation during partial prefill:
+
+```text
+smoke:
+  llama-hpx-engine-cancel-mid-prefill-smoke
+```
+
+It validated:
+
+```text
+partial prefill happened:
+  prefill_rows_per_iter = [2]
+
+no token emitted:
+  tokens_emitted_per_iter = [0]
+
+result:
+  status = cancelled
+  n_decoded = 0
+  generated_tokens = empty
+  terminal stream close reason = cancelled
+
+cleanup:
+  residual_kv_ok = 1
+
+reuse:
+  follow-up request admits from cancel_freed
+  follow-up completes with canonical b8
+```
+
+Slice E recorded concurrent decode plus chunked prefill:
+
+```text
+smoke:
+  llama-hpx-engine-concurrent-chunked-prefill-smoke
+```
+
+It validated the real continuous-batching shape:
+
+```text
+one sequence decoding
+another sequence chunk-prefilling
+both co-resident in one llama_decode batch
+```
+
+The content-isolation gate used fixed batch shape but changed the other sequence's content:
+
+```text
+A = P, B = P:
+  A hash = b8
+  B hash = b8
+
+A = P, B = Q:
+  A hash remains b8
+  B hash changes
+
+A = Q, B = P:
+  B hash remains b8
+  A hash changes
+```
+
+This proves per-seq content isolation under overlap without using an invalid solo-vs-concurrent hash gate.
+
+Slice F Option A recorded engine-only W1c-style policy effect:
+
+```text
+smoke:
+  llama-hpx-engine-w1c-policy-smoke
+```
+
+It validated across 64 scenarios:
+
+```text
+B in {0, 32, 64, 128}
+probe classes L8 / L64 / L256 / L1024
+cycles per class
+```
+
+The engine-only policy result showed:
+
+```text
+for every B > 0 and every class:
+  max(prefill_rows_in_iter) <= B
+```
+
+The L1024 engine-only headline was:
+
+```text
+B=0:
+  max_pf = 977
+  median interference decode ≈ 874 ms
+
+B=32:
+  max_pf = 32
+  median interference decode ≈ 90 ms
+
+B=64:
+  max_pf = 64
+  median interference decode ≈ 105 ms
+
+B=128:
+  max_pf = 128
+  median interference decode ≈ 157 ms
+```
+
+### 11.9 Experiment 16 records server-path PrefillBudgetPolicy result
+
+Experiment 16 is:
+
+```text
+hpx-bench/experiments/16_prefill_budget_policy_server_w1c/
+```
+
+The experiment question is:
+
+```text
+Does hpx-server --prefill-budget-rows bound per-iteration
+prefill/decode interference in the server-driven W1c d2-staggered shape?
+```
+
+The run shape is:
+
+```text
+server:
+  llama-hpx-server
+
+policy:
+  --prefill-budget-rows B
+
+B values:
+  0, 32, 64, 128
+
+condition:
+  d2-staggered only
+
+prompt classes:
+  L8, L64, L256, L1024
+
+cycles:
+  K=4 per class
+
+baseline:
+  fresh in-tree B=0
+
+historical context only:
+  local/runs/w1c-staggered-prefill-2026-05-26/
+```
+
+The primary gate was:
+
+```text
+for every B > 0 and every prompt class:
+  max(prefill_rows_in_iter) <= B
+```
+
+The gate passed.
+
+The L1024 server-path headline table is:
+
+```text
+B=0:
+  max_pf = 977
+  median decode wall = 868.8 ms
+  p95 decode wall = 870.9 ms
+
+B=32:
+  max_pf = 32
+  median decode wall = 84.7 ms
+  p95 decode wall = 85.1 ms
+
+B=64:
+  max_pf = 64
+  median decode wall = 101.6 ms
+  p95 decode wall = 103.3 ms
+
+B=128:
+  max_pf = 128
+  median decode wall = 151.5 ms
+  p95 decode wall = 157.7 ms
+```
+
+Decoder progress was also recorded:
+
+```text
+iters_with_token == n_interference
+```
+
+for every interference cell.
+
+The interpretation is:
+
+```text
+--prefill-budget-rows changes the per-iteration distribution of prefill work.
+It splits one large interference iteration into multiple smaller capped
+interference iterations.
+```
+
+Exp16 does not claim:
+
+```text
+throughput improvement
+total latency improvement
+production benchmark
+default-enable recommendation
+llama-server comparison
+Llama 3 generalization
+Exp14 / Exp15 conclusion
+```
+
+### 11.10 Experiment 17 records short-prompt throughput characterization
+
+Experiment 17 is:
+
+```text
+hpx-bench/experiments/17_hpx_vs_llama_server_throughput_smoke/
+```
+
+The experiment question is:
+
+```text
+For a fixed short prompt, greedy 8-token generation, and matched client
+concurrency, how do llama-server and llama-hpx-server B=0 compare on
+external request-level throughput and latency?
+```
+
+This is deliberately separate from Exp16.
+
+Exp17 uses:
+
+```text
+PrefillBudgetPolicy:
+  disabled / B=0 / default
+
+prompt:
+  "Hello, my name is"
+
+decode:
+  8 tokens
+
+mode:
+  non-streaming
+
+metrics:
+  external request-level throughput and latency
+```
+
+The initial c={1,2} throughput smoke showed:
+
+```text
+c=1:
+  llama-server ≈ 22.9 tok/s
+  hpx-B0 ≈ 23.2 tok/s
+
+c=2:
+  llama-server ≈ 42.9 tok/s
+  hpx-B0 ≈ 33.6 tok/s
+```
+
+Because the first HPX run used diagnostics to support clean shutdown, a diagnostics-off control was added.
+
+The HPX diagnostics-off control recorded:
+
+```text
+c=1:
+  24.1 tok/s
+  p50 = 332 ms
+  p95 = 338 ms
+
+c=2:
+  35.3 tok/s
+  p50 = 449 ms
+  p95 = 475 ms
+```
+
+The interpretation was:
+
+```text
+diagnostics explain part of the c=2 gap, but not most of it
+```
+
+A diagnostics-off scaling follow-up ran:
+
+```text
+c in {1, 2, 4, 8}
+```
+
+with capacity matched to c:
+
+```text
+llama-server:
+  --parallel c
+
+llama-hpx-server:
+  --n-seq-max c
+  --max-concurrent c
+```
+
+The throughput table was:
+
+```text
+llama-server:
+  c=1: 23.6 tok/s
+  c=2: 38.4 tok/s
+  c=4: 75.5 tok/s
+  c=8: 87.0 tok/s
+
+hpx-B0:
+  c=1: 23.4 tok/s
+  c=2: 35.7 tok/s
+  c=4: 59.3 tok/s
+  c=8: 82.1 tok/s
+```
+
+The latency table was:
+
+```text
+llama-server:
+  c=1: p50 338 ms, p95 343 ms
+  c=2: p50 439 ms, p95 461 ms
+  c=4: p50 411 ms, p95 538 ms
+  c=8: p50 738 ms, p95 744 ms
+
+hpx-B0:
+  c=1: p50 335 ms, p95 375 ms
+  c=2: p50 447 ms, p95 453 ms
+  c=4: p50 538 ms, p95 558 ms
+  c=8: p50 778 ms, p95 781 ms
+```
+
+The scaling efficiency was:
+
+```text
+efficiency(c) = tokens_per_sec(c) / (tokens_per_sec(c=1) * c)
+
+llama-server:
+  c=1: 1.00
+  c=2: 0.81
+  c=4: 0.80
+  c=8: 0.46
+
+hpx-B0:
+  c=1: 1.00
+  c=2: 0.76
+  c=4: 0.63
+  c=8: 0.44
+```
+
+The external throughput gap was:
+
+```text
+llama-server minus hpx-B0:
+
+c=1:
+  +0.2 tok/s
+
+c=2:
+  +2.7 tok/s
+
+c=4:
+  +16.3 tok/s
+
+c=8:
+  +4.9 tok/s
+```
+
+The interpretation is:
+
+```text
+c=1 is tied, so the base llama_decode path is not the issue.
+c=4 is the widest gap, so the next attribution target is HPX serving-control
+batching cadence / wakeups / request lifecycle under moderate concurrency.
+c=8 partially reconverges, suggesting both backends are approaching saturation.
+```
+
+Exp17 does not claim:
+
+```text
+production benchmark
+general HPX faster/slower conclusion
+Llama 3 generalization
+PrefillBudgetPolicy effect
+streaming / TTFT result
+internal HPX JSONL comparison metric
+```
+
+### 11.11 Architecture summary for this checkpoint
+
+This checkpoint reinforces the six-layer architecture distinction.
+
+In the upstream llama.cpp stack:
+
+```text
+Layer 1:
+  user-facing binaries such as llama-cli and llama-server
+
+Layer 1.5:
+  common helpers and server/tool support
+
+Layer 2:
+  public llama API and serving-control overlays
+
+Layer 3:
+  llama runtime state: llama_model, llama_context, llama_batch, KV, per-slot/per-seq state
+
+Layer 4:
+  graph builder inside llama_decode
+
+Layer 5:
+  ggml IR and backend scheduling
+
+Layer 6:
+  backend execution: CPU, Metal, CUDA, SYCL, etc.
+```
+
+The HPX implementation is added mainly in Layers 1–3:
+
+```text
+Layer 1:
+  llama-hpx-server
+
+Layer 1.5:
+  HPX server adapter using common tokenization/detokenization/batch/sampler helpers
+
+Layer 2:
+  HPX serving control plane:
+    inbox
+    admission
+    futures/promises
+    stream channel
+    cancellation
+    diagnostics
+    PrefillBudgetPolicy
+
+Layer 3:
+  HPX engine state:
+    seq_state
+    prefill_cursor
+    prefill_complete
+    shared llama_batch
+    single owner of llama_context mutation
+```
+
+Layers 4–6 remain upstream llama.cpp / ggml / backend execution:
+
+```text
+HPX does not replace:
+  graph builder
+  ggml scheduler
+  backend kernels
+  llama_decode internals
+```
+
+The meeting-level architecture statement is:
+
+```text
+HPX is not replacing llama_decode.
+HPX controls when and how request rows enter llama_decode.
+```
+
+### 11.12 Validation summary
+
+This checkpoint records the following validation as completed:
+
+```text
+N5a smoke:
+  llama-hpx-engine-cancel-freed-completion-admit-smoke
+  PASS
+
+Slice B:
+  state-only prep
+  default B=0 behavior preserved
+  PASS
+
+Slice C:
+  single-request chunked prefill
+  B=0 and B>=prompt_len preserve b8
+  B=2 / B=4 split prompt rows
+  PASS
+
+Slice D:
+  cancel during partial prefill
+  no token emitted
+  residual KV clean
+  freed slot reusable
+  PASS
+
+Slice E:
+  concurrent decode + chunked prefill
+  per-seq content isolation
+  PASS
+
+Slice F Option A:
+  engine-only W1c-style policy result
+  max_pf <= B for every B>0 class
+  PASS
+
+Option B server surface:
+  --prefill-budget-rows accepted
+  non-negative validation
+  value reaches engine
+  PASS
+
+Exp16:
+  server-path W1c policy result
+  per-iteration bound holds
+  decoder not starved
+  PASS
+
+Exp17:
+  diagnostics-off short-prompt throughput scaling smoke
+  c={1,2,4,8}
+  all cells complete
+  PASS
+```
+
+Final repository checks for the checkpoint recorded:
+
+```text
+git diff --check:
+  clean
+
+server process check:
+  no llama-server or llama-hpx-server processes running
+
+cleanup:
+  unrelated simple.cpp edit restored
+  stray JSON/log/presentation artifacts removed
+  remaining git status entries belong to the HPX serving section
+```
+
+### 11.13 Remaining open questions
+
+The following questions remain out of scope for this checkpoint:
+
+```text
+server disconnect during chunked prefill
+c=4 serving-control attribution
+broader W2 / W3 cancellation and slow-stream workloads
+Llama 3 / non-TinyLlama generalization
+default-policy decision
+production throughput / latency benchmarking
+```
+
+The next technical attribution target is:
+
+```text
+why HPX-B0 loses the most short-prompt throughput efficiency at c=4
+```
+
+The likely area to inspect is:
+
+```text
+serving-control batching cadence
+engine wakeups
+request lifecycle overhead
+future/promise completion path
+HTTP result handling
+slot/seq admission timing
+```
+
+The next correctness target is:
+
+```text
+server-path disconnect during partial chunked prefill
+```
+
+### 11.14 Checkpoint conclusion
+
+This checkpoint closes the main PrefillBudgetPolicy arc.
+
+The result is:
+
+```text
+HPX now has a concrete serving-control mechanism that can bound long-prefill
+interference without changing llama_decode or ggml/backend execution.
+```
+
+The policy is validated first in engine-only smokes, then through the real hpx-server path.
+
+The broader throughput story is deliberately separate:
+
+```text
+short-prompt B=0 throughput:
+  HPX matches llama-server at c=1
+  HPX trails most at c=4
+  c=4 is a future attribution target
+```
+
+The correct combined interpretation is:
+
+```text
+PrefillBudgetPolicy is a positive HPX-native scheduling result.
+
+Baseline HPX serving throughput still has an open moderate-concurrency
+performance attribution question.
+```

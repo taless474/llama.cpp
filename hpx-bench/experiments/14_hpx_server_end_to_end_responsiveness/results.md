@@ -202,9 +202,12 @@ control-plane wins outweigh the small end-to-end overhead.
 - `disconnect_ms` is the client-side socket close return time,
   not a server-observed cancel timestamp. Phase 1 has no
   server-side cancel timestamp yet.
-- W3 uses a fixed `--w3-post-disconnect-sleep 2.0` between
-  disconnect trials and before the post-cell sanity POST instead
-  of the older `wait_for_cap_free` probe. See section 11.
+- W3 between-trial spacing (`--w3-between-trial-mode`, see
+  section 11):
+  - fixed sleep remains the Phase 1 default for compatibility with
+    recorded Phase 1 results;
+  - capfree mode is available for post-N5a/N5b refresh validation;
+  - this does not re-baseline Phase 1.
 - No `LLAMA_HPX_PLACEMENT_TRACE` was set in the main run. The
   `engine_pool_os2` cells' argv contains `--engine-pool`, the
   binary launched successfully, and Exp 13 already demonstrated
@@ -241,12 +244,31 @@ control-plane wins outweigh the small end-to-end overhead.
   regression slice — likely a dedicated
   `hpx_server_multi_cycle_disconnect_smoke` or an engine-level
   reproducer — and is tracked outside Phase 1.
-- Update: this admission issue is now tracked as **N5a** and remains
-  **deferred / not fixed**. A separate engine shutdown-liveness issue
-  (**N5b** — a queued-but-unadmittable request blocking
-  `request_shutdown`) was isolated and **fixed**
+- Update: this admission issue was tracked as **N5a** and is now
+  **fixed** — `finalize_and_fulfill` recovers a `cancel_freed`-admitted
+  slot that completes naturally, so a later request is admitted. A
+  separate engine shutdown-liveness issue (**N5b** — a
+  queued-but-unadmittable request blocking `request_shutdown`) was
+  isolated and **fixed** first
   (`docs/hpx/n5_deferred_slot_recovery_note.md`). The W3 fixed-sleep
-  workaround remains; N5a, not N5b, is what keeps it necessary.
+  workaround predates the N5a fix and is retained for Phase 1; it has
+  not been re-tuned and this records no performance claim.
+- Refresh: a small post-N5a/N5b W3-only validation
+  (`run_id=20260524-142251-n5-refresh-w3-capfree-validate`, 1 warmup +
+  3 trials per mode) and a 10-trial sleep-vs-capfree comparison
+  (`run_id=20260524-142531-n5-refresh-w3-sleep-compare`,
+  `run_id=20260524-142655-n5-refresh-w3-capfree-compare`) both PASS in
+  all three modes. In capfree mode every `wait_for_cap_free` probe
+  returned True (max ~72 ms vs the 30 s timeout) and the W3 sanity hash
+  matched, confirming that the admission bug originally tracked as N5a
+  is no longer observed on this harness shape. The 10-trial capfree
+  distributions are visibly tighter than the matching sleep
+  distributions; this is consistent with the capfree probe removing
+  queue-wait contamination from per-trial measurements rather than a
+  performance change. The fixed `--w3-post-disconnect-sleep 2.0`
+  workaround remains the Phase 1 default; capfree is available via
+  `--w3-between-trial-mode capfree` for refresh validation. No
+  performance claim, and no llama-server comparison was performed.
 - This is a harness decision and not a performance claim.
 
 ## 12. `git status --short` (end of run)
@@ -277,3 +299,135 @@ The `results/` subdirectory under
 `hpx-bench/experiments/14_hpx_server_end_to_end_responsiveness/`
 is gitignored and does not appear in `git status`. Nothing has been
 staged, committed, or pushed.
+
+## 13. Exp14 Phase 1R — post-N5a/N5b capfree refresh
+
+`run_id`: `20260524-144031-phase1r-capfree`. Results dir:
+`results/20260524-144031-phase1r-capfree/`. Driver capture:
+`local/runs/exp14/phase1r-capfree/driver.{stdout,stderr}`.
+
+Same shape as the original Phase 1 main except W3 uses
+`--w3-between-trial-mode capfree`:
+
+```text
+python3 bench.py \
+  --modes default_os1,default_os2,engine_pool_os2 \
+  --workloads w1,w2,w3 \
+  --trials 30 \
+  --warmup-trials 1 \
+  --decode-budgets 8,64 \
+  --w3-decode-budget 128 \
+  --w3-between-trial-mode capfree \
+  --label phase1r-capfree
+```
+
+15 cells = 3 modes × (2 W1 budgets + 2 W2 budgets + 1 W3 budget).
+Every cell `trials_ok=30/30 term=sigterm exit=-15`. No stuck
+`llama-hpx-server` process after the run.
+
+PASS/FAIL: `EXP14_PHASE1: PASS run_id=20260524-144031-phase1r-capfree`.
+
+### 13.1 W3 capfree probe summary
+
+31 probes per W3 cell = 30 `between_trial` + 1 `pre_sanity`. All
+probes returned `ok=true`; max wait well under the 30 s timeout.
+
+| mode             | w3_probe_attempts | w3_probe_ok | w3_probe_max_ms |
+|------------------|------------------:|------------:|----------------:|
+| default_os1      | 31                | 31          | 69.57           |
+| default_os2      | 31                | 31          | 69.16           |
+| engine_pool_os2  | 31                | 31          | 75.92           |
+
+### 13.2 W3 sanity hash summary
+
+| mode             | w3_sanity_ok | w3_sanity_hash_ok |
+|------------------|:------------:|:-----------------:|
+| default_os1      | True         | True              |
+| default_os2      | True         | True              |
+| engine_pool_os2  | True         | True              |
+
+Canonical b8 hash `0x0619d4d1900c2365` matched in all three sanity
+POSTs.
+
+### 13.3 W1 — `response_complete_ms` (ms, n=30, warmup excluded)
+
+| mode             |  b | p50    | p95    | p99    |
+|------------------|---:|-------:|-------:|-------:|
+| default_os1      |  8 |  96.47 | 102.96 | 103.22 |
+| default_os1      | 64 | 569.02 | 583.66 | 594.40 |
+| default_os2      |  8 |  91.41 |  94.48 | 104.81 |
+| default_os2      | 64 | 517.64 | 521.30 | 525.04 |
+| engine_pool_os2  |  8 |  92.03 |  93.18 |  93.63 |
+| engine_pool_os2  | 64 | 523.83 | 544.36 | 548.05 |
+
+W1 b=8 `trials_hash_ok = 30/30` in every mode. W1 b=64 hashes are
+recorded only (no canonical b64 anchor).
+
+### 13.4 W2 — first event, first token, completion (ms, n=30)
+
+| mode             |  b | first_event p50/p95 | first_token p50/p95 | response_complete p50/p95 |
+|------------------|---:|--------------------:|--------------------:|--------------------------:|
+| default_os1      |  8 | 39.28 / 40.52       | 39.28 / 40.52       |  96.97 / 103.19           |
+| default_os1      | 64 | 39.84 / 41.20       | 39.84 / 41.20       | 566.59 / 623.07           |
+| default_os2      |  8 | 37.89 / 38.27       | 37.89 / 38.27       |  91.80 /  92.77           |
+| default_os2      | 64 | 38.06 / 38.45       | 38.06 / 38.45       | 517.23 / 521.87           |
+| engine_pool_os2  |  8 | 38.07 / 38.54       | 38.07 / 38.54       |  92.89 /  96.13           |
+| engine_pool_os2  | 64 | 38.57 / 42.59       | 38.57 / 42.59       | 538.18 / 595.92           |
+
+`first_event_ms == first_token_event_ms` in every W2 cell — the SSE
+stream emits the first token event as the first record. W2 b=8
+`trials_hash_ok = 30/30` per mode; b=64 hashes recorded only.
+`inter_event_gap_ms` p50/p95 at b=64: default_os1 8.26 / 9.31;
+default_os2 7.55 / 7.94; engine_pool_os2 7.87 / 8.83.
+
+### 13.5 W3 — first event, disconnect, bytes (b=128, capfree)
+
+| mode             | first_event p50 / p95 | disconnect p50 / p95 | bytes_received |
+|------------------|----------------------:|---------------------:|---------------:|
+| default_os1      | 38.36 / 38.71         | 46.87 / 47.53        | 107            |
+| default_os2      | 37.92 / 38.63         | 45.92 / 46.81        | 107            |
+| engine_pool_os2  | 38.02 / 38.64         | 46.19 / 48.69        | 107            |
+
+`bytes_received` is constant 107 per trial (the W3 abort threshold).
+
+### 13.6 Interpretation
+
+- Refreshed hpx-server-only baseline after N5a/N5b. Every cell PASS,
+  no hangs, no SIGKILLs, no stuck processes; the W3 capfree path is
+  stable at full Phase 1 size (31 probes per W3 cell, all
+  `ok=true`).
+- `default_os1` is the slowest on long-decode workloads (W1/W2 b=64
+  `response_complete_ms` p50 about +50 ms vs `default_os2`),
+  consistent with one shared OS worker contending with the engine
+  task.
+- `default_os2` is the fastest in most metrics on this shape.
+- `engine_pool_os2` is approximately neutral relative to
+  `default_os2` on end-to-end client metrics: first-event /
+  first-token p50 essentially equal; W1/W2 b=64
+  `response_complete_ms` p50 is slightly higher (about 5–20 ms)
+  with a longer p95 tail on W2 b=64. Consistent with the existing
+  Phase 1 and Exp 13 finding that engine-pool placement helps the
+  HPX control plane but is not visible — and may slightly worsen —
+  on decode-dominated end-to-end metrics.
+- W3 distributions across all three modes are tightly clustered
+  (`first_event_ms` p50 ~38 ms, `disconnect_ms` p50 ~46 ms) and the
+  original W3 cap-free admission failure path is no longer
+  observed.
+- No llama-server comparison. No concurrent-client claim. No
+  performance claim beyond this hpx-server-only refresh.
+
+### 13.7 Caveats
+
+- Single machine: Apple M4 Pro, darwin, TinyLlama 1.1B Q4_K_M.
+- Single client; cells run strictly sequentially.
+- W3 used `capfree` for harness cleanliness. Phase 1 main numbers
+  (§3–§9 above) used the fixed-sleep workaround; Phase 1R W3
+  timings are therefore **not directly comparable** to those W3
+  numbers as a performance delta.
+- W1/W2 do not use the between-trial spacing knob; their Phase 1R
+  numbers are directly comparable in shape to the corresponding
+  Phase 1 main W1/W2 numbers, though run-to-run noise and minor
+  scheduling differences are expected.
+- `disconnect_ms` is client-side socket close, not server-observed
+  cancel time.
+- No llama-server comparison. No broader production-server claim.

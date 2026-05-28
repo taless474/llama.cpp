@@ -1,0 +1,46 @@
+{
+  "model_path": "/Users/unick/Desktop/hpx/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+  "binaries": {
+    "hpx_server":   "/Users/unick/Desktop/hpx/builds/llama-hpx-hpx-on/bin/llama-hpx-server",
+    "llama_server": "/Users/unick/Desktop/hpx/builds/llama-base/bin/llama-server"
+  },
+  "ports": {
+    "hpx_server":   9087,
+    "llama_server": 9088
+  },
+  "ctx_size": 2048,
+  "threads": 2,
+  "streaming": true,
+  "stream_line_timeout_seconds":    30.0,
+  "stream_overall_timeout_seconds": 60.0,
+  "workload": {
+    "workload_id":         "p0_b32",
+    "prompt_id":           "p0",
+    "prompt":              "Hello, my name is",
+    "decode_budget":       32,
+    "is_canonical_anchor": true
+  },
+  "concurrency_levels":     [1, 2],
+  "iterations_per_client":  51,
+  "request_timeout_seconds": 30.0,
+  "readiness": {
+    "tcp_poll_interval_seconds": 0.05,
+    "tcp_poll_timeout_seconds":  30.0,
+    "warmup_request_timeout_seconds": 30.0
+  },
+  "shutdown": {
+    "sigterm_grace_seconds": 5.0
+  },
+  "server_args": {
+    "hpx_server": {
+      "n_seq_max":         2,
+      "max_concurrent":    2,
+      "max_prompt_tokens": 512
+    },
+    "llama_server": {
+      "parallel":         2,
+      "no_context_shift": true,
+      "seed":             0
+    }
+  }
+}

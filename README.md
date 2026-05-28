@@ -4,12 +4,11 @@
 
 The short version:
 
-```text
 llama.cpp runs the model.
 HPX owns the serving-control layer around it.
-```
 
-This repository is **not** trying to replace llama.cpp kernels, tensor math, tokenizer logic, sampler math, or backend execution. The useful direction found so far is to use HPX for request orchestration around llama.cpp: ownership, futures, cancellation, streaming, admission, runtime placement, and correctness validation.
+
+This repository is **not** trying to replace llama.cpp kernels, tensor math, tokenizer logic, sampler math, or backend execution. The useful direction found so far is to use HPX for request orchestration around llama.cpp: ownership, futures, cancellation, streaming, admission, batch-composition policy, runtime placement, and correctness validation.
 
 ---
 
@@ -17,9 +16,8 @@ This repository is **not** trying to replace llama.cpp kernels, tensor math, tok
 
 The starting question was:
 
-```text
 Can HPX improve llama.cpp inference by adding better runtime orchestration?
-```
+
 
 Several approaches were explored:
 
@@ -48,16 +46,22 @@ The current `hpx-run-level-analyzer` branch demonstrates a correctness-first HPX
 - per-request token streaming,
 - traceable lifecycle events,
 - optional HPX runtime placement for the engine task,
+- serving-side batch-composition policy,
+- optional prefill budgeting for live-admitted requests,
+- per-iteration diagnostics for attribution,
 - regression smokes for default-pool and engine-pool scheduling paths,
 - benchmark gates that verify output stability.
 
 The key design rule is:
 
-```text
 Only the engine-owned execution path touches llama.cpp mutable state.
-```
+
 
 Adapters, HTTP handlers, benchmark drivers, and producer tasks do not call `llama_decode` or mutate KV state directly. They send messages to the engine and consume futures or token streams.
+
+The current prototype also includes an experimental `PrefillBudgetPolicy`. With the default budget disabled, behavior remains unbounded. With a positive prefill budget, the HPX serving layer caps how many live-admitted prompt rows may enter one engine iteration. This is a serving-control mechanism above `llama_decode`; it does not change ggml, backend kernels, tokenizer behavior, sampler math, or KV internals.
+
+The validated claim is narrow: prefill budgeting can bound per-iteration prefill/decode interference. It is not a throughput claim and it is not a default-enable recommendation.
 
 ---
 
@@ -71,7 +75,10 @@ HPX is used for the serving-control plane:
 - typed engine inbox,
 - engine actor ownership,
 - token-stream delivery,
+- admission and batch-composition policy,
+- prefill budgeting,
 - lifecycle traces,
+- per-iteration diagnostics,
 - runtime placement,
 - correctness and regression gates.
 
@@ -109,6 +116,8 @@ llama.cpp remains responsible for:
 - logits,
 - sampler behavior,
 - KV-memory operations,
+- graph construction,
+- ggml scheduling,
 - ggml graph execution,
 - CPU / Metal / BLAS / backend kernels.
 
@@ -152,17 +161,17 @@ for the durable architecture reference.
 
 This is the simplified mental model used in the HPX design notes.
 
-![Upstream llama.cpp sketch](docs/hpx/figures/llama_cpp_architecture_v1_manual_sketch.png)
+![Upstream llama.cpp sketch](docs/hpx/figures/llama_cpp_architecture_v2_manual_sketch.png)
 
 In this project, HPX is placed around the serving/request lifecycle, not inside llama.cpp kernels. The important boundary is:
 
-```text
 HPX:
-  request lifecycle, futures, cancellation, streaming, placement
+  request lifecycle, futures, cancellation, streaming, placement,
+  admission, batch-composition policy, prefill budgeting
 
 llama.cpp:
   model execution, llama_decode, logits, sampling, KV operations, backends
-```
+
 
 ---
 
@@ -170,9 +179,8 @@ llama.cpp:
 
 The main active prototype lives under:
 
-```text
 tools/hpx-continuous-batch-gate/
-```
+
 
 It demonstrates:
 
@@ -186,7 +194,9 @@ It demonstrates:
 - named per-iteration phase helpers,
 - optional `--engine-pool` runtime placement in the gate,
 - placement-aware pump cooperativity,
-- queued-cancel regression smokes for both default-pool and engine-pool behavior.
+- queued-cancel regression smokes for both default-pool and engine-pool behavior,
+- chunked live-admission prefill under an explicit prefill budget,
+- cancellation and concurrent-sequence smokes for the chunked-prefill path.
 
 This tool is correctness-first and lifecycle-first.
 
@@ -205,11 +215,10 @@ This branch explored early HPX/thread-pool ideas around llama.cpp execution.
 
 Main lesson:
 
-```text
 Wrapping existing llama.cpp execution with another runtime is not enough.
 The design must expose real overlap, cancellation, priority, admission,
 or another useful scheduling capability.
-```
+
 
 ### `hpx-prefill-orchestrator`
 
@@ -219,7 +228,6 @@ This branch explored HPX closer to ggml graph execution: prefill orchestration, 
 
 Topics explored included:
 
-```text
 ggml graph structure
 prefill vs decode behavior
 selective lowering
@@ -227,15 +235,14 @@ fine-region DAGs
 packetized repeated subgraphs
 run-level execution planning
 interaction with ggml scheduler and CPU backend paths
-```
+
 
 Main lesson:
 
-```text
 HPX could execute some lowered or packetized regions correctly, but the
 tested CPU-only designs did not beat the existing llama.cpp / ggml
 scheduler. The overhead and granularity were not favorable.
-```
+
 
 ### `hpx-run-level-analyzer`
 
@@ -245,32 +252,26 @@ This branch moved HPX out of ggml graph execution and into serving/runtime orche
 
 It contains two serving-level lines of work:
 
-```text
 1. FIFO context-pool serving-bench line
 2. Continuous-batching request-lifecycle line
-```
+
 
 The FIFO serving-bench line compared:
 
-```text
 llama-serving-bench --backend std
 llama-serving-bench --backend hpx
-```
+
 
 That path was correct and robust, but it did not show a useful HPX latency advantage. It is now evidence for the FIFO closeout, not the active direction.
 
 The active direction is the continuous-batching serving-control layer under:
 
-```text
 tools/hpx-continuous-batch-gate/
-```
 
 Main lesson:
 
-```text
 HPX becomes more meaningful when it owns a serving lifecycle capability,
 not when it merely replaces a FIFO queue around opaque llama_decode calls.
-```
 
 ---
 
@@ -290,6 +291,10 @@ Useful current documents include:
 docs/hpx/provenance.md
 docs/hpx/hpx_serving_layer_architecture.md
 docs/hpx/hpx_serving_layer_m0_m8_milestone_summary.md
+docs/hpx/hpx_native_serving_control_plane_design.md
+docs/hpx/serving_overhead_diagnostics_roadmap.md
+docs/hpx/prefill_budget_policy_design.md
+docs/hpx/prefill_budget_policy_result.md
 docs/hpx/continuous_batching_upstream_notes.md
 docs/hpx/continuous_batching_simulator_design.md
 docs/hpx/continuous_batching_phase3_target.md
@@ -312,6 +317,13 @@ The milestone summary records the validated serving-layer history:
 docs/hpx/hpx_serving_layer_m0_m8_milestone_summary.md
 ```
 
+The prefill-budget documents record the current HPX-owned batch-composition policy and the server-path validation result:
+
+```text
+docs/hpx/prefill_budget_policy_design.md
+docs/hpx/prefill_budget_policy_result.md
+```
+
 ---
 
 ### HPX continuous-batch gate
@@ -332,7 +344,9 @@ It proves:
 - cooperative cancellation completes futures with `status=cancelled`,
 - live admission and sequence reuse are validated,
 - optional engine-pool placement is supported in the gate,
-- placement-specific queued-cancel behavior is guarded by smokes.
+- placement-specific queued-cancel behavior is guarded by smokes,
+- live-admitted long prefill can be chunked under an explicit budget,
+- chunked-prefill cancellation, concurrent overlap, and same-shape determinism are guarded by smokes.
 
 This is the current HPX-native serving prototype.
 
@@ -375,10 +389,13 @@ hpx-bench/experiments/
 hpx-bench/sim/
 ```
 
-The `experiments/` tree contains serving-bench evidence packages and server-vs-server comparison runs. Recent serving-layer responsiveness work:
+The `experiments/` tree contains serving-bench evidence packages and server-vs-server comparison runs. Recent serving-layer responsiveness and comparison work:
 
 - `hpx-bench/experiments/13_control_plane_responsiveness/` — internal HPX control-plane responsiveness; shows engine-pool improves queued-cancel tail latency but not decode-dominated streaming.
-- `hpx-bench/experiments/14_hpx_server_end_to_end_responsiveness/` — end-to-end hpx-server client-visible responsiveness; shows default_os2 improves over default_os1, while engine_pool_os2 is neutral-to-slightly-negative for this single-client workload.
+- `hpx-bench/experiments/14_hpx_server_end_to_end_responsiveness/` — end-to-end hpx-server client-visible responsiveness; records hpx-server responsiveness behavior and later slot-recovery refreshes.
+- `hpx-bench/experiments/15_hpx_vs_llama_server_semantics/` — semantic-alignment revalidation against `llama-server`; useful for comparison setup, but not a throughput benchmark.
+- `hpx-bench/experiments/16_prefill_budget_policy_server_w1c/` — server-path PrefillBudgetPolicy validation; shows that an HPX-owned prefill budget can bound per-iteration prefill/decode interference.
+- `hpx-bench/experiments/17_hpx_vs_llama_server_throughput_smoke/` — small external throughput/scaling smoke for `llama-server` vs `llama-hpx-server` with default B=0; identifies a moderate-concurrency serving-control attribution target.
 
 The `sim/` tree contains the continuous-batching simulator and workload analysis that helped define the mixed-decode target.
 

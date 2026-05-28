@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <thread>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -31,6 +33,184 @@
 namespace {
 
 using namespace token_hash;
+
+// ---- Phase 1 serving-overhead diagnostics --------------------------------
+// Default-OFF. With LLAMA_HPX_DIAG_METRICS unset, diag_enabled() returns
+// false and every guarded site is a single not-taken branch — no chrono
+// call, no vector push, no JSON formatting, no file I/O.
+//
+// Per-engine state: the only file-scope state below is the env-switch
+// caches (diag_enabled() / diag_path()) which are read-only after first
+// access. The per-iter scratch accumulator and every output vector live
+// inside engine_result::metrics, owned by each engine instance. Multiple
+// engines running concurrently in the same process (engine-pool framing,
+// future replication) therefore never share Phase 1 state — every read
+// and write goes through result_.metrics.cur_iter_diag.* and
+// result_.metrics.*_per_iter, both of which are per-engine.
+//
+// Vector alignment: Phase 1 per-iter vectors are pushed at the same
+// site as result_.metrics.active_seqs_per_iter (inside iter_run_decode).
+// One push per iter that actually called llama_decode via the per-iter
+// site. Iters that hit the no-active early break do not push, matching
+// the existing active_seqs_per_iter semantics.
+//
+// Two llama_decode sites exist:
+//   (a) the per-iter site in iter_run_decode (engine.cpp:iter_run_decode)
+//   (b) a pre-loop preloaded-prefill site in run_body (fires only when
+//       budgets_ is non-empty, before any iter)
+// Phase 1 deliberately instruments site (a) only. Site (b) is excluded
+// by design, for two reasons:
+//   1. The hpx-server path constructs engines with budgets_={}, so site
+//      (b) never fires in the production serving path that the c > 1
+//      diagnostics are meant to analyze.
+//   2. Gate/smoke runs with preloaded actives DO hit site (b), and
+//      including it would create a half-iter row (no admission, no
+//      cancellation, no per-iter scratch valid). The cleaner contract
+//      is "per-iter rows describe iters from the inner-while loop only."
+// The exclusion is surfaced to consumers in the engine_summary JSONL
+// row via the "preload_prefill_llama_decode_included" key (always 0
+// in Phase 1) so analysis code can detect the omission unambiguously
+// rather than infer it. The dump's rows_per_batch offset code below
+// handles gate/smoke runs where rows_per_batch has the extra leading
+// preload entry.
+bool diag_enabled() {
+    static const bool v = []() -> bool {
+        const char * e = std::getenv("LLAMA_HPX_DIAG_METRICS");
+        return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+}
+
+const char * diag_path() {
+    static const char * const v =
+        std::getenv("LLAMA_HPX_DIAG_METRICS_PATH");
+    return v;
+}
+
+// Emit one JSONL row per iter plus one engine_summary row. Called at
+// the tail of engine::run() when diag_enabled(). Bare fprintf (no
+// nlohmann::json in engine TU). Writes to LLAMA_HPX_DIAG_METRICS_PATH
+// if set (O_APPEND, line-buffered), stderr otherwise.
+void dump_metrics_jsonl(const engine_result & r) {
+    const char * path = diag_path();
+    FILE * fp = stderr;
+    bool   need_close = false;
+    if (path != nullptr && *path != '\0') {
+        FILE * f = std::fopen(path, "a");
+        if (f != nullptr) {
+            std::setvbuf(f, nullptr, _IOLBF, 0);
+            fp = f;
+            need_close = true;
+        }
+    }
+
+    const auto &  m = r.metrics;
+    const size_t  n = m.active_seqs_per_iter.size();
+    // rows_per_batch may have an extra leading entry from the
+    // preloaded-prefill site; compute the per-iter offset.
+    const size_t  rpb_offset =
+        (m.rows_per_batch.size() > n) ? (m.rows_per_batch.size() - n) : 0;
+
+    for (size_t i = 0; i < n; i++) {
+        const int32_t batch_n_tokens =
+            (i + rpb_offset < m.rows_per_batch.size())
+              ? m.rows_per_batch[i + rpb_offset] : 0;
+        const int32_t prefill =
+            (i < m.prefill_rows_per_iter.size())
+              ? m.prefill_rows_per_iter[i] : 0;
+        const int32_t decode_r =
+            (i < m.decode_rows_per_iter.size())
+              ? m.decode_rows_per_iter[i] : 0;
+        const int32_t admitted =
+            (i < m.admitted_per_iter.size())
+              ? m.admitted_per_iter[i] : 0;
+        const int32_t completed =
+            (i < m.completed_per_iter.size())
+              ? m.completed_per_iter[i] : 0;
+        const int32_t cancelled =
+            (i < m.cancelled_per_iter.size())
+              ? m.cancelled_per_iter[i] : 0;
+        const int32_t tok_emit =
+            (i < m.tokens_emitted_per_iter.size())
+              ? m.tokens_emitted_per_iter[i] : 0;
+        const int32_t wq_depth =
+            (i < m.waiting_queue_depth_after_admission_per_iter.size())
+              ? m.waiting_queue_depth_after_admission_per_iter[i] : 0;
+        const int64_t decode_us =
+            (i < m.llama_decode_wall_us_per_iter.size())
+              ? m.llama_decode_wall_us_per_iter[i] : 0;
+        const int64_t iter_us =
+            (i < m.iter_wall_us_per_iter.size())
+              ? m.iter_wall_us_per_iter[i] : 0;
+        const int64_t idle_us =
+            (i < m.idle_wait_us_per_iter.size())
+              ? m.idle_wait_us_per_iter[i] : 0;
+        const int64_t t_from_start_us =
+            (i < m.t_us_from_engine_start_per_iter.size())
+              ? m.t_us_from_engine_start_per_iter[i] : 0;
+        std::fprintf(fp,
+            "{\"kind\":\"iter\",\"iter\":%zu,"
+            "\"t_us_from_engine_start\":%lld,"
+            "\"batch_n_tokens\":%d,"
+            "\"active_seq_count\":%d,"
+            "\"prefill_rows_in_iter\":%d,"
+            "\"decode_rows_in_iter\":%d,"
+            "\"admitted_in_iter\":%d,"
+            "\"completed_in_iter\":%d,"
+            "\"cancelled_in_iter\":%d,"
+            "\"tokens_emitted_in_iter\":%d,"
+            "\"waiting_queue_depth_after_admission\":%d,"
+            "\"llama_decode_wall_us\":%lld,"
+            "\"iter_wall_us\":%lld,"
+            "\"idle_wait_us\":%lld}\n",
+            i,
+            static_cast<long long>(t_from_start_us),
+            batch_n_tokens,
+            m.active_seqs_per_iter[i],
+            prefill, decode_r,
+            admitted, completed, cancelled, tok_emit,
+            wq_depth,
+            static_cast<long long>(decode_us),
+            static_cast<long long>(iter_us),
+            static_cast<long long>(idle_us));
+    }
+
+    // Phase 1: preload_prefill_llama_decode_included is always 0 in
+    // this slice — the preloaded-prefill llama_decode call site (the
+    // pre-inner-while site in run_body, fired only when budgets_ is
+    // non-empty) is intentionally excluded from per-iter rows. Surfacing
+    // it as an explicit key in engine_summary lets analysis code detect
+    // the omission unambiguously rather than infer it from row counts.
+    std::fprintf(fp,
+        "{\"kind\":\"engine_summary\","
+        "\"decode_calls\":%d,"
+        "\"update_iterations\":%d,"
+        "\"wall_ms\":%.3f,"
+        "\"admitted_count\":%d,"
+        "\"promises_fulfilled\":%d,"
+        "\"cancelled_count\":%d,"
+        "\"streams_closed_completed\":%d,"
+        "\"streams_closed_cancelled\":%d,"
+        "\"streams_closed_error\":%d,"
+        "\"engine_t_start_us_absolute\":%lld,"
+        "\"preload_prefill_llama_decode_included\":0}\n",
+        r.decode_calls,
+        r.metrics.update_iterations,
+        r.metrics.wall_ms,
+        r.admitted_count,
+        r.promises_fulfilled,
+        r.cancelled_count,
+        r.streams_closed_completed,
+        r.streams_closed_cancelled,
+        r.streams_closed_error,
+        static_cast<long long>(r.engine_t_start_us_absolute));
+
+    if (need_close) {
+        std::fclose(fp);
+    } else {
+        std::fflush(fp);
+    }
+}
 
 // N3.1 (Exp 13): absolute steady_clock microseconds since the
 // system's steady_clock epoch. Called only when
@@ -134,6 +314,7 @@ engine::engine(engine_options opts)
       keep_alive_(opts.lib.keep_alive),
       cooperative_yield_on_pump_(opts.lib.cooperative_yield_on_pump),
       enable_responsiveness_timing_(opts.lib.enable_responsiveness_timing),
+      prefill_budget_rows_(opts.lib.prefill_budget_rows),
       iter_release_set_(std::move(opts.gate_test.release_iter_set)),
       max_decode_iters_(opts.gate_test.max_decode_iters),
       stream_all_(opts.preload.stream_all)
@@ -643,6 +824,13 @@ void engine::run() {
             // already satisfied; ignore.
         }
     }
+    // Phase 1 diagnostics dump. Fires exactly once per engine::run()
+    // tail when LLAMA_HPX_DIAG_METRICS=1. Writes to
+    // LLAMA_HPX_DIAG_METRICS_PATH if set (O_APPEND, line-buffered),
+    // stderr otherwise. Zero-cost when the env switch is unset.
+    if (diag_enabled()) {
+        dump_metrics_jsonl(result_);
+    }
 }
 
 bool engine::clear_and_check(seq_state & seq, int32_t iter,
@@ -697,6 +885,15 @@ bool engine::clear_and_check(seq_state & seq, int32_t iter,
 }
 
 void engine::publish_token(seq_state & seq, int32_t token_id) {
+    // Phase 1: count every token emission attributed to this iter,
+    // regardless of streaming status. Bumped BEFORE the streaming
+    // early-return so non-streaming requests are also counted. Guarded
+    // by !empty so preloaded-prefill calls (which fire before
+    // iter_run_decode pushes the first row) do not underflow.
+    if (diag_enabled()
+     && !result_.metrics.tokens_emitted_per_iter.empty()) {
+        result_.metrics.tokens_emitted_per_iter.back()++;
+    }
     if (!seq.stream_enabled || seq.stream_closed) return;
     // N3.1 (Exp 13): stamp the first non-terminal token publish on
     // this seq when the option is on. Guarded by the seq's prior
@@ -857,11 +1054,17 @@ bool engine::finalize_and_fulfill(seq_state & seq, int32_t iter,
     // truly KV-empty at queue-entry time.
     if (reuse_completed_ && !waiting_queue_consumable_.empty()) {
         free_due_to_completion_.push_back(seq.seq_id);
-    } else if (seq.admission_src == admission_source::initial_idle) {
-        // M6b-followup: return idle-sourced slots to free_idle_ so the
-        // strict sequential keep-alive submit_request pattern can rebind
-        // beyond initial_idle_slots. Gates use initial_idle_slots=0 so
-        // this branch is inert for canonical gate shapes.
+    } else if (seq.seq_id >= static_cast<int32_t>(budgets_.size())) {
+        // N5a: idle-origin slots occupy seq_id range
+        // [budgets_.size(), seqs_.size()); after a natural completion
+        // that is NOT routed to free_due_to_completion_, return them to
+        // free_idle_. Keying on the seq_id range rather than
+        // admission_src also recovers a slot admitted via cancel_freed
+        // (idle slot -> active-cancel -> cancel_freed -> natural
+        // completion), which the old initial_idle-only predicate leaked.
+        // This relies on today's seq_id == slot index invariant. Gates
+        // use initial_idle_slots=0 (budgets_.size()==seqs_.size()) so
+        // this branch stays inert for canonical gate shapes.
         free_idle_.push_back(seq.seq_id);
     }
 
@@ -905,6 +1108,13 @@ bool engine::finalize_and_fulfill(seq_state & seq, int32_t iter,
 
     trace::event("promise_fulfilled seq=%d ttc_us=%lld",
                  seq.seq_id, static_cast<long long>(ttc_us));
+    // Phase 1: bump the current iter's completed counter. Guarded by
+    // !empty so preloaded-prefill calls (which fire before iter_run_decode
+    // pushes the first row) do not underflow.
+    if (diag_enabled()
+     && !result_.metrics.completed_per_iter.empty()) {
+        result_.metrics.completed_per_iter.back()++;
+    }
     return true;
 }
 
@@ -987,6 +1197,7 @@ bool engine::cancel_and_fulfill(seq_state & seq, int32_t iter,
     trace::event(
         "cancel_future_fulfilled seq=%d status=cancelled ttc_us=%lld",
         seq.seq_id, static_cast<long long>(ttc_us));
+    if (diag_enabled()) result_.metrics.cur_iter_diag.cancelled++;
     return true;
 }
 
@@ -1652,6 +1863,11 @@ bool engine::admit_one(int32_t              reuse_seq,
     rseq.decode_budget          = w.decode_budget;
     rseq.n_decoded              = 0;
     rseq.pos_next               = 0;
+    // Slice B: a reused slot starts a fresh prefill. The admitted-prefill
+    // pass in iter_build_batch sets these to (size, true) in the admission
+    // iter, before sampling, so behavior is unchanged.
+    rseq.prefill_cursor         = 0;
+    rseq.prefill_complete       = false;
     rseq.i_batch                = -1;
     rseq.last_token             = 0;
     rseq.done                   = false;
@@ -1878,6 +2094,7 @@ bool engine::admit_one(int32_t              reuse_seq,
     }
     result_.admitted_count++;
     result_.reused_seq_id_set.push_back(reuse_seq);
+    if (diag_enabled()) result_.metrics.cur_iter_diag.admitted++;
     return true;
 }
 
@@ -2010,30 +2227,62 @@ int32_t engine::iter_build_batch(int32_t iter, llama_batch & batch,
         // decode row. The post-decode argmax then produces its
         // first token via the same path as a normal
         // post-prefill argmax, after which n_decoded == 1.
-        if (seq.admitted_at_iter == iter && seq.n_decoded == 0) {
-            // M1c: admitted prefill reads the per-seq owned
-            // prompt vector that admit_one moved in from the
-            // waiter. In M1c every waiter's prompt is still a
-            // copy of the shared prompt source, so prompt.size()
-            // equals the outer n_prompt and the emitted rows /
-            // pos / logits selection are byte-identical to the
-            // M1b path. M1d+ will diverge when CLI flags allow
-            // per-request prompts.
-            const auto &  prompt       = seq.prompt_tokens;
-            const int32_t n_seq_prompt =
-                static_cast<int32_t>(prompt.size());
-            for (int32_t p = 0; p < n_seq_prompt; p++) {
-                const bool last = (p == n_seq_prompt - 1);
+        // Slice C: live-admission prefill (Path A) is keyed on prefill
+        // STATE, not the admission iter, so a chunked prefill
+        // (prefill_budget_rows_ > 0) can span multiple iters. For B=0
+        // this places the whole prompt in the admission iter, preserving
+        // the previous `admitted_at_iter == iter && n_decoded == 0`
+        // selection: a freshly admitted seq has prefill_complete == false
+        // (set in admit_one), and n_decoded only advances after
+        // prefill_complete (the sample loop skips mid-prefill seqs), so
+        // the two predicates pick the same seqs for B=0. Path B
+        // (preloaded) sets prefill_complete in run_body before the inner
+        // loop and is therefore never selected by this branch.
+        if (!seq.prefill_complete) {
+            // M1c: admitted prefill reads the per-seq owned prompt vector
+            // that admit_one moved in from the waiter.
+            const auto &  prompt    = seq.prompt_tokens;
+            const int32_t n         = static_cast<int32_t>(prompt.size());
+            const int32_t start     = seq.prefill_cursor;
+            const int32_t remaining = n - start;
+            // B <= 0 means unbounded (place the whole remaining prompt this
+            // iter); B > 0 caps the chunk. min(remaining, B) is >= 1
+            // whenever start < n and B >= 1, so the cursor always advances
+            // and the engine task cannot livelock on a zero-row prefill
+            // iter. The only chunk == 0 case is an empty/exhausted prompt
+            // (start >= n), which flips prefill_complete immediately below.
+            int32_t chunk = remaining;
+            if (prefill_budget_rows_ > 0 && chunk > prefill_budget_rows_) {
+                chunk = prefill_budget_rows_;
+            }
+            assert((start < n) ? (chunk > 0) : (chunk == 0));
+            for (int32_t l = 0; l < chunk; l++) {
+                const int32_t p = start + l;
+                // logits only on the final prompt token of the FINAL
+                // chunk, keyed on the absolute index so any chunk-boundary
+                // alignment is handled. Intermediate-chunk rows carry
+                // logits=false and never have i_batch read (the sample
+                // loop skips this seq while !prefill_complete).
+                const bool final = (p == n - 1);
                 common_batch_add(batch, prompt[p],
-                                 /*pos=*/p,
+                                 /*pos=*/start + l,
                                  /*seq_ids=*/{seq.seq_id},
-                                 /*logits=*/last);
-                if (last) {
+                                 /*logits=*/final);
+                if (final) {
                     seq.i_batch = batch.n_tokens - 1;
                 }
             }
-            seq.pos_next = n_seq_prompt;
+            seq.prefill_cursor   = start + chunk;
+            seq.pos_next         = seq.prefill_cursor;
+            seq.prefill_complete = (seq.prefill_cursor >= n);
+            assert(seq.prefill_cursor
+                   <= static_cast<int32_t>(prompt.size()));
+            // B <= 0 (and B >= n) must finish the whole prompt in one pass.
+            assert(prefill_budget_rows_ > 0 || seq.prefill_complete);
             active_idx.push_back(static_cast<int32_t>(s));
+            if (diag_enabled()) {
+                result_.metrics.cur_iter_diag.prefill_rows += chunk;
+            }
             // No decode_row trace for prefill rows; Slice 4
             // owns admitted-prefill trace events.
         } else {
@@ -2044,6 +2293,9 @@ int32_t engine::iter_build_batch(int32_t iter, llama_batch & batch,
             seq.i_batch = batch.n_tokens - 1;
             seq.pos_next++;
             active_idx.push_back(static_cast<int32_t>(s));
+            if (diag_enabled()) {
+                result_.metrics.cur_iter_diag.decode_rows++;
+            }
             trace::event("decode_row iter=%d seq=%d pos=%d",
                          iter, seq.seq_id, seq.pos_next - 1);
             // Live Admission Slice 4: fine-grained event for
@@ -2076,12 +2328,56 @@ bool engine::iter_run_decode(llama_batch & batch,
     result_.decode_calls++;
     result_.metrics.decode_calls = result_.decode_calls;
 
+    // Phase 1 diagnostics: push per-iter aggregates aligned 1:1 with
+    // active_seqs_per_iter. admitted/cancelled/prefill_rows/decode_rows
+    // come from the per-engine cur_iter_diag accumulator populated by
+    // earlier-in-iter phases (iter_observe_cancellations via
+    // cancel_and_fulfill, iter_run_admissions via admit_one, and
+    // iter_build_batch). completed/tokens_emitted are pushed as 0 here
+    // and bumped in finalize_and_fulfill/publish_token below. iter_wall
+    // and idle_wait are pushed as 0 and back-patched at iter bottom
+    // (idle_wait stays 0 in Phase 1; deferred to Phase 2).
+    // t_us_from_engine_start is the snapshot taken at iter top in
+    // run_body (microseconds since t_start_), enabling server-side
+    // JSONL request events to align to a common engine-relative axis.
+    if (diag_enabled()) {
+        const auto & acc = result_.metrics.cur_iter_diag;
+        result_.metrics.prefill_rows_per_iter.push_back(acc.prefill_rows);
+        result_.metrics.decode_rows_per_iter.push_back(acc.decode_rows);
+        result_.metrics.admitted_per_iter.push_back(acc.admitted);
+        result_.metrics.cancelled_per_iter.push_back(acc.cancelled);
+        result_.metrics.t_us_from_engine_start_per_iter.push_back(
+            acc.t0_us);
+        result_.metrics.completed_per_iter.push_back(0);
+        result_.metrics.tokens_emitted_per_iter.push_back(0);
+        result_.metrics.llama_decode_wall_us_per_iter.push_back(0);
+        result_.metrics.iter_wall_us_per_iter.push_back(0);
+        // c=4 attribution: credit any idle wait accumulated at the
+        // keep-alive tail (wait_inbox_blocking) since the last decode
+        // iter to THIS iter — the iter the wake produced — then reset
+        // the accumulator. Stays 0 for non-keep-alive engines (they
+        // never reach the wait site) and for back-to-back iters with no
+        // intervening idle wait.
+        result_.metrics.idle_wait_us_per_iter.push_back(
+            result_.metrics.pending_idle_wait_us);
+        result_.metrics.pending_idle_wait_us = 0;
+    }
+
+    std::chrono::steady_clock::time_point decode_t0;
+    if (diag_enabled()) decode_t0 = std::chrono::steady_clock::now();
     if (llama_decode(ctx_, batch) != 0) {
         result_.decode_failures++;
         result_.error = "llama_decode failed during decode loop";
         return false;
     }
     llama_synchronize(ctx_);
+    if (diag_enabled()
+     && !result_.metrics.llama_decode_wall_us_per_iter.empty()) {
+        const auto t1 = std::chrono::steady_clock::now();
+        result_.metrics.llama_decode_wall_us_per_iter.back() =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t1 - decode_t0).count();
+    }
     return true;
 }
 
@@ -2098,6 +2394,15 @@ bool engine::iter_sample_and_finalize(
     llama_memory_t mem) {
     for (int32_t s : active_idx) {
         seq_state & seq = seqs_[s];
+        // Slice C: a mid-prefill seq is active for KV construction (its
+        // chunk rows were placed and decoded this iter) but must never be
+        // sampled. Skip it BEFORE any logits read, sampling, hash fold,
+        // publish_token, generated_tokens push, n_decoded bump, or
+        // finalize. With B=0 prefill always completes in iter_build_batch
+        // within the same iter, so this skip is never taken on the
+        // whole-prompt path; once prefill_complete is true the seq is
+        // sampled exactly once per iter as before.
+        if (!seq.prefill_complete) continue;
         // M6b: select the next token via per-seq sampler chain
         // when stochastic, otherwise fall through to the
         // bit-identical greedy argmax path. This is the site
@@ -2122,15 +2427,21 @@ bool engine::iter_sample_and_finalize(
             }
             next_id = argmax(logits, n_vocab_);
         }
-        // Live Admission Slice 4: capture the admitted-prefill-
-        // argmax predicate BEFORE n_decoded changes, so the
+        // Live Admission Slice 4 / Slice C: capture the admitted-
+        // prefill-argmax predicate BEFORE n_decoded changes, so the
         // event fires exactly once per admitted request (at the
-        // post-decode argmax of its admission iter, where it
-        // saw its prefill rows). Mirrors the existing
-        // seq_prefilled placement (before EOG check).
+        // post-decode argmax of the iter in which its prefill
+        // completed and the first token is sampled). With chunked
+        // prefill that iter may be LATER than the admission iter, so
+        // the predicate is keyed on prefill having just finished
+        // (n_decoded == 0, and the skip above guarantees
+        // prefill_complete) rather than admitted_at_iter == iter. For
+        // B=0 the first sample is in the admission iter where
+        // admitted_at_iter == iter also held, so this selects the same
+        // single event. Mirrors the seq_prefilled placement (before
+        // the EOG check).
         const bool is_admitted_prefill_argmax =
             seq.admission_src != admission_source::none
-         && seq.admitted_at_iter == iter
          && seq.n_decoded == 0;
         if (is_admitted_prefill_argmax) {
             trace::event(
@@ -2197,6 +2508,12 @@ bool engine::iter_fire_release_ack_barrier(int32_t iter) {
     return true;
 }
 
+// run_body — single-engine-task control loop. The inner loop follows
+// named HPX control-plane phases (INTAKE, CANCEL, ADMIT, BUILD, DECODE,
+// SAMPLE_PUBLISH_FINALIZE, RELEASE, WAIT). llama_decode is the single
+// llama.cpp execution boundary and is crossed exactly once per iter.
+// Detailed dataflow and ownership tables live in
+// docs/hpx/hpx_native_serving_control_plane_design.md.
 void engine::run_body() {
     result_.ok = false;
     result_.error.clear();
@@ -2339,6 +2656,11 @@ void engine::run_body() {
         seq_state & seq = seqs_[s];
         seq.n_decoded         = 0;
         seq.pos_next          = 0;
+        // Slice B: reset prefill progress for the new repeat. With the
+        // whole-prompt path these are immediately set to (size, true) in
+        // the prefill pass below, so behavior is unchanged.
+        seq.prefill_cursor    = 0;
+        seq.prefill_complete  = false;
         seq.i_batch           = -1;
         seq.last_token        = 0;
         seq.done_iter         = -1;
@@ -2377,6 +2699,16 @@ void engine::run_body() {
     }
 
     t_start_ = std::chrono::steady_clock::now();
+    // c=4 attribution: stamp t_start_ in the absolute steady_clock epoch
+    // so engine per-iter rows (relative t_us_from_engine_start) can be
+    // overlaid on server_request rows (absolute server_now_us). Reuses
+    // the already-captured time_point — no extra clock read. Diag-gated;
+    // emitted in the engine_summary JSONL row.
+    if (diag_enabled()) {
+        result_.engine_t_start_us_absolute =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_start_.time_since_epoch()).count();
+    }
 
     trace::event("engine_start n_seqs=%d prompt_tokens=%d max_budget=%d",
                  n_seqs, n_prompt, max_budget);
@@ -2433,6 +2765,12 @@ void engine::run_body() {
             }
         }
         seq.pos_next = n_seq_prompt;
+        // Slice B: preloaded/initial whole-prompt prefill completes here,
+        // before the post-prefill argmax pass below. Inert state only.
+        seq.prefill_cursor   = n_seq_prompt;
+        seq.prefill_complete = true;
+        assert(seq.prefill_cursor <= static_cast<int32_t>(prompt.size()));
+        assert(seq.prefill_complete);
     }
 
     // M2f: with zero initial actives (budgets_.empty()), the prefill
@@ -2456,6 +2794,10 @@ void engine::run_body() {
         const int32_t prefill_iter = 0;
         for (int32_t s = 0; s < n_seqs; s++) {
             seq_state & seq = seqs_[s];
+            // Slice B invariant (preloaded path): the initial prefill loop
+            // above set prefill_complete = true for every preloaded active
+            // before this post-prefill argmax. Debug-only; inert in NDEBUG.
+            assert(seq.prefill_complete);
             // M6b: select the next token via per-seq sampler chain
             // when stochastic, otherwise fall through to the
             // bit-identical greedy argmax path. The post-prefill site
@@ -2566,6 +2908,28 @@ void engine::run_body() {
         || inbox_has_pending()) {
         iter++;
 
+        // Phase 1 diagnostics: reset per-engine per-iter accumulator
+        // at iter top and stamp t0_us as microseconds since this
+        // engine's t_start_ baseline. cur_iter_diag is a member of
+        // this engine's result_.metrics, so concurrent engines never
+        // share this state. All zero-cost when LLAMA_HPX_DIAG_METRICS
+        // is unset.
+        if (diag_enabled()) {
+            auto & acc = result_.metrics.cur_iter_diag;
+            acc.admitted     = 0;
+            acc.cancelled    = 0;
+            acc.prefill_rows = 0;
+            acc.decode_rows  = 0;
+            acc.t0_us        =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_start_).count();
+        }
+
+        // ---- Phase INTAKE — pump inbox; drain external arrivals +
+        // cancels; apply queued cancellations. HPX control plane only;
+        // no KV touch. Phase 1 counters attach here (arrival_drained_count,
+        // cancel_request_calls, queued_cancelled, cancel_active_observed).
+
         // N1: unconditional channel pump at iter top. The inner-
         // while predicate short-circuits on any_active() and never
         // calls inbox_has_pending() during a mid-decode iter, so
@@ -2614,6 +2978,10 @@ void engine::run_body() {
         const size_t admission_eligible_count =
             free_due_to_cancel_.size();
 
+        // ---- Phase CANCEL — observe active-seq cancellations at iter
+        // boundary; KV clear + stream close + promise fulfill. Pushes
+        // the freed slot to free_due_to_cancel_ for next-iter admission.
+        // Phase 1 counter attaches here (cur_iter_diag.cancelled).
         // P6: cancellation observation #2.
         if (!iter_observe_cancellations(iter, mem)) {
             llama_batch_free(batch);
@@ -2622,6 +2990,10 @@ void engine::run_body() {
             return;
         }
 
+        // ---- Phase ADMIT — three-source priority drain (cancel_freed
+        // -> completion_freed -> initial_idle) binds waiting_request to
+        // a KV-empty slot. Engine task only; no llama_decode here.
+        // Phase 1 counter attaches here (cur_iter_diag.admitted).
         // P7: three-source admission priority drain.
         const iter_admission_result adm =
             iter_run_admissions(iter, mem, admission_eligible_count);
@@ -2649,11 +3021,19 @@ void engine::run_body() {
             break;
         }
 
+        // ---- Phase BUILD — compose llama_batch rows: admitted-prefill
+        // rows plus one decode row per still-active seq. llama_batch
+        // shape mutation only; no llama_decode here. Phase 1 counters
+        // attach here (prefill_rows / decode_rows per iter; rows_per_batch).
         // P9: build per-iter llama_batch (admitted-prefill rows OR
         // regular decode rows). Returns 0 → defensive break.
         std::vector<int32_t> active_idx;
         if (iter_build_batch(iter, batch, active_idx) == 0) break;
 
+        // ---- Phase DECODE — THE single llama_decode site per iter.
+        // llama.cpp execution boundary. Engine task only; never
+        // parallelized on the same llama_context. Phase 1 counter
+        // attaches here (llama_decode_wall_us_per_iter).
         // P10: per-iter decode site + per-iter decode metrics.
         if (!iter_run_decode(batch, active_idx)) {
             llama_batch_free(batch);
@@ -2662,6 +3042,10 @@ void engine::run_body() {
             return;
         }
 
+        // ---- Phase SAMPLE_PUBLISH_FINALIZE — per-seq sampler/argmax,
+        // publish_token to per-request stream channel, finalize_and_fulfill
+        // on EOG/budget (KV clear + promise). Phase 1 counters attach
+        // here (tokens_emitted_per_iter, completed_per_iter).
         // P11: sample + EOG + publish + finalize per active seq.
         if (!iter_sample_and_finalize(iter, active_idx, mem)) {
             llama_batch_free(batch);
@@ -2670,6 +3054,9 @@ void engine::run_body() {
             return;
         }
 
+        // ---- Phase RELEASE — gate-test release/ack barrier (no-op
+        // when the release_iter set is empty) and iter-wall diagnostic
+        // backpatch onto the row pushed in DECODE. HPX control plane only.
         // P12: gate-test release/ack barrier at end of iter K.
         if (!iter_fire_release_ack_barrier(iter)) {
             llama_batch_free(batch);
@@ -2677,7 +3064,28 @@ void engine::run_body() {
             finalize_wall_ms();
             return;
         }
+
+        // Phase 1 diagnostics: back-patch this iter's wall time into
+        // the entry pushed by iter_run_decode. Computed as
+        // (now_us_from_t_start_ - cur_iter_diag.t0_us), so it shares
+        // the engine-relative time axis with t_us_from_engine_start.
+        // Guarded by !empty so an iter that hit the no-active early-
+        // break (which does not push) cannot corrupt a prior iter's
+        // entry.
+        if (diag_enabled()
+         && !result_.metrics.iter_wall_us_per_iter.empty()) {
+            const int64_t now_us_from_start =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_start_).count();
+            result_.metrics.iter_wall_us_per_iter.back() =
+                now_us_from_start
+                  - result_.metrics.cur_iter_diag.t0_us;
+        }
     }
+    // ---- Phase WAIT — keep-alive outer-loop tail. Observe shutdown,
+    // continue if staged work exists, else HPX-native suspend on the
+    // inbox channel via wait_inbox_blocking() (no condition_variable,
+    // no busy-poll). Phase 1 counter attaches here (engine_idle_waits).
     // M3a: keep-alive outer-loop tail. With keep_alive_=false this
     // breaks immediately. With keep_alive_=true: N1: pump the HPX
     // inbox channel into the staged_* deques and observe
@@ -2746,7 +3154,21 @@ void engine::run_body() {
     // submission, cancel (rid or token), or shutdown — channel
     // FIFO; no lost-wakeup risk because the producer publishes
     // before its set() returns.
-    wait_inbox_blocking();
+    // c=4 attribution: time the (already-suspending) wait only when
+    // diagnostics are on, and accumulate it into pending_idle_wait_us.
+    // No behavior change — wait_inbox_blocking() is unchanged; the
+    // chrono pair brackets an existing suspension point and is credited
+    // to the next decode iter at the iter_run_decode push site.
+    if (diag_enabled()) {
+        const auto idle_t0 = std::chrono::steady_clock::now();
+        wait_inbox_blocking();
+        const auto idle_t1 = std::chrono::steady_clock::now();
+        result_.metrics.pending_idle_wait_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                idle_t1 - idle_t0).count();
+    } else {
+        wait_inbox_blocking();
+    }
     }
 
     result_.metrics.update_iterations = iter;

@@ -23,15 +23,31 @@
 //   Content-Type: text/event-stream, transfer-encoding: chunked.
 //   One SSE record per emitted token followed by one terminal `done`:
 //     event: token
-//     data: {"token":"<best-effort utf8>","token_id":<int>}
+//     data: {"token":"<incremental utf8 delta>","token_id":<int>}
 //
 //     event: done
 //     data: {"request_id":<int>,"status":"<completed|cancelled|
 //             failed_reserved>","n_decoded":<int>,"hash":"0x..."}
-//   Per-token text is best-effort: a single-piece `common_detokenize`
-//   may return "" when a multi-byte codepoint splits across pieces.
-//   `token_id` is the reliable field in M7c (no UTF-8 chunk buffering
-//   yet).
+//   `token` is the cumulative-detokenization *delta*: per stream we
+//   keep `emitted_tokens` (running token-id vector) and `emitted_text`
+//   (cumulative UTF-8 already written to the wire). On each engine
+//   token event we append the new `token_id`, recompute
+//   `full = common_detokenize(vocab, emitted_tokens, false)`, assert
+//   the prefix-stability invariant `full.starts_with(emitted_text)`,
+//   and emit `delta = full.substr(emitted_text.size())`. `delta` may
+//   legitimately be "" when a Unicode codepoint splits across BPE /
+//   byte-fallback tokens; the next token event delivers the assembled
+//   bytes in one go. Concatenation of all `token` chunks across a
+//   stream equals `common_detokenize(vocab, streamed_token_ids,
+//   false)` for that same generated token sequence — an in-stream
+//   identity by construction of the delta. In deterministic
+//   same-shape smoke tests the assembled stream therefore matches
+//   the same-shape non-streaming `text` field whenever token IDs /
+//   anchors match; cross-request equality is not asserted in the
+//   general case. The `token_id` field is unchanged and remains the
+//   authoritative per-event identifier. On a prefix-stability violation the handler
+//   fails closed (cancel + drain + no `done` record) rather than emit
+//   corrupt streaming text.
 //
 //   M7d wires client-disconnect cancellation through two cooperating
 //   detection paths and one shared finalize routine:
@@ -150,8 +166,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -174,6 +192,16 @@ struct server_args {
     // `parse_args` normalizes a zero/negative value to n_seq_max at the
     // end of argv parsing so the default tracks the engine concurrency.
     int32_t     max_concurrent    = 0;
+    // Slice F Option B: per-seq prefill row cap forwarded to
+    // engine_options::lib.prefill_budget_rows. Default 0 leaves the
+    // engine in its current observable behavior (unbounded /
+    // whole-prompt prefill in the live-admission build path). A value
+    // > 0 enables the experimental HPX-owned chunked-prefill cap. This
+    // is a diagnostic surface for the PrefillBudgetPolicy investigation
+    // (see docs/hpx/prefill_budget_policy_design.md /
+    // prefill_budget_policy_result.md); the slice does not recommend
+    // any specific value.
+    int32_t     prefill_budget_rows = 0;
     // N4: HPX worker count for hpx_runtime::start_once. Default 2
     // preserves M7a behavior byte-for-byte. Independent of --n-threads
     // (libllama compute). Must be >= 2 when --engine-pool is on; the
@@ -197,6 +225,14 @@ void print_usage(const char * argv0) {
         "  --n-threads <int>         default: 2  (libllama compute)\n"
         "  --max-concurrent <int>    default: --n-seq-max  (M7e: HTTP-layer in-flight cap)\n"
         "  --ctx-size <int>          default: 2048  (llama_context n_ctx)\n"
+        "  --prefill-budget-rows <int>  default: 0  (disabled / unbounded:\n"
+        "                            whole-prompt prefill in the live-admission\n"
+        "                            build path, current observable behavior).\n"
+        "                            > 0 enables the experimental HPX prefill\n"
+        "                            row cap (per-seq, per-iter) under the\n"
+        "                            PrefillBudgetPolicy investigation. No value\n"
+        "                            is recommended; provided as a diagnostic\n"
+        "                            surface only.\n"
         "  --hpx-os-threads <int>    default: 2  (N4: HPX worker count;\n"
         "                            independent of --n-threads. Must be\n"
         "                            >= 2 when --engine-pool is on.)\n"
@@ -243,6 +279,9 @@ bool parse_args(int argc, char ** argv, server_args & out) {
         } else if (a == "--ctx-size") {
             if (!need_value("--ctx-size")) return false;
             out.n_ctx = std::atoi(argv[++i]);
+        } else if (a == "--prefill-budget-rows") {
+            if (!need_value("--prefill-budget-rows")) return false;
+            out.prefill_budget_rows = std::atoi(argv[++i]);
         } else if (a == "--hpx-os-threads") {
             if (!need_value("--hpx-os-threads")) return false;
             out.hpx_os_threads = std::atoi(argv[++i]);
@@ -269,6 +308,10 @@ bool parse_args(int argc, char ** argv, server_args & out) {
     }
     if (out.max_prompt_tokens < 1) {
         fprintf(stderr, "error: --max-prompt-tokens must be >= 1\n");
+        return false;
+    }
+    if (out.prefill_budget_rows < 0) {
+        fprintf(stderr, "error: --prefill-budget-rows must be >= 0\n");
         return false;
     }
     if (out.n_ctx < 1) {
@@ -373,6 +416,164 @@ struct capacity_lease {
         }
     }
 };
+
+// ---- Phase 1 server-side serving-overhead diagnostics ------------------
+// Default-OFF. With LLAMA_HPX_DIAG_METRICS unset, server_diag_enabled()
+// returns false and every guarded site (chrono call, counter bump, JSON
+// formatting, file I/O) is a single not-taken branch. Identical env-
+// switch contract to the engine TU's diag_enabled / diag_path: same
+// variable names, same semantics.
+//
+// Per-request state lives on the stack for the non-streaming path (a
+// `request_metrics` POD local to the handler) and inside `stream_state`
+// for the streaming path (one `request_metrics` field plus a
+// `metrics_emitted` dedupe flag). No mutable file-scope state is
+// introduced anywhere — the only file-scope additions below are the
+// read-only env-switch caches and the pure dump helper.
+//
+// Emission policy: one JSONL row per request that reached
+// `eng.submit_request`. Pre-submit failures (400/422/payload-too-large,
+// 503 capacity-rejected, tokenization-empty) do NOT emit, because the
+// row's submit_us / n_decoded fields would be undefined. Document this
+// in the row schema rather than emit half-populated rows.
+//
+// Time axis: absolute steady_clock microseconds. Matches engine.cpp's
+// `now_us()` helper used by Exp-13 responsiveness timing, so engine-
+// side and server-side rows share a single process-level steady_clock
+// epoch. Engine per-iter rows use a *relative* axis
+// (t_us_from_engine_start_per_iter is delta from engine `t_start_`);
+// cross-axis alignment is a Phase 2 detail and can be done later by
+// stamping one engine-start absolute value into the engine_summary
+// row (out of scope here — would require touching engine.cpp again).
+bool server_diag_enabled() {
+    static const bool v = []() -> bool {
+        const char * e = std::getenv("LLAMA_HPX_DIAG_METRICS");
+        return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+}
+
+const char * server_diag_path() {
+    static const char * const v =
+        std::getenv("LLAMA_HPX_DIAG_METRICS_PATH");
+    return v;
+}
+
+// Phase 1 graceful-shutdown precursor. The real llama-hpx-server has no
+// signal handler — `srv.listen()` blocks until something inside the
+// process calls `srv.stop()`. Without that, killing the binary with
+// SIGINT skips the post-listen cleanup (`eng.request_shutdown` +
+// `engine_fut.get`), `engine::run()` never reaches its tail, and the
+// engine's `dump_metrics_jsonl(result_)` site never fires — leaving
+// every captured JSONL with `server_request` rows only and zero engine
+// `iter` / `engine_summary` rows (the Phase 1 caveat surfaced in the
+// real-server demo at local/runs/n6-phase1-diag/pass2-real-server/).
+//
+// This helper gates a diagnostic-only `POST /shutdown` endpoint behind
+// two env vars in conjunction:
+//   LLAMA_HPX_DIAG_METRICS         must be "1"
+//   LLAMA_HPX_DIAG_ENABLE_SHUTDOWN must be "1"
+//
+// Both required: setting only DIAG_METRICS does NOT enable the
+// endpoint. The two-key gate keeps the shutdown surface invisible to
+// any production deployment that turns on metrics without explicitly
+// opting into the operator-facing kill switch. The endpoint is
+// intentionally NOT registered when this returns false — the route
+// simply does not exist, so an unauthenticated POST gets the cpp-
+// httplib default 404. No signal handler is installed; cpp-httplib's
+// `srv.stop()` is called from the handler thread, which is the
+// supported safe entry point.
+bool server_diag_shutdown_enabled() {
+    static const bool v = []() -> bool {
+        if (!server_diag_enabled()) return false;
+        const char * e = std::getenv("LLAMA_HPX_DIAG_ENABLE_SHUTDOWN");
+        return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+}
+
+int64_t server_now_us() noexcept {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Per-request server-side metrics. POD-friendly. All fields default-
+// init to safe sentinels so a partial row (e.g. failed_reserved before
+// first token) is still well-formed JSONL. Used by both paths:
+//   * non-streaming: stack-local in the handler;
+//   * streaming: stored inside `stream_state` so the chunked-content
+//     provider, the in-provider sad-path finalize, and the M7d
+//     resource releaser all share the same accumulator.
+//
+// final_status is a pointer-to-static-string-literal (e.g.
+// "completed", "cancelled", "failed_reserved", "engine_error",
+// "stream_error", "prefix_violation"). No std::string allocation on
+// the hot path. The status_name() return value used elsewhere in this
+// TU is also a static string literal, so it is safe to copy into this
+// pointer without lifetime worries.
+struct request_metrics {
+    int32_t      request_id              = -1;
+    bool         stream                  = false;
+    int64_t      submit_us               = 0;
+    int64_t      first_token_us          = 0;
+    int64_t      completion_us           = 0;
+    int32_t      stream_channel_get_count = 0;
+    int32_t      sse_write_count         = 0;
+    int64_t      sse_write_bytes         = 0;
+    bool         disconnect_observed     = false;
+    bool         cancel_issued           = false;
+    const char * final_status            = "unknown";
+    int32_t      n_decoded               = 0;
+};
+
+// Emit one JSONL row to LLAMA_HPX_DIAG_METRICS_PATH (O_APPEND, line-
+// buffered) when set, stderr otherwise. Bare fprintf (no nlohmann::json
+// allocation on the hot path; mirrors engine.cpp's dump_metrics_jsonl).
+// Caller must have already verified server_diag_enabled().
+void dump_request_metrics_jsonl(const request_metrics & m) {
+    const char * path = server_diag_path();
+    FILE * fp = stderr;
+    bool   need_close = false;
+    if (path != nullptr && *path != '\0') {
+        FILE * f = std::fopen(path, "a");
+        if (f != nullptr) {
+            std::setvbuf(f, nullptr, _IOLBF, 0);
+            fp = f;
+            need_close = true;
+        }
+    }
+    std::fprintf(fp,
+        "{\"kind\":\"server_request\","
+        "\"request_id\":%d,"
+        "\"stream\":%s,"
+        "\"submit_us\":%lld,"
+        "\"first_token_us\":%lld,"
+        "\"completion_us\":%lld,"
+        "\"stream_channel_get_count\":%d,"
+        "\"sse_write_count\":%d,"
+        "\"sse_write_bytes\":%lld,"
+        "\"disconnect_observed\":%s,"
+        "\"cancel_issued\":%s,"
+        "\"final_status\":\"%s\","
+        "\"n_decoded\":%d}\n",
+        m.request_id,
+        m.stream ? "true" : "false",
+        static_cast<long long>(m.submit_us),
+        static_cast<long long>(m.first_token_us),
+        static_cast<long long>(m.completion_us),
+        m.stream_channel_get_count,
+        m.sse_write_count,
+        static_cast<long long>(m.sse_write_bytes),
+        m.disconnect_observed ? "true" : "false",
+        m.cancel_issued ? "true" : "false",
+        m.final_status != nullptr ? m.final_status : "unknown",
+        m.n_decoded);
+    if (need_close) {
+        std::fclose(fp);
+    } else {
+        std::fflush(fp);
+    }
+}
 
 // Lock-free CAS-bump-if-below-cap. On success returns an engaged
 // lease and bumps `peak` (best-effort, relaxed) + `accepted`. On
@@ -486,6 +687,12 @@ int main(int argc, char ** argv) {
     // placement; it causes a scheduler livelock on a dedicated single-
     // PU named pool (N2.6c evidence).
     opts.lib.cooperative_yield_on_pump = !args.engine_pool;
+    // Slice F Option B: forward the CLI-supplied prefill row cap to
+    // the engine. Default 0 leaves the engine in its current
+    // observable behavior (unbounded prefill). The engine ctor treats
+    // any value <= 0 as unbounded (see Slice C invariant in
+    // engine_options::lib.prefill_budget_rows).
+    opts.lib.prefill_budget_rows  = args.prefill_budget_rows;
     opts.preload.prompt_tokens    = nullptr;
     opts.preload.budgets          = {};
     opts.preload.waiting_queue    = &empty_waiting;
@@ -705,6 +912,25 @@ int main(int argc, char ** argv) {
             const int32_t rid =
                 next_rid.fetch_add(1, std::memory_order_relaxed);
 
+            // Phase 1 server diagnostics: stack-local accumulator,
+            // populated only when LLAMA_HPX_DIAG_METRICS=1. Submit
+            // timestamp is captured immediately before submit_request
+            // so it bookends the engine's view (the engine's per-iter
+            // t_us_from_engine_start uses its own t_start_ baseline;
+            // both ride the same process-level steady_clock epoch).
+            // For the non-streaming branch this stays a stack local
+            // released on handler return. For the streaming branch
+            // the populated copy is moved into stream_state below so
+            // the chunked provider, in-provider sad-path finalize, and
+            // the M7d resource releaser can all update / emit it under
+            // the same `metrics_emitted` dedupe flag.
+            request_metrics rmet;
+            if (server_diag_enabled()) {
+                rmet.request_id = rid;
+                rmet.stream     = stream_requested;
+                rmet.submit_us  = server_now_us();
+            }
+
             submit_request sr;
             sr.request_id    = rid;
             sr.prompt_tokens = std::move(tokens);
@@ -721,6 +947,11 @@ int main(int argc, char ** argv) {
                 try {
                     r = h.result.get();
                 } catch (const std::exception & e) {
+                    if (server_diag_enabled()) {
+                        rmet.completion_us = server_now_us();
+                        rmet.final_status  = "engine_error";
+                        dump_request_metrics_jsonl(rmet);
+                    }
                     send_error(res, 500, "engine_error", e.what());
                     return;
                 }
@@ -737,6 +968,13 @@ int main(int argc, char ** argv) {
                 out["text"]       = text;
                 res.status = 200;
                 res.set_content(out.dump(), "application/json");
+                if (server_diag_enabled()) {
+                    rmet.completion_us = server_now_us();
+                    rmet.final_status  = status_name(r.status);
+                    rmet.n_decoded     = r.n_decoded;
+                    if (r.request_id >= 0) rmet.request_id = r.request_id;
+                    dump_request_metrics_jsonl(rmet);
+                }
                 return;
             }
 
@@ -800,6 +1038,14 @@ int main(int argc, char ** argv) {
                 bool          cancel_issued     = false;
                 bool          result_consumed   = false;
                 bool          completed_cleanly = false;
+                // Cumulative-delta streaming detokenization state.
+                // Both fields are touched only from the cpp-httplib
+                // worker that owns this response's provider lambda
+                // (single-threaded per response; the resource releaser
+                // fires from ~Response strictly after the loop has
+                // exited). No new synchronization primitive.
+                std::vector<llama_token> emitted_tokens;
+                std::string              emitted_text;
                 // M7e: capacity lease moved here once we are committed
                 // to the SSE path. Destructor releases capacity exactly
                 // once when the shared_ptr<stream_state> refcount drops
@@ -810,10 +1056,28 @@ int main(int argc, char ** argv) {
                 // body so the M7d cancel/drain finalize routine has
                 // already run).
                 capacity_lease lease;
+                // Phase 1 server diagnostics. Lives in stream_state
+                // because four sites can finalize a streaming request:
+                // (a) the closed branch (happy path); (b) the in-
+                // provider prefix-violation finalize; (c) the in-
+                // provider sink.write-returned-false finalize; (d) the
+                // M7d resource releaser. metrics_emitted is the dedupe
+                // flag — whichever site finishes first stamps rmet,
+                // emits the JSONL row, and sets metrics_emitted=true;
+                // subsequent sites skip emission. Both fields are
+                // touched only from the cpp-httplib worker that owns
+                // this response (provider loop is single-threaded per
+                // response; the releaser fires strictly after the loop
+                // has exited). No new synchronization primitive.
+                request_metrics rmet;
+                bool            metrics_emitted = false;
             };
             auto state   = std::make_shared<stream_state>();
             state->h     = std::move(h);
             state->lease = std::move(lease);
+            if (server_diag_enabled()) {
+                state->rmet = rmet;
+            }
 
             res.status = 200;
             res.set_chunked_content_provider(
@@ -821,6 +1085,9 @@ int main(int argc, char ** argv) {
                 [state, vocab, &eng](size_t /*offset*/,
                                      httplib::DataSink & sink) -> bool {
                     token_stream_event ev;
+                    if (server_diag_enabled()) {
+                        state->rmet.stream_channel_get_count++;
+                    }
                     try {
                         ev = state->h.stream->get(hpx::launch::sync);
                     } catch (const std::exception &) {
@@ -832,23 +1099,136 @@ int main(int argc, char ** argv) {
                         if (state->sink_alive) {
                             sink.done();
                         }
+                        // Phase 1: leave metrics_emitted=false so the
+                        // M7d resource releaser owns the JSONL row.
+                        // final_status will be set there if r is
+                        // unavailable (releaser tags "stream_error"
+                        // when result.get() also fails).
                         return false;
                     }
 
                     if (ev.kind == stream_event_kind::token) {
                         if (state->sink_alive) {
-                            const std::string text = common_detokenize(
-                                vocab,
-                                std::vector<llama_token>{ev.token_id},
+                            // Cumulative-detokenization delta scheme.
+                            // The cumulative `common_detokenize` owns
+                            // every tokenizer-specific rule (byte-
+                            // fallback assembly, leading-space glue,
+                            // special-token suppression under
+                            // special=false, trailing-whitespace
+                            // policy). The handler only emits the new
+                            // visible byte-substring.
+                            //
+                            // Prefix-stability invariant: each new
+                            // cumulative detokenization must extend
+                            // the previously emitted cumulative text
+                            // byte-for-byte. A future detokenizer
+                            // edge case that violates the invariant
+                            // fails closed below rather than corrupt
+                            // the wire stream.
+                            state->emitted_tokens.push_back(ev.token_id);
+                            std::string full = common_detokenize(
+                                vocab, state->emitted_tokens,
                                 /*special=*/false);
+                            const bool prefix_ok =
+                                full.size() >= state->emitted_text.size()
+                             && std::memcmp(
+                                    full.data(),
+                                    state->emitted_text.data(),
+                                    state->emitted_text.size()) == 0;
+                            if (!prefix_ok) {
+                                // Surface through the existing env-
+                                // gated trace (free-form printf-style
+                                // `fmt`; no trace.{h,cpp} edits). Run
+                                // the standard M7d cancel/drain
+                                // finalize routine and return false
+                                // without emitting a `done` record —
+                                // the wire bytes are already
+                                // unrecoverable, so finalizing as
+                                // "completed" would be a lie.
+                                trace::event(
+                                    "stream_detokenize_prefix_violation"
+                                    " request=%d token_id=%d"
+                                    " emitted_bytes=%zu"
+                                    " new_full_bytes=%zu",
+                                    state->h.token.request_id,
+                                    ev.token_id,
+                                    state->emitted_text.size(),
+                                    full.size());
+                                state->sink_alive = false;
+                                if (!state->cancel_issued) {
+                                    state->h.cancel(eng);
+                                    state->cancel_issued = true;
+                                    if (server_diag_enabled()) {
+                                        state->rmet.cancel_issued = true;
+                                    }
+                                }
+                                while (true) {
+                                    token_stream_event drain_ev;
+                                    if (server_diag_enabled()) {
+                                        state->rmet
+                                            .stream_channel_get_count++;
+                                    }
+                                    try {
+                                        drain_ev =
+                                            state->h.stream->get(
+                                                hpx::launch::sync);
+                                    } catch (
+                                        const std::exception &) {
+                                        break;
+                                    }
+                                    if (drain_ev.kind ==
+                                          stream_event_kind::closed) {
+                                        break;
+                                    }
+                                }
+                                if (!state->result_consumed) {
+                                    try {
+                                        request_result fr =
+                                            state->h.result.get();
+                                        if (server_diag_enabled()) {
+                                            state->rmet.n_decoded =
+                                                fr.n_decoded;
+                                            state->rmet.final_status =
+                                                status_name(fr.status);
+                                            if (fr.request_id >= 0) {
+                                                state->rmet.request_id =
+                                                    fr.request_id;
+                                            }
+                                        }
+                                    } catch (
+                                        const std::exception &) {}
+                                    state->result_consumed = true;
+                                }
+                                // Phase 1: in-provider prefix-violation
+                                // exit. Leave metrics_emitted=false so
+                                // the M7d resource releaser emits the
+                                // JSONL row exactly once — keeps the
+                                // dedupe contract centralized in one
+                                // place rather than scattered across
+                                // every sad-path return.
+                                return false;
+                            }
+                            const std::string delta =
+                                full.substr(state->emitted_text.size());
+                            state->emitted_text = std::move(full);
                             nlohmann::json data;
-                            data["token"]    = text;
+                            data["token"]    = delta;
                             data["token_id"] = ev.token_id;
                             std::string payload =
                                 "event: token\ndata: " + data.dump()
                               + "\n\n";
                             if (sink.write(payload.data(),
                                            payload.size())) {
+                                if (server_diag_enabled()) {
+                                    state->rmet.sse_write_count++;
+                                    state->rmet.sse_write_bytes +=
+                                        static_cast<int64_t>(
+                                            payload.size());
+                                    if (state->rmet.first_token_us == 0) {
+                                        state->rmet.first_token_us =
+                                            server_now_us();
+                                    }
+                                }
                                 return true;
                             }
                             // ---- M7d (in-provider disconnect) ------
@@ -857,13 +1237,22 @@ int main(int argc, char ** argv) {
                             // chunked write loop chooses not to call
                             // us again.
                             state->sink_alive = false;
+                            if (server_diag_enabled()) {
+                                state->rmet.disconnect_observed = true;
+                            }
                             if (!state->cancel_issued) {
                                 state->h.cancel(eng);
                                 state->cancel_issued = true;
+                                if (server_diag_enabled()) {
+                                    state->rmet.cancel_issued = true;
+                                }
                             }
                         }
                         while (true) {
                             token_stream_event drain_ev;
+                            if (server_diag_enabled()) {
+                                state->rmet.stream_channel_get_count++;
+                            }
                             try {
                                 drain_ev = state->h.stream->get(
                                     hpx::launch::sync);
@@ -877,10 +1266,24 @@ int main(int argc, char ** argv) {
                         }
                         if (!state->result_consumed) {
                             try {
-                                (void)state->h.result.get();
+                                request_result fr =
+                                    state->h.result.get();
+                                if (server_diag_enabled()) {
+                                    state->rmet.n_decoded = fr.n_decoded;
+                                    state->rmet.final_status =
+                                        status_name(fr.status);
+                                    if (fr.request_id >= 0) {
+                                        state->rmet.request_id =
+                                            fr.request_id;
+                                    }
+                                }
                             } catch (const std::exception &) {}
                             state->result_consumed = true;
                         }
+                        // Phase 1: in-provider sink.write-returned-false
+                        // exit. Leave metrics_emitted=false so the M7d
+                        // resource releaser emits the JSONL row exactly
+                        // once.
                         return false;
                     }
 
@@ -915,8 +1318,43 @@ int main(int argc, char ** argv) {
                           + "\n\n";
                         sink.write(payload.data(), payload.size());
                         sink.done();
+                        if (server_diag_enabled()) {
+                            // The `done` SSE record is unchecked
+                            // (sink.write return value ignored per M7d
+                            // contract), so the wire bytes may not
+                            // have actually landed. Count it the same
+                            // way: one chunked-write attempt with the
+                            // full payload size, matching how analysis
+                            // code interprets sse_write_bytes (bytes
+                            // handed to cpp-httplib, not bytes ACKed).
+                            state->rmet.sse_write_count++;
+                            state->rmet.sse_write_bytes +=
+                                static_cast<int64_t>(payload.size());
+                        }
                     }
                     state->completed_cleanly = true;
+                    // Phase 1: happy-path JSONL emission. metrics_emitted
+                    // dedupes against the M7d resource releaser, which
+                    // also fires on this path but short-circuits via
+                    // completed_cleanly before reaching its own
+                    // emission site.
+                    if (server_diag_enabled()
+                     && !state->metrics_emitted) {
+                        state->rmet.completion_us = server_now_us();
+                        if (result_ok) {
+                            state->rmet.n_decoded    = r.n_decoded;
+                            state->rmet.final_status =
+                                status_name(r.status);
+                            if (r.request_id >= 0) {
+                                state->rmet.request_id = r.request_id;
+                            }
+                        } else if (state->rmet.final_status
+                                   == request_metrics{}.final_status) {
+                            state->rmet.final_status = "engine_error";
+                        }
+                        dump_request_metrics_jsonl(state->rmet);
+                        state->metrics_emitted = true;
+                    }
                     return false;
                 },
                 // M7d resource releaser: fires from `~Response`
@@ -934,12 +1372,28 @@ int main(int argc, char ** argv) {
                         return;
                     }
                     state->sink_alive = false;
+                    if (server_diag_enabled()) {
+                        // Releaser-without-clean-close means cpp-httplib
+                        // either observed !strm.is_peer_alive() between
+                        // provider invocations, or the provider's own
+                        // in-provider sad-path already set
+                        // disconnect_observed=true (idempotent re-set).
+                        // Either way, the server saw the request go
+                        // away without delivering a `done` record.
+                        state->rmet.disconnect_observed = true;
+                    }
                     if (!state->cancel_issued) {
                         state->h.cancel(eng);
                         state->cancel_issued = true;
+                        if (server_diag_enabled()) {
+                            state->rmet.cancel_issued = true;
+                        }
                     }
                     while (true) {
                         token_stream_event drain_ev;
+                        if (server_diag_enabled()) {
+                            state->rmet.stream_channel_get_count++;
+                        }
                         try {
                             drain_ev = state->h.stream->get(
                                 hpx::launch::sync);
@@ -953,25 +1407,103 @@ int main(int argc, char ** argv) {
                     }
                     if (!state->result_consumed) {
                         try {
-                            (void)state->h.result.get();
+                            request_result fr =
+                                state->h.result.get();
+                            if (server_diag_enabled()) {
+                                state->rmet.n_decoded = fr.n_decoded;
+                                state->rmet.final_status =
+                                    status_name(fr.status);
+                                if (fr.request_id >= 0) {
+                                    state->rmet.request_id =
+                                        fr.request_id;
+                                }
+                            }
                         } catch (const std::exception &) {}
                         state->result_consumed = true;
                     }
+                    // Phase 1: catch-all JSONL emission. Fires for
+                    // every streaming exit path except the happy
+                    // closed branch (which short-circuited above via
+                    // completed_cleanly). metrics_emitted dedupe is
+                    // belt-and-suspenders here — the happy path is
+                    // the only other site that emits, and it sets
+                    // completed_cleanly before doing so, so this
+                    // branch can only reach the emit site when
+                    // metrics_emitted is still false. Kept for
+                    // defense-in-depth against future refactors.
+                    if (server_diag_enabled()
+                     && !state->metrics_emitted) {
+                        state->rmet.completion_us = server_now_us();
+                        if (state->rmet.final_status
+                            == request_metrics{}.final_status) {
+                            // Result.get() either threw or was never
+                            // available (e.g. provider's stream.get
+                            // threw at line ~849 and the result
+                            // promise also failed). Tag explicitly.
+                            state->rmet.final_status = "stream_error";
+                        }
+                        dump_request_metrics_jsonl(state->rmet);
+                        state->metrics_emitted = true;
+                    }
                 });
         });
+
+        // Phase 1 graceful-shutdown precursor. Endpoint registration
+        // is GATED by server_diag_shutdown_enabled() — true iff BOTH
+        // LLAMA_HPX_DIAG_METRICS=1 AND LLAMA_HPX_DIAG_ENABLE_SHUTDOWN=1.
+        // When the gate is closed the route is not registered at all,
+        // so cpp-httplib returns its default 404 to any POST /shutdown.
+        // When open: handler emits a small JSON ack, then calls
+        // srv.stop() from the cpp-httplib handler thread — that is
+        // the supported safe entry point per cpp-httplib's contract.
+        // srv.stop() sets the accept-loop's atomic stop flag; the
+        // in-flight response still flushes, srv.listen() returns
+        // cleanly, the post-listen cleanup (eng.request_shutdown +
+        // engine_fut.get) runs, engine::run() reaches its tail, and
+        // dump_metrics_jsonl(result_) emits the engine iter rows
+        // and engine_summary row that were previously inaccessible
+        // when the operator killed the binary with SIGINT.
+        //
+        // No signal handler is installed. No always-on production
+        // shutdown endpoint is exposed.
+        if (server_diag_shutdown_enabled()) {
+            fprintf(stderr,
+                "[hpx-server] diagnostic /shutdown endpoint enabled "
+                "(LLAMA_HPX_DIAG_METRICS=1 AND "
+                "LLAMA_HPX_DIAG_ENABLE_SHUTDOWN=1)\n");
+            fflush(stderr);
+            srv.Post("/shutdown",
+                     [&srv](const httplib::Request & /*req*/,
+                            httplib::Response &       res) {
+                nlohmann::json out;
+                out["status"] = "shutting_down";
+                res.status = 200;
+                res.set_content(out.dump(), "application/json");
+                // cpp-httplib's srv.stop() is thread-safe and is the
+                // documented way to drive a graceful exit from a
+                // request handler. The accept loop observes the stop
+                // flag and exits AFTER this handler's response has
+                // been flushed by the worker thread.
+                srv.stop();
+            });
+        }
 
         // listen() blocks the calling thread (main) until somebody
         // calls srv.stop(). M7a has no signal handler; an operator
         // running the binary by hand terminates it externally. The
         // server smokes drive srv.stop() through normal control
         // flow from a separate task — see hpx_server_smoke.cpp.
+        // Phase 1 diagnostic precursor (above): when the env-gated
+        // /shutdown endpoint is registered, a POST request drives
+        // srv.stop() through normal control flow without any signal
+        // involvement.
         fprintf(stderr,
             "[hpx-server] listening on %s:%d  "
             "(n_seq_max=%d max_prompt_tokens=%d batch_capacity=%d "
-            "max_concurrent=%d n_ctx=%d)\n",
+            "max_concurrent=%d n_ctx=%d prefill_budget_rows=%d)\n",
             args.host.c_str(), args.port,
             args.n_seq_max, args.max_prompt_tokens, batch_capacity,
-            args.max_concurrent, args.n_ctx);
+            args.max_concurrent, args.n_ctx, args.prefill_budget_rows);
         fflush(stderr);
         const bool ok = srv.listen(args.host, args.port);
         if (!ok) {

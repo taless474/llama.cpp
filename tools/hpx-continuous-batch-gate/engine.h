@@ -156,6 +156,20 @@ struct engine_options {
         // benchmark binary so existing gates do not pay extra clock
         // reads.
         bool                enable_responsiveness_timing = false;
+        // Slice C: per-seq chunked-prefill row budget for the live-
+        // admission build path (engine.cpp iter_build_batch). Default 0
+        // means unbounded — the whole prompt is placed in the admission
+        // iter, preserving current observable behavior (same smokes, same
+        // b8 anchor, same streaming/cancel behavior, same diagnostics).
+        // A value B > 0 caps each iter at B prompt rows for a given seq,
+        // so a long prompt is prefilled across multiple iters; the seq
+        // is not sampled until its prefill completes. Consulted ONLY in
+        // the live-admission Path A; the preloaded whole-prompt path is
+        // unchanged and ignores this. No server CLI/env surface in this
+        // slice — set directly via engine_options. Values <= 0 are
+        // treated as unbounded. See
+        // docs/hpx/prefill_budget_policy_design.md §4.
+        int32_t             prefill_budget_rows = 0;
     } lib;
 
     // M4e: preload bucket. Ctor-time seeding for the gate / preload
@@ -675,6 +689,14 @@ private:
     // gate, hpx-server, M8 configs); set true only by the dedicated
     // responsiveness benchmark binary.
     bool                                            enable_responsiveness_timing_ = false;
+    // Slice C: copied once from engine_options::lib.prefill_budget_rows
+    // at construction. 0 (and any <= 0) means unbounded whole-prompt
+    // prefill — current behavior. A value B > 0 caps the live-admission
+    // prefill build (iter_build_batch) at B prompt rows per iter for a
+    // seq, so prefill spans multiple iters and the seq is held out of
+    // sampling until prefill_complete. Engine-task-only; read only on
+    // the Path A build site.
+    int32_t                                         prefill_budget_rows_ = 0;
     // M3b: queued-before-admission cancellation set, engine-task-
     // only. Populated by drain_cancel_inbox() from
     // staged_cancel_rids_; consumed by apply_queued_cancellations

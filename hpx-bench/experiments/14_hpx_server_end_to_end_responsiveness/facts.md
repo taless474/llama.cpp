@@ -152,6 +152,8 @@ results/<run_id>/
   "workloads":        ["..."],
   "decode_budgets":   [8, 64],
   "w3_decode_budget": 128,
+  "w3_post_disconnect_sleep_s": 2.0,
+  "w3_between_trial_mode":      "sleep" | "capfree",
   "trials":           30,
   "warmup_trials":    1,
   "placement_trace_engine_pool": true|false,
@@ -173,6 +175,11 @@ results/<run_id>/
       "trials_done_seen":   <int>      // W2 only
       "w3_sanity_ok":       true|false // W3 only
       "w3_sanity_hash_ok":  true|false // W3 only
+      "w3_probe_attempts":  <int>|null // W3 + capfree only; null otherwise
+      "w3_probe_ok":        <int>|null // W3 + capfree only; null otherwise
+      "w3_probe_max_ms":    <float>|null // max observed wait_for_cap_free
+                                         // elapsed_ms across the cell;
+                                         // null until the first probe
       "exit_code":          <int>,
       "term_method":        "sigterm|sigkill|already_exited",
       "placement_trace_seen": true|false  // engine_pool_os2 only
@@ -188,10 +195,13 @@ One row per request (warmups + measured + the W3 sanity request).
 ```text
 {
   "mode":                 "<mode>",
-  "workload":             "<w1|w2|w3|w3_sanity>",
+  "workload":             "<w1|w2|w3|w3_sanity|w3_probe>",
   "decode_budget":        <int>,
   "iteration":            <int>             // 0 = warmup if --warmup-trials > 0
-  "is_warmup":            true|false,
+                                            // w3_probe pre_sanity: -1
+                                            // w3_probe between_trial: index of trial just completed
+  "is_warmup":            true|false,       // w3_probe between_trial: matches the trial just completed
+                                            // w3_probe pre_sanity: false
   "ts_utc":               "<iso>",
   "request_start_monotonic": <float seconds>,
   "request_body":         {...},
@@ -209,6 +219,11 @@ One row per request (warmups + measured + the W3 sanity request).
   // W3 only:
   "disconnect_ms":        <float>,
   "bytes_received":       <int>,
+  // w3_probe only (capfree mode):
+  "probe_phase":          "<between_trial|pre_sanity>",
+  "probe_ok":             true|false,       // wait_for_cap_free return
+  "probe_elapsed_ms":     <float>,          // monotonic call duration
+  "probe_timeout_s":      <float>,          // 30.0 in the current harness
   // correctness fingerprints:
   "n_decoded":            <int>,
   "hash":                 "<str>",
@@ -218,6 +233,11 @@ One row per request (warmups + measured + the W3 sanity request).
   "stream_parse_error":   ""
 }
 ```
+
+`w3_probe` and `w3_sanity` rows are excluded from `summary.csv`
+aggregation. Probe outcomes are summarized into the per-cell manifest
+counters (`w3_probe_attempts`, `w3_probe_ok`, `w3_probe_max_ms`); sanity
+outcomes into `w3_sanity_ok` / `w3_sanity_hash_ok`.
 
 ## summary.csv schema
 
@@ -282,12 +302,29 @@ W3:  first_event_ms, disconnect_ms, bytes_received
   correctness/regression slice — likely a dedicated
   `hpx_server_multi_cycle_disconnect_smoke` or an engine-level
   reproducer — and is tracked outside Phase 1.
-- Update: this admission issue is now tracked as **N5a** (cancel_freed
-  → natural completion slot recovery) and remains **deferred / not
-  fixed**. A separate engine shutdown-liveness issue found while building
-  the N5 reproducer (**N5b** — a queued-but-unadmittable request
-  blocking `request_shutdown`) has been **isolated and fixed**
-  (`docs/hpx/n5_deferred_slot_recovery_note.md`). The W3 fixed-sleep
-  workaround below remains in place; it is the N5a admission issue, not
-  N5b, that keeps it necessary.
+- Update: this admission issue was tracked as **N5a** (cancel_freed
+  → natural completion slot recovery) and is now **fixed**
+  (`finalize_and_fulfill` returns idle-origin slots to `free_idle_` by
+  seq_id range, so a `cancel_freed`-admitted slot that completes
+  naturally is recovered for later admission). A separate engine
+  shutdown-liveness issue found while building the N5 reproducer
+  (**N5b** — a queued-but-unadmittable request blocking
+  `request_shutdown`) was **isolated and fixed** first; the N5b
+  `failed_reserved` shutdown drain is what makes the N5a pre-fix red
+  clean (`docs/hpx/n5_deferred_slot_recovery_note.md`). The W3
+  fixed-sleep workaround below predates the N5a fix and is retained for
+  Phase 1; it has not been re-tuned and this records no performance
+  claim.
+- Post-N5a/N5b, `bench.py` accepts `--w3-between-trial-mode {sleep,
+  capfree}`. Default remains `sleep` to preserve Phase 1 behavior and
+  the `--w3-post-disconnect-sleep` knob. The new `capfree` mode
+  restores the original `wait_for_cap_free` probe between W3
+  disconnect trials and before the W3 post-cell sanity POST. Each
+  probe writes a `workload="w3_probe"` row to the cell JSONL and
+  updates the per-cell `w3_probe_attempts` / `w3_probe_ok` /
+  `w3_probe_max_ms` manifest counters; a single failed probe fails
+  the cell loudly via the PASS/FAIL gate. The `capfree` mode is
+  intended for refresh validation that the N5a fix removed the
+  admission bug that originally motivated the fixed sleep; no
+  performance claim is attached to it.
 - This is a harness decision and not a performance claim.

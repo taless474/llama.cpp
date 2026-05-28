@@ -1,15 +1,34 @@
-// hpx_server_stream_smoke.cpp — M7c in-process SSE round-trip smoke
-// for llama-hpx-server.
+// hpx_server_stream_smoke.cpp — in-process SSE round-trip smoke for
+// llama-hpx-server. Covers the cumulative-delta streaming
+// detokenization contract.
 //
-// Boots model + engine + cpp-httplib server in-process, drives a
-// single `POST /completion` with `"stream": true`, and asserts:
-//   - HTTP 200,
-//   - `Content-Type` starts with `text/event-stream`,
-//   - at least one SSE record with `event: token` whose `data:` body
-//     parses to JSON containing an integer `token_id`,
-//   - the terminal SSE record is `event: done` with `data:` parsing
-//     to `{status:"completed", n_decoded:8,
-//          hash:"0x0619d4d1900c2365"}` (greedy canonical budget-8).
+// Boots model + engine + cpp-httplib server in-process. For each of
+// two canonical TinyLlama greedy shapes — `p0_b8` (budget=8,
+// hash=0x0619d4d1900c2365) and `p0_b16` (budget=16,
+// hash=0x833045f1e2ebf49f) — drives one streaming `POST /completion`
+// and one direct same-shape non-streaming `eng.submit_request`
+// (in-process engine API; no second HTTP path), then asserts:
+//   - HTTP 200, `Content-Type: text/event-stream` on the streaming
+//     response,
+//   - every non-terminal SSE record is `event: token` with `data:`
+//     containing an integer `token_id` and a string `token` (the
+//     cumulative-detokenization delta — may be ""),
+//   - prefix stability across the streamed prefix: for every i,
+//     `common_detokenize(vocab, streamed_token_ids[0..i], false)`
+//     starts with the previously assembled cumulative text and
+//     extends it by exactly the i-th `data["token"]` delta,
+//   - in-stream identity: assembled streamed text equals
+//     `common_detokenize(vocab, streamed_token_ids, false)`,
+//   - same-shape equality: assembled streamed text equals
+//     `common_detokenize(vocab, r.generated_tokens, false)`
+//     byte-for-byte against the direct engine `request_result`,
+//   - token-id equality: streamed `token_id` sequence equals the
+//     direct engine `r.generated_tokens` (deterministic greedy →
+//     exact equality),
+//   - terminal SSE record is `event: done` with
+//     `status:"completed"`, `n_decoded == decode_budget`, and
+//     `hash == canonical` for the shape; the engine `request_result`
+//     hash also equals the canonical.
 //
 // HPX-nativity boundary (mirrors hpx-server.cpp):
 //   cpp-httplib is the explicit non-HPX network adapter boundary; this
@@ -255,6 +274,8 @@ int main(int argc, char ** argv) {
 
     constexpr const char * k_canonical_greedy_b8 =
         "0x0619d4d1900c2365";
+    constexpr const char * k_canonical_greedy_b16 =
+        "0x833045f1e2ebf49f";
 
     try {
         engine eng(std::move(opts));
@@ -365,6 +386,12 @@ int main(int argc, char ** argv) {
             struct stream_state {
                 submit_handle h;
                 bool          sink_alive = true;
+                // Cumulative-delta streaming detokenization state,
+                // mirroring hpx-server.cpp. Touched only from the
+                // single cpp-httplib worker that owns this response's
+                // provider lambda.
+                std::vector<llama_token> emitted_tokens;
+                std::string              emitted_text;
             };
             auto state = std::make_shared<stream_state>();
             state->h   = std::move(h);
@@ -384,12 +411,49 @@ int main(int argc, char ** argv) {
 
                     if (ev.kind == stream_event_kind::token) {
                         if (!state->sink_alive) return true;
-                        const std::string text = common_detokenize(
-                            vocab,
-                            std::vector<llama_token>{ev.token_id},
+                        // Cumulative-detokenization delta scheme,
+                        // mirroring hpx-server.cpp. The cumulative
+                        // `common_detokenize` owns every
+                        // tokenizer-specific rule; the handler only
+                        // emits the new visible byte-substring.
+                        state->emitted_tokens.push_back(ev.token_id);
+                        std::string full = common_detokenize(
+                            vocab, state->emitted_tokens,
                             /*special=*/false);
+                        const bool prefix_ok =
+                            full.size() >= state->emitted_text.size()
+                         && std::memcmp(
+                                full.data(),
+                                state->emitted_text.data(),
+                                state->emitted_text.size()) == 0;
+                        if (!prefix_ok) {
+                            // Mirror the production fail-closed
+                            // intent: stop emitting and let the
+                            // client-side prefix-stability gate
+                            // surface the failure. The smoke handler
+                            // does not exercise the full M7d
+                            // cancel/drain routine, so we simply
+                            // mark the sink dead and return false;
+                            // the missing `done` record will trip
+                            // the outer assertions.
+                            fprintf(stderr,
+                                "[smoke handler] "
+                                "stream_detokenize_prefix_violation"
+                                " request=%d token_id=%d"
+                                " emitted_bytes=%zu"
+                                " new_full_bytes=%zu\n",
+                                state->h.token.request_id,
+                                ev.token_id,
+                                state->emitted_text.size(),
+                                full.size());
+                            state->sink_alive = false;
+                            return false;
+                        }
+                        const std::string delta =
+                            full.substr(state->emitted_text.size());
+                        state->emitted_text = std::move(full);
                         nlohmann::json data;
-                        data["token"]    = text;
+                        data["token"]    = delta;
                         data["token_id"] = ev.token_id;
                         std::string payload =
                             "event: token\ndata: " + data.dump()
@@ -447,147 +511,311 @@ int main(int argc, char ** argv) {
         cli.set_read_timeout(60, 0);
         cli.set_write_timeout(30, 0);
 
-        nlohmann::json req_body;
-        req_body["prompt"]        = "Hello, my name is";
-        req_body["decode_budget"] = 8;
-        req_body["stream"]        = true;
-
-        auto resp = cli.Post("/completion", req_body.dump(),
-                             "application/json");
-
-        srv.stop();
-        listen_fut.get();
-
-        auto cleanup_engine_and_fail =
-            [&](const std::string & reason) -> int {
+        auto end_test_cleanup = [&]() {
+            srv.stop();
+            listen_fut.get();
             eng.request_shutdown();
             engine_fut.get();
+        };
+
+        auto cleanup_and_fail_round =
+            [&](const std::string & reason) -> int {
+            end_test_cleanup();
             return fail_and_cleanup(reason);
         };
 
-        if (!resp) {
-            char buf[200];
-            std::snprintf(buf, sizeof(buf),
-                "client.Post failed (error=%d)",
-                static_cast<int>(resp.error()));
-            return cleanup_engine_and_fail(buf);
-        }
-        if (resp->status != 200) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf),
-                "HTTP status=%d (expected 200), body=%s",
-                resp->status, resp->body.c_str());
-            return cleanup_engine_and_fail(buf);
-        }
+        struct round_spec {
+            int32_t      decode_budget;
+            const char * canonical_hash;
+            const char * label;
+        };
+        const round_spec rounds[] = {
+            { 8,  k_canonical_greedy_b8,  "p0_b8"  },
+            { 16, k_canonical_greedy_b16, "p0_b16" },
+        };
 
-        const std::string ctype =
-            resp->get_header_value("Content-Type");
-        if (ctype.rfind("text/event-stream", 0) != 0) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf),
-                "Content-Type='%s' (expected prefix "
-                "text/event-stream)", ctype.c_str());
-            return cleanup_engine_and_fail(buf);
-        }
+        // Per-round: HTTP streaming POST → walk SSE records with the
+        // prefix-stability + in-stream-identity assertions; then a
+        // direct in-process engine non-streaming submit for the same
+        // shape to obtain the authoritative `r.generated_tokens` and
+        // `r.hash`, against which the streamed token-id sequence and
+        // assembled streamed text are asserted byte-for-byte.
+        auto do_round = [&](const round_spec & rs) -> std::string {
+            const std::string prompt = "Hello, my name is";
 
-        const std::vector<std::string> records =
-            split_sse_records(resp->body);
-        if (records.empty()) {
-            return cleanup_engine_and_fail(
-                "SSE body parsed to zero records");
-        }
-
-        size_t token_event_count = 0;
-        bool   seen_token_with_id = false;
-        for (size_t i = 0; i + 1 < records.size(); i++) {
-            const sse_record sr = parse_sse_record(records[i]);
-            if (sr.event_name != "token") {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf),
-                    "record[%zu] event='%s' (expected 'token')",
-                    i, sr.event_name.c_str());
-                return cleanup_engine_and_fail(buf);
-            }
-            nlohmann::json data;
-            try {
-                data = nlohmann::json::parse(sr.data);
-            } catch (const std::exception & e) {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf),
-                    "record[%zu] data parse failed: %s",
-                    i, e.what());
-                return cleanup_engine_and_fail(buf);
-            }
-            if (!data.contains("token_id")
-             || !data["token_id"].is_number_integer()) {
+            nlohmann::json sreq;
+            sreq["prompt"]        = prompt;
+            sreq["decode_budget"] = rs.decode_budget;
+            sreq["stream"]        = true;
+            auto sresp = cli.Post("/completion", sreq.dump(),
+                                  "application/json");
+            if (!sresp) {
                 char buf[200];
                 std::snprintf(buf, sizeof(buf),
-                    "record[%zu] missing integer 'token_id'", i);
-                return cleanup_engine_and_fail(buf);
+                    "streaming client.Post failed (error=%d)",
+                    static_cast<int>(sresp.error()));
+                return buf;
             }
-            seen_token_with_id = true;
-            token_event_count++;
+            if (sresp->status != 200) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "streaming HTTP status=%d (expected 200), body=%s",
+                    sresp->status, sresp->body.c_str());
+                return buf;
+            }
+            const std::string ctype =
+                sresp->get_header_value("Content-Type");
+            if (ctype.rfind("text/event-stream", 0) != 0) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "Content-Type='%s' (expected prefix "
+                    "text/event-stream)", ctype.c_str());
+                return buf;
+            }
+
+            const std::vector<std::string> records =
+                split_sse_records(sresp->body);
+            if (records.empty()) {
+                return "SSE body parsed to zero records";
+            }
+
+            std::vector<llama_token> streamed_token_ids;
+            std::string              assembled;
+            size_t                   token_event_count = 0;
+
+            for (size_t i = 0; i + 1 < records.size(); i++) {
+                const sse_record rec = parse_sse_record(records[i]);
+                if (rec.event_name != "token") {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf),
+                        "record[%zu] event='%s' (expected 'token')",
+                        i, rec.event_name.c_str());
+                    return buf;
+                }
+                nlohmann::json data;
+                try {
+                    data = nlohmann::json::parse(rec.data);
+                } catch (const std::exception & e) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf),
+                        "record[%zu] data parse failed: %s",
+                        i, e.what());
+                    return buf;
+                }
+                if (!data.contains("token_id")
+                 || !data["token_id"].is_number_integer()) {
+                    char buf[200];
+                    std::snprintf(buf, sizeof(buf),
+                        "record[%zu] missing integer 'token_id'", i);
+                    return buf;
+                }
+                if (!data.contains("token")
+                 || !data["token"].is_string()) {
+                    char buf[200];
+                    std::snprintf(buf, sizeof(buf),
+                        "record[%zu] missing string 'token'", i);
+                    return buf;
+                }
+                const int32_t     tid   =
+                    data["token_id"].get<int32_t>();
+                const std::string delta =
+                    data["token"].get<std::string>();
+
+                // Client-side prefix-stability gate:
+                //   common_detokenize(vocab, ids[0..=i], false) must
+                //   start with `assembled` and extend it by exactly
+                //   the wire `delta`. Either failure implies a
+                //   handler bug or a tokenizer edge case the slice
+                //   has not characterized.
+                streamed_token_ids.push_back(tid);
+                const std::string local_full = common_detokenize(
+                    vocab, streamed_token_ids, /*special=*/false);
+                if (local_full.size() < assembled.size()
+                 || std::memcmp(local_full.data(), assembled.data(),
+                                assembled.size()) != 0) {
+                    char buf[320];
+                    std::snprintf(buf, sizeof(buf),
+                        "prefix-stability violation at record[%zu] "
+                        "token_id=%d: local_full(len=%zu) does not "
+                        "start with assembled(len=%zu)",
+                        i, tid, local_full.size(),
+                        assembled.size());
+                    return buf;
+                }
+                const size_t expected_delta_len =
+                    local_full.size() - assembled.size();
+                if (delta.size() != expected_delta_len
+                 || std::memcmp(
+                        local_full.data() + assembled.size(),
+                        delta.data(), delta.size()) != 0) {
+                    char buf[320];
+                    std::snprintf(buf, sizeof(buf),
+                        "delta mismatch at record[%zu] token_id=%d: "
+                        "wire_delta(len=%zu) != local_full tail "
+                        "(len=%zu)",
+                        i, tid, delta.size(), expected_delta_len);
+                    return buf;
+                }
+                assembled += delta;
+                token_event_count++;
+            }
+
+            if (token_event_count == 0) {
+                return "no SSE token records";
+            }
+
+            // In-stream identity gate.
+            {
+                const std::string final_full = common_detokenize(
+                    vocab, streamed_token_ids, /*special=*/false);
+                if (assembled != final_full) {
+                    return "assembled streamed text != "
+                           "common_detokenize(streamed_token_ids)";
+                }
+            }
+
+            // done record
+            const sse_record done_rec =
+                parse_sse_record(records.back());
+            if (done_rec.event_name != "done") {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                    "terminal event='%s' (expected 'done')",
+                    done_rec.event_name.c_str());
+                return buf;
+            }
+            nlohmann::json done_data;
+            try {
+                done_data = nlohmann::json::parse(done_rec.data);
+            } catch (const std::exception & e) {
+                return std::string("done.data parse failed: ")
+                     + e.what();
+            }
+            if (!done_data.contains("status")
+             || !done_data["status"].is_string()
+             || done_data["status"].get<std::string>()
+                  != "completed") {
+                return "done.status != \"completed\"";
+            }
+            if (!done_data.contains("n_decoded")
+             || !done_data["n_decoded"].is_number_integer()
+             || done_data["n_decoded"].get<int>()
+                  != rs.decode_budget) {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                    "done.n_decoded=%d != decode_budget=%d",
+                    done_data.contains("n_decoded")
+                     && done_data["n_decoded"].is_number_integer()
+                       ? done_data["n_decoded"].get<int>()
+                       : -1,
+                    rs.decode_budget);
+                return buf;
+            }
+            if (!done_data.contains("hash")
+             || !done_data["hash"].is_string()
+             || done_data["hash"].get<std::string>()
+                  != std::string(rs.canonical_hash)) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "done.hash=%s != canonical %s",
+                    done_data.contains("hash")
+                      && done_data["hash"].is_string()
+                        ? done_data["hash"]
+                              .get<std::string>().c_str()
+                        : "<missing>",
+                    rs.canonical_hash);
+                return buf;
+            }
+
+            // Direct in-process engine non-streaming submit for the
+            // same shape. This gives us the authoritative
+            // `r.generated_tokens` and `r.hash` against which the
+            // streamed token-id sequence and assembled text are
+            // checked. Not routed through HTTP — the non-streaming
+            // HTTP path is already covered by hpx_server_smoke; this
+            // smoke isolates the streaming contract.
+            std::vector<llama_token> ref_prompt_tokens =
+                common_tokenize(vocab, prompt,
+                                /*add_special=*/true,
+                                /*parse_special=*/true);
+            if (ref_prompt_tokens.empty()) {
+                return "ref tokenization produced zero tokens";
+            }
+
+            submit_request ref_req;
+            ref_req.request_id    = -10000 - rs.decode_budget;
+            ref_req.prompt_tokens = std::move(ref_prompt_tokens);
+            ref_req.decode_budget = rs.decode_budget;
+            ref_req.want_stream   = false;
+            submit_handle ref_h =
+                eng.submit_request(std::move(ref_req));
+            request_result r;
+            try {
+                r = ref_h.result.get();
+            } catch (const std::exception & e) {
+                return std::string(
+                    "direct engine submit failed: ") + e.what();
+            }
+            if (r.status != request_status::completed) {
+                return "direct engine r.status != completed";
+            }
+            if (r.n_decoded != rs.decode_budget) {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                    "direct engine r.n_decoded=%d != %d",
+                    r.n_decoded, rs.decode_budget);
+                return buf;
+            }
+            if (hex_hash(r.hash) != std::string(rs.canonical_hash)) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "direct engine r.hash=%s != canonical %s",
+                    hex_hash(r.hash).c_str(), rs.canonical_hash);
+                return buf;
+            }
+            if (streamed_token_ids != r.generated_tokens) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "streamed_token_ids (n=%zu) != "
+                    "r.generated_tokens (n=%zu)",
+                    streamed_token_ids.size(),
+                    r.generated_tokens.size());
+                return buf;
+            }
+            const std::string ref_text = common_detokenize(
+                vocab, r.generated_tokens, /*special=*/false);
+            if (assembled != ref_text) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "assembled(len=%zu) != "
+                    "common_detokenize(r.generated_tokens) (len=%zu)",
+                    assembled.size(), ref_text.size());
+                return buf;
+            }
+
+            fprintf(stdout,
+                "[%s] records=%zu token_events=%zu "
+                "assembled_bytes=%zu done.hash=%s "
+                "ref_n_decoded=%d ref_hash=%s\n",
+                rs.label,
+                records.size(), token_event_count,
+                assembled.size(),
+                done_data["hash"].get<std::string>().c_str(),
+                r.n_decoded, hex_hash(r.hash).c_str());
+
+            return std::string();  // success
+        };
+
+        for (const auto & rs : rounds) {
+            const std::string reason = do_round(rs);
+            if (!reason.empty()) {
+                return cleanup_and_fail_round(
+                    std::string(rs.label) + ": " + reason);
+            }
         }
 
-        if (!seen_token_with_id) {
-            return cleanup_engine_and_fail(
-                "no SSE token event with integer 'token_id'");
-        }
-
-        const sse_record done_rec =
-            parse_sse_record(records.back());
-        if (done_rec.event_name != "done") {
-            char buf[200];
-            std::snprintf(buf, sizeof(buf),
-                "terminal event='%s' (expected 'done')",
-                done_rec.event_name.c_str());
-            return cleanup_engine_and_fail(buf);
-        }
-        nlohmann::json done_data;
-        try {
-            done_data = nlohmann::json::parse(done_rec.data);
-        } catch (const std::exception & e) {
-            return cleanup_engine_and_fail(
-                std::string("done.data parse failed: ") + e.what());
-        }
-        if (!done_data.contains("status")
-         || !done_data["status"].is_string()
-         || done_data["status"].get<std::string>() != "completed") {
-            return cleanup_engine_and_fail(
-                "done.status != \"completed\"");
-        }
-        if (!done_data.contains("n_decoded")
-         || !done_data["n_decoded"].is_number_integer()
-         || done_data["n_decoded"].get<int>() != 8) {
-            return cleanup_engine_and_fail(
-                "done.n_decoded != 8");
-        }
-        if (!done_data.contains("hash")
-         || !done_data["hash"].is_string()
-         || done_data["hash"].get<std::string>()
-              != std::string(k_canonical_greedy_b8)) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf),
-                "done.hash=%s != canonical %s",
-                done_data.contains("hash")
-                  && done_data["hash"].is_string()
-                    ? done_data["hash"].get<std::string>().c_str()
-                    : "<missing>",
-                k_canonical_greedy_b8);
-            return cleanup_engine_and_fail(buf);
-        }
-
-        fprintf(stdout,
-            "records=%zu token_events=%zu done.status=%s "
-            "done.n_decoded=%d done.hash=%s\n",
-            records.size(), token_event_count,
-            done_data["status"].get<std::string>().c_str(),
-            done_data["n_decoded"].get<int>(),
-            done_data["hash"].get<std::string>().c_str());
         emit_pass();
-
-        eng.request_shutdown();
-        engine_fut.get();
+        end_test_cleanup();
     } catch (const std::exception & e) {
         return fail_and_cleanup(
             std::string("exception: ") + e.what());

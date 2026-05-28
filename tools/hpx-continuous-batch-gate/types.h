@@ -307,6 +307,18 @@ struct seq_state {
     int32_t                  decode_budget                = 0;
     int32_t                  n_decoded                    = 0;
     int32_t                  pos_next                     = 0;
+    // ---- Slice B (PrefillBudgetPolicy prep — no-behavior) --------------
+    // prefill_cursor is the index of the next prompt row not yet placed in
+    // a batch. Today's whole-prompt prefill jumps it from 0 to
+    // prompt_tokens.size() in one iter; prefill_complete becomes true in
+    // that same iter, before any sampling. Both fields are INERT in Slice
+    // B: no chunking, no policy consult, no control-flow change — they are
+    // set/reset alongside the existing per-occupant state and guarded by
+    // debug assertions only. Slice C wires the per-iter budget that makes
+    // prefill_cursor advance in steps. See
+    // docs/hpx/prefill_budget_policy_design.md §4.
+    int32_t                  prefill_cursor               = 0;
+    bool                     prefill_complete             = false;
     int32_t                  i_batch                      = -1;
     llama_token              last_token                   = 0;
     bool                     done                         = false;
@@ -640,6 +652,82 @@ struct engine_metrics {
     // bound at least one waiting request). Insertion order is
     // monotonically increasing, so it doubles as the iter set.
     std::vector<int32_t> admission_iter_set;
+
+    // ---- Phase 1 serving-overhead diagnostics ---------------------------
+    // Populated only when LLAMA_HPX_DIAG_METRICS=1. When the env switch
+    // is unset, every vector stays default-constructed (no heap
+    // allocation) and the engine code does not touch these fields. The
+    // existing rows_per_batch (= batch_n_tokens per llama_decode call)
+    // and active_seqs_per_iter are reused as-is — Phase 1 does not
+    // duplicate them.
+    //
+    // When the switch is ON, each vector has length == update_iterations
+    // at engine end (one row per inner-while iteration), and the JSONL
+    // dump in engine.cpp walks them in lockstep.
+    //
+    // Two llama_decode call sites exist (the per-iter site and the
+    // admitted-prefill argmax post-iter site). Per the Phase 1 roadmap,
+    // both sites' wall times accumulate into the same per-iter entry
+    // in llama_decode_wall_us_per_iter so the analysis layer does not
+    // double-attribute a single iteration.
+    //
+    // idle_wait_us_per_iter is best-effort: if a single low-risk wait
+    // site exists in the engine inbox path it carries real values;
+    // otherwise the engine emits zeros (deferred to Phase 2).
+    std::vector<int32_t> prefill_rows_per_iter;
+    std::vector<int32_t> decode_rows_per_iter;
+    std::vector<int32_t> admitted_per_iter;
+    std::vector<int32_t> completed_per_iter;
+    std::vector<int32_t> cancelled_per_iter;
+    std::vector<int32_t> tokens_emitted_per_iter;
+    std::vector<int64_t> llama_decode_wall_us_per_iter;
+    std::vector<int64_t> iter_wall_us_per_iter;
+    std::vector<int64_t> idle_wait_us_per_iter;
+
+    // Phase 1 absolute per-iter timestamp, in microseconds since the
+    // engine's run_body t_start_ baseline (the same baseline used for
+    // wall_ms / Exp-13 responsiveness timestamps). Lets server-side
+    // JSONL request events align to a common engine-relative axis for
+    // c > 1 service-overhead analysis. One push per iter at the same
+    // site as active_seqs_per_iter; default-empty (no allocation) when
+    // LLAMA_HPX_DIAG_METRICS is unset.
+    std::vector<int64_t> t_us_from_engine_start_per_iter;
+
+    // Phase 1 transient per-iter accumulator. Lives inside
+    // engine_metrics so the engine owns per-engine scratch state
+    // without adding a new private member to class engine (engine.h
+    // is out-of-scope for this slice). Each engine instance has its
+    // own engine_metrics inside its own engine_result, so multiple
+    // engines in one process never share this state — replacing the
+    // earlier file-scope `s_iter_*` statics that would have aliased
+    // across concurrent engines. Reset by engine::run_body at iter
+    // top; read by engine::iter_run_decode at push time. Only touched
+    // when LLAMA_HPX_DIAG_METRICS=1; otherwise stays default-init
+    // (no chrono call, no allocation, no I/O).
+    //
+    // t0_us is microseconds since the engine's t_start_ baseline, so
+    // this struct stays POD-friendly and types.h does NOT need to
+    // pull in <chrono>.
+    struct phase1_iter_acc {
+        int32_t admitted     = 0;
+        int32_t cancelled    = 0;
+        int32_t prefill_rows = 0;
+        int32_t decode_rows  = 0;
+        int64_t t0_us        = 0;
+    };
+    phase1_iter_acc cur_iter_diag;
+
+    // c=4 attribution: engine-task-only transient accumulator for time
+    // spent HPX-suspended in wait_inbox_blocking() at the keep-alive
+    // outer-loop tail. Lives OUTSIDE phase1_iter_acc so the per-iter
+    // reset (run_body iter top) never clears it: the idle wait happens
+    // between inner-loop passes and is credited to the NEXT iter that
+    // produces a decode row. Bumped only when LLAMA_HPX_DIAG_METRICS=1;
+    // drained into idle_wait_us_per_iter.back() and reset to 0 at the
+    // iter_run_decode push site. Default 0; zero-cost when diag is off
+    // (the wait site's timing is guarded). Non-keep-alive engines never
+    // reach the wait site, so this stays 0 for every gate smoke.
+    int64_t pending_idle_wait_us = 0;
 };
 
 // ---- Engine result (engine-task-level diagnostics) ----------------------
@@ -775,6 +863,19 @@ struct engine_result {
     // rid). Not printed by the gate driver; consumed only by the M5a
     // stale-token smoke via `eng.result().cancel_stale_epoch`.
     int32_t              cancel_stale_epoch          = 0;
+
+    // c=4 attribution: absolute steady_clock microseconds of this
+    // engine's run_body t_start_ baseline (t_start_.time_since_epoch()).
+    // Lets server-side server_request JSONL rows (which use absolute
+    // server_now_us) and engine per-iter rows (which use the relative
+    // t_us_from_engine_start delta) be overlaid on one timeline:
+    //   engine_iter_abs_us = engine_t_start_us_absolute
+    //                        + t_us_from_engine_start
+    // hpx-server embeds the engine in the same process, so both share
+    // one steady_clock epoch. Written only when LLAMA_HPX_DIAG_METRICS=1;
+    // emitted in the engine_summary JSONL row. Default -1 = not
+    // populated (diag off).
+    int64_t              engine_t_start_us_absolute  = -1;
 
     engine_metrics       metrics;
 };
