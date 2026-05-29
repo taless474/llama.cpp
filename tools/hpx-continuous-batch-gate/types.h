@@ -78,6 +78,20 @@ enum class admission_source : uint8_t {
     cancel_freed     = 1,
     completion_freed = 2,
     initial_idle     = 3,
+    // B1 Slice 3: a session_id request bound back onto its own resident
+    // slot via exact-prefix reuse (no free slot consumed, prefix prefill
+    // skipped). External arrival like the other runtime-submitted sources.
+    session_reuse    = 4,
+    // B1 Slice 4: a waiter admitted onto a slot reclaimed by evicting an
+    // inactive resident slot (LRU) because no ordinary free slot existed.
+    // Normal full prefill on the freed slot.
+    evicted_reclaim  = 5,
+    // B+1: a same-session waiter bound back onto a resident slot by
+    // longest-common-prefix reuse -- the matched prefix KV is kept, the
+    // divergent resident tail is trimmed, and only the new suffix is
+    // prefilled. Distinct from session_reuse (exact full extension, no
+    // trim). Same-session only; no cross-session matching.
+    session_reuse_lcp = 6,
 };
 
 inline const char * admission_source_name(admission_source s) noexcept {
@@ -86,6 +100,9 @@ inline const char * admission_source_name(admission_source s) noexcept {
         case admission_source::cancel_freed:     return "cancel_freed";
         case admission_source::completion_freed: return "completion_freed";
         case admission_source::initial_idle:     return "initial_idle";
+        case admission_source::session_reuse:    return "session_reuse";
+        case admission_source::evicted_reclaim:  return "evicted_reclaim";
+        case admission_source::session_reuse_lcp: return "session_reuse_lcp";
     }
     return "unknown";
 }
@@ -346,6 +363,27 @@ struct seq_state {
     int32_t                  admitted_at_iter             = -1;
     int32_t                  previous_request_id          = -1;
     admission_source         admission_src                = admission_source::none;
+    // B1 Slice 1: exact-session identity of the request currently bound
+    // to this slot, copied from `waiting_request::session_id` by
+    // `admit_one`. Empty means no session. Reset on every rebind so a
+    // prior owner cannot leak its session into the next owner. NOT read
+    // by any reuse/residency/admission logic in Slice 1 — pure plumbing.
+    std::string              owning_session_id;
+    // ---- B1 Slice 2: finalize-time residency metadata -------------------
+    // When a session_id request completes successfully, the slot is kept
+    // RESIDENT instead of clearing its KV: resident_valid is set,
+    // resident_tokens records exactly the token sequence held in KV
+    // (prompt ++ generated, truncated to resident_pos_max+1), and
+    // resident_lru stamps an engine-monotonic recency counter. A resident
+    // slot is neither active (done==true) nor free (never pushed to a
+    // free queue). Slice 2 only RECORDS this metadata and clears it at
+    // teardown — no admission, reuse, or eviction reads it yet. Reset to
+    // the inert defaults on every admit_one rebind.
+    bool                     resident_valid               = false;
+    std::string              resident_session_id;
+    std::vector<llama_token> resident_tokens;
+    llama_pos                resident_pos_max             = -1;
+    uint64_t                 resident_lru                 = 0;
 
     // ---- arrival data model (Live Admission Slice 6) --------------------
     // Records whether this request entered the engine via the preloaded
@@ -483,6 +521,11 @@ struct waiting_request {
     // preloaded waiters (`scripted_arrival` does not yet expose
     // sampling, so the gate's scripted-submitter path stays greedy).
     sampling_config          sampling      = {};
+    // B1 Slice 1: optional exact-session identity, moved out of
+    // `arrival_msg::session_id` by `drain_external_inbox` and copied into
+    // `seq_state::owning_session_id` by `admit_one`. Empty means no
+    // session. Not read by any reuse logic in Slice 1.
+    std::string              session_id;
 };
 
 // ---- Async external arrival (Live Admission Slice 6) -------------------
@@ -524,6 +567,11 @@ struct arrival_msg {
     // moved a final time into the bound slot at `admit_one`.
     bool                                want_stream    = false;
     std::optional<token_stream_channel> stream_channel;
+    // B1 Slice 1: optional exact-session identity, copied from
+    // `submit_request::session_id` in `engine::submit_request` and moved
+    // into `waiting_request::session_id` by `drain_external_inbox`.
+    // Empty means no session. Not read by any reuse logic in Slice 1.
+    std::string                         session_id;
     // M6a: per-request sampling configuration. Copied from
     // `submit_request::sampling` in `engine::submit_request` before the
     // inbox push, and moved into `waiting_request::sampling` by
@@ -553,6 +601,12 @@ struct submit_request {
     int32_t                  decode_budget = 0;
     bool                     want_stream   = false;
     sampling_config          sampling      = {};
+    // B1 Slice 1: optional exact-session identity. Empty string means
+    // "no session" — the byte-identical no-session path. Carried
+    // end-to-end (submit_request -> arrival_msg -> waiting_request ->
+    // seq_state::owning_session_id) but NOT yet read by any reuse,
+    // residency, or admission logic in Slice 1.
+    std::string              session_id;
 };
 
 // ---- M5a: cancel_token ------------------------------------------------
@@ -741,6 +795,40 @@ struct engine_result {
     int32_t        cancelled_count    = 0;   // seqs fulfilled with status=cancelled
     bool           residual_kv_ok     = false;
     std::string    residual_kv_error;
+    // B1 Slice 2: structural counters for the resident-finalize path.
+    // resident_slots_created is bumped each time a successful session_id
+    // completion is kept resident (KV intentionally NOT cleared at
+    // finalize). resident_slots_cleared_at_teardown is bumped for each
+    // resident slot whose KV is cleared during engine teardown, before
+    // the residual-KV-empty sweep. For a clean run the two are equal.
+    int32_t        resident_slots_created             = 0;
+    int32_t        resident_slots_cleared_at_teardown = 0;
+    // B1 Slice 3: exact-session reuse counters. session_reuse_admitted_count
+    // is bumped each time a session_id waiter is bound back onto its own
+    // resident slot via exact-prefix reuse;
+    // session_reuse_prefill_skipped_tokens accumulates the matched prefix
+    // lengths (prompt rows NOT re-prefilled). Both 0 for runs without reuse.
+    int32_t        session_reuse_admitted_count          = 0;
+    int64_t        session_reuse_prefill_skipped_tokens  = 0;
+    // B1 Slice 4: number of inactive resident slots reclaimed (KV
+    // cleared) to admit a waiter when no ordinary free slot existed.
+    // 0 for runs that never hit slot pressure. last_evicted_resident_lru
+    // is the resident_lru of the most-recently-evicted slot (0 if none);
+    // the eviction policy picks the smallest resident_lru, so a test can
+    // assert oldest-first (LRU) ordering through it.
+    int32_t        resident_slots_evicted_count          = 0;
+    uint64_t       last_evicted_resident_lru             = 0;
+    // B+1: same-session longest-common-prefix reuse counters.
+    // lcp_reuse_admitted_count is bumped each time a partial same-session
+    // LCP match (matched < resident length, matched >= LCP_MIN_TOKENS) is
+    // bound onto its resident slot; lcp_reuse_matched_tokens accumulates
+    // the reused prefix lengths; lcp_reuse_trimmed_tokens accumulates the
+    // divergent resident-tail tokens removed by seq_rm. Exact full
+    // extensions remain counted under session_reuse_* (no trim). All 0 for
+    // runs without partial LCP reuse.
+    int32_t        lcp_reuse_admitted_count              = 0;
+    int64_t        lcp_reuse_matched_tokens              = 0;
+    int64_t        lcp_reuse_trimmed_tokens              = 0;
     // Live Admission Slice 3: queue visibility + admission counters.
     // queued_count is sampled at engine start; waiting_queue_size_at_engine_end
     // is sampled at engine end. consumed = queued_count - end_size must

@@ -284,6 +284,23 @@ llama_sampler_ptr build_sampler_chain(const sampling_config & cfg,
     return owner;
 }
 
+// B1 Slice 3: token-level longest-common-prefix length. Used by the
+// exact-session reuse pre-pass to decide whether a resident slot's KV is
+// an exact prefix of a new prompt. Pure comparison; no llama call sites.
+size_t lcp_len(const std::vector<llama_token> & a,
+               const std::vector<llama_token> & b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) i++;
+    return i;
+}
+
+// B+1: minimum matched prefix length for a PARTIAL same-session LCP reuse
+// to be worthwhile. Below this, the seq_rm tail-trim + lost batch density
+// is not worth it, so the waiter falls back to a normal full prefill.
+// Exact full extensions (B1) are NOT gated by this threshold.
+constexpr size_t k_lcp_min_tokens = 32;
+
 }  // namespace
 
 engine::engine(engine_options opts)
@@ -624,6 +641,12 @@ submit_handle engine::submit_request(struct submit_request req) {
     // No sampling site reads this field in M6a — both argmax sites
     // remain unchanged.
     msg.sampling      = req.sampling;
+    // B1 Slice 1: carry the optional exact-session identity through the
+    // inbox. Empty means no session. drain_external_inbox moves it onto
+    // the waiting_request; admit_one copies it into
+    // seq_state::owning_session_id. No reuse/residency/admission logic
+    // reads it in Slice 1 — this is plumbing only.
+    msg.session_id    = std::move(req.session_id);
 
     submit_handle h;
     h.result            = std::move(fut);
@@ -1034,11 +1057,54 @@ bool engine::finalize_and_fulfill(seq_state & seq, int32_t iter,
             admission_source_name(seq.admission_src));
     }
 
-    if (!clear_and_check(seq, iter, mem)) return false;
+    // B1 Slice 2: a successful completion that carried a session_id is
+    // kept RESIDENT — its KV is intentionally NOT cleared at finalize so
+    // a later slice can reuse the prefix. Slice 2 only records metadata;
+    // nothing reads it yet, and the slot is cleared at teardown. A
+    // no-session completion takes the unchanged full-clear path.
+    const bool make_resident = !seq.owning_session_id.empty();
 
-    trace::event(
-        "kv_cleared seq=%d pos_max_at_clear=%d cross_talk_ok=1",
-        seq.seq_id, seq.pos_max_at_clear);
+    if (make_resident) {
+        // Mark done WITHOUT seq_rm (clear_and_check would normally set
+        // these AND clear KV). kv_cleared stays false: the KV remains.
+        seq.done             = true;
+        seq.done_iter        = iter;
+        const llama_pos pmax = llama_memory_seq_pos_max(mem, seq.seq_id);
+        seq.pos_max_at_clear = pmax;   // reported in request_result
+
+        // resident_tokens must equal exactly the tokens held in KV.
+        // Tokens enter KV in prompt-then-generated order; the KV holds
+        // contiguous positions [0, pmax] == pmax+1 tokens. The final
+        // sampled token is never placed in KV, so truncating
+        // prompt++generated to pmax+1 keeps resident_tokens byte-exact to
+        // the resident KV. The clamp guards degenerate short cases.
+        std::vector<llama_token> resident = seq.prompt_tokens;
+        resident.insert(resident.end(),
+                        seq.generated_tokens.begin(),
+                        seq.generated_tokens.end());
+        size_t resident_n = (pmax >= 0)
+            ? static_cast<size_t>(pmax) + 1 : 0;
+        if (resident_n > resident.size()) resident_n = resident.size();
+        resident.resize(resident_n);
+
+        seq.resident_valid      = true;
+        seq.resident_session_id = seq.owning_session_id;
+        seq.resident_tokens     = std::move(resident);
+        seq.resident_pos_max    = pmax;
+        seq.resident_lru        = resident_lru_next_++;
+        result_.resident_slots_created++;
+        trace::event(
+            "resident_slot_created seq=%d session=%s pos_max=%d "
+            "n_tokens=%zu lru=%llu",
+            seq.seq_id, seq.resident_session_id.c_str(), pmax,
+            seq.resident_tokens.size(),
+            static_cast<unsigned long long>(seq.resident_lru));
+    } else {
+        if (!clear_and_check(seq, iter, mem)) return false;
+        trace::event(
+            "kv_cleared seq=%d pos_max_at_clear=%d cross_talk_ok=1",
+            seq.seq_id, seq.pos_max_at_clear);
+    }
 
     // Streaming Slice 8: close the per-seq token stream with
     // reason=completed before fulfilling the request_result promise.
@@ -1052,20 +1118,27 @@ bool engine::finalize_and_fulfill(seq_state & seq, int32_t iter,
     // residual size remains a tight invariant for the first-wave
     // proof. Push happens after KV-clear succeeds so the slot is
     // truly KV-empty at queue-entry time.
-    if (reuse_completed_ && !waiting_queue_consumable_.empty()) {
-        free_due_to_completion_.push_back(seq.seq_id);
-    } else if (seq.seq_id >= static_cast<int32_t>(budgets_.size())) {
-        // N5a: idle-origin slots occupy seq_id range
-        // [budgets_.size(), seqs_.size()); after a natural completion
-        // that is NOT routed to free_due_to_completion_, return them to
-        // free_idle_. Keying on the seq_id range rather than
-        // admission_src also recovers a slot admitted via cancel_freed
-        // (idle slot -> active-cancel -> cancel_freed -> natural
-        // completion), which the old initial_idle-only predicate leaked.
-        // This relies on today's seq_id == slot index invariant. Gates
-        // use initial_idle_slots=0 (budgets_.size()==seqs_.size()) so
-        // this branch stays inert for canonical gate shapes.
-        free_idle_.push_back(seq.seq_id);
+    //
+    // B1 Slice 2: a resident slot is neither active nor free — its KV is
+    // still populated — so it must NOT enter any free queue (that would
+    // expose populated KV to normal admission). Skip the whole return
+    // block for resident slots; the unchanged paths run for everyone else.
+    if (!make_resident) {
+        if (reuse_completed_ && !waiting_queue_consumable_.empty()) {
+            free_due_to_completion_.push_back(seq.seq_id);
+        } else if (seq.seq_id >= static_cast<int32_t>(budgets_.size())) {
+            // N5a: idle-origin slots occupy seq_id range
+            // [budgets_.size(), seqs_.size()); after a natural completion
+            // that is NOT routed to free_due_to_completion_, return them to
+            // free_idle_. Keying on the seq_id range rather than
+            // admission_src also recovers a slot admitted via cancel_freed
+            // (idle slot -> active-cancel -> cancel_freed -> natural
+            // completion), which the old initial_idle-only predicate leaked.
+            // This relies on today's seq_id == slot index invariant. Gates
+            // use initial_idle_slots=0 (budgets_.size()==seqs_.size()) so
+            // this branch stays inert for canonical gate shapes.
+            free_idle_.push_back(seq.seq_id);
+        }
     }
 
     const auto    now    = std::chrono::steady_clock::now();
@@ -1306,6 +1379,11 @@ void engine::drain_external_inbox(int32_t iter) {
         // ready for M6b, when a non-trivially-movable `llama_sampler_ptr`
         // may eventually ride alongside or replace this carrier.
         w.sampling      = std::move(msg.sampling);
+        // B1 Slice 1: carry the optional exact-session identity onto the
+        // waiting_request. admit_one copies it into
+        // seq_state::owning_session_id. Empty means no session. No reuse
+        // behavior is wired in Slice 1.
+        w.session_id    = std::move(msg.session_id);
         waiting_queue_consumable_.push_back(std::move(w));
         result_.arrival_drained_count++;
         if (result_.first_external_drain_iter == -1) {
@@ -1790,6 +1868,93 @@ void engine::apply_queued_cancellations() {
     }
 }
 
+// B1 Slice 3: linear scan for a resident slot whose session matches
+// `session_id`. Returns the most-recently-resident match (max
+// resident_lru) deterministically, or -1 if none. Engine-task-only; no
+// llama call sites. No cross-session matching.
+int32_t engine::find_resident_slot(const std::string & session_id) const {
+    int32_t  best     = -1;
+    uint64_t best_lru = 0;
+    for (size_t s = 0; s < seqs_.size(); s++) {
+        const seq_state & rs = seqs_[s];
+        if (!rs.resident_valid) continue;
+        if (rs.resident_session_id != session_id) continue;
+        if (best < 0 || rs.resident_lru > best_lru) {
+            best     = static_cast<int32_t>(s);
+            best_lru = rs.resident_lru;
+        }
+    }
+    return best;
+}
+
+// B+1: same-session resident slot with the largest token-level LCP against
+// `prompt`. Tie-break: largest matched, then most-recent resident_lru,
+// then lowest seq_id (implicit via ascending scan + strict replacement).
+// Same-session only -- never matches a different resident_session_id.
+// Engine-task-only; no llama call sites.
+int32_t engine::find_best_lcp_resident_slot(
+    const std::string &              session_id,
+    const std::vector<llama_token> & prompt,
+    size_t &                         matched_out) const {
+    int32_t  best       = -1;
+    size_t   best_match = 0;
+    uint64_t best_lru   = 0;
+    for (size_t s = 0; s < seqs_.size(); s++) {
+        const seq_state & rs = seqs_[s];
+        if (!rs.resident_valid) continue;
+        if (rs.resident_session_id != session_id) continue;  // same-session only
+        const size_t m = lcp_len(rs.resident_tokens, prompt);
+        if (m == 0) continue;
+        const bool better =
+            (best < 0)
+            || (m > best_match)
+            || (m == best_match && rs.resident_lru > best_lru);
+        if (better) {
+            best       = static_cast<int32_t>(s);
+            best_match = m;
+            best_lru   = rs.resident_lru;
+        }
+    }
+    matched_out = (best < 0) ? 0 : best_match;
+    return best;
+}
+
+// B1 Slice 4: smallest-resident_lru (oldest) inactive resident slot.
+// Only resident, completed (done) slots are eligible; an active slot is
+// never evictable. Engine-task-only; no llama call sites.
+int32_t engine::find_evictable_resident_slot() const {
+    int32_t  best     = -1;
+    uint64_t best_lru = 0;
+    for (size_t s = 0; s < seqs_.size(); s++) {
+        const seq_state & rs = seqs_[s];
+        if (!rs.resident_valid) continue;
+        if (!rs.done)           continue;  // never evict an active slot
+        if (best < 0 || rs.resident_lru < best_lru) {
+            best     = static_cast<int32_t>(s);
+            best_lru = rs.resident_lru;
+        }
+    }
+    return best;
+}
+
+// B1 Slice 4: reclaim a resident slot for normal admission. Clears the
+// slot's KV, resets its residency metadata, and returns it to free_idle_.
+// Caller guarantees the slot is resident && inactive (see
+// find_evictable_resident_slot).
+void engine::evict_resident_slot(int32_t seq_id, llama_memory_t mem) {
+    seq_state & rs = seqs_[static_cast<size_t>(seq_id)];
+    result_.last_evicted_resident_lru = rs.resident_lru;  // before reset
+    llama_memory_seq_rm(mem, rs.seq_id, /*p0=*/-1, /*p1=*/-1);
+    rs.resident_valid = false;
+    rs.resident_session_id.clear();
+    rs.resident_tokens.clear();
+    rs.resident_pos_max = -1;
+    rs.resident_lru     = 0;
+    rs.kv_cleared       = true;
+    free_idle_.push_back(rs.seq_id);
+    trace::event("resident_slot_evicted seq=%d", rs.seq_id);
+}
+
 // Bind a freshly freed seq_id to the FIFO head of
 // waiting_queue_consumable_ and emit the admission trace events
 // (payloads carry an explicit admission_source=<value> key so
@@ -1801,26 +1966,40 @@ bool engine::admit_one(int32_t              reuse_seq,
                        admission_source     src,
                        const char *         src_label,
                        int32_t              iter,
-                       llama_memory_t       mem) {
-    const llama_pos pmin =
-        llama_memory_seq_pos_min(mem, reuse_seq);
-    const llama_pos pmax =
-        llama_memory_seq_pos_max(mem, reuse_seq);
-    if (pmin != -1 || pmax != -1) {
-        char buf[200];
-        std::snprintf(buf, sizeof(buf),
-            "admission: reuse seq %d KV not empty before "
-            "binding: pos_min=%d pos_max=%d",
-            reuse_seq, pmin, pmax);
-        result_.error = buf;
-        return false;
+                       llama_memory_t       mem,
+                       size_t               waiter_idx,
+                       int32_t              prefill_start,
+                       bool                 skip_empty_kv_check) {
+    // B1 Slice 3: the empty-KV precondition holds for every normal
+    // free-queue drain (the slot was cleared at finalize/cancel). The
+    // resident-reuse path passes skip_empty_kv_check=true because the
+    // slot intentionally still holds its matched prefix KV.
+    if (!skip_empty_kv_check) {
+        const llama_pos pmin =
+            llama_memory_seq_pos_min(mem, reuse_seq);
+        const llama_pos pmax =
+            llama_memory_seq_pos_max(mem, reuse_seq);
+        if (pmin != -1 || pmax != -1) {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                "admission: reuse seq %d KV not empty before "
+                "binding: pos_min=%d pos_max=%d",
+                reuse_seq, pmin, pmax);
+            result_.error = buf;
+            return false;
+        }
     }
 
-    // M1c: move the waiter out so its prompt_tokens vector can be
-    // moved into the bound slot below without an extra copy.
+    // M1c: move the chosen waiter out so its prompt_tokens vector can be
+    // moved into the bound slot below without an extra copy. waiter_idx
+    // defaults to 0 — the FIFO front, byte-identical to the previous
+    // front()/pop_front() for every free-queue drain. The reuse pre-pass
+    // passes an explicit index for a (possibly non-front) session match.
     waiting_request w =
-        std::move(waiting_queue_consumable_.front());
-    waiting_queue_consumable_.pop_front();
+        std::move(waiting_queue_consumable_[waiter_idx]);
+    waiting_queue_consumable_.erase(
+        waiting_queue_consumable_.begin()
+        + static_cast<std::ptrdiff_t>(waiter_idx));
 
     seq_state & rseq =
         seqs_[static_cast<size_t>(reuse_seq)];
@@ -1862,11 +2041,17 @@ bool engine::admit_one(int32_t              reuse_seq,
     rseq.epoch                  = w.epoch;
     rseq.decode_budget          = w.decode_budget;
     rseq.n_decoded              = 0;
-    rseq.pos_next               = 0;
+    // B1 Slice 3: prefill_start is 0 for a normal full prefill, or the
+    // matched resident-prefix length for the reuse path. Seeding both
+    // pos_next and prefill_cursor here means iter_build_batch prefills
+    // only the suffix [prefill_start, prompt_size) at positions
+    // [prefill_start, ...), continuing contiguously from the resident KV
+    // that already occupies [0, prefill_start).
+    rseq.pos_next               = prefill_start;
     // Slice B: a reused slot starts a fresh prefill. The admitted-prefill
     // pass in iter_build_batch sets these to (size, true) in the admission
     // iter, before sampling, so behavior is unchanged.
-    rseq.prefill_cursor         = 0;
+    rseq.prefill_cursor         = prefill_start;
     rseq.prefill_complete       = false;
     rseq.i_batch                = -1;
     rseq.last_token             = 0;
@@ -1887,6 +2072,23 @@ bool engine::admit_one(int32_t              reuse_seq,
     // Symmetric with the prompt_tokens hand-off; both are per-request
     // inputs fixed at admission.
     rseq.sampling               = std::move(w.sampling);
+    // B1 Slice 1: copy the waiter's exact-session identity into the
+    // bound slot. Assigned unconditionally on every rebind (empty for
+    // no-session requests), so a prior owner's session can never leak
+    // into the new owner. NOT read by reuse/residency/admission logic in
+    // Slice 1 — pure plumbing for later slices.
+    rseq.owning_session_id      = std::move(w.session_id);
+    // B1 Slice 2: a freshly bound slot is ACTIVE, never resident. Reset
+    // the residency metadata defensively on every rebind so a prior
+    // resident incarnation cannot leak its flags into the new owner.
+    // (In Slice 2 a resident slot is never routed to admission, so this
+    // is belt-and-suspenders; Slice 3's reuse path will set residency
+    // deliberately on its own path.)
+    rseq.resident_valid         = false;
+    rseq.resident_session_id.clear();
+    rseq.resident_tokens.clear();
+    rseq.resident_pos_max       = -1;
+    rseq.resident_lru           = 0;
 
     // M6b/M6c: per-seq sampler chain (re)binding for the new owner.
     //
@@ -2137,6 +2339,88 @@ engine::iter_admission_result engine::iter_run_admissions(
     int32_t iter, llama_memory_t mem,
     size_t admission_eligible_count) {
     iter_admission_result r;
+
+    // B1 Slice 3: exact-session reuse pre-pass. BEFORE the free-queue
+    // drains, bind any session_id waiter whose prompt EXACTLY extends a
+    // resident slot back onto that same slot, keeping the matched prefix
+    // KV and prefilling only the suffix. This consumes no free slot. Only
+    // the exact-extension case is handled in Slice 3 (resident_tokens is
+    // a full prefix of the new prompt with >=1 new token); any other
+    // session waiter falls through to the normal drains for a full
+    // prefill. With no resident slots present (every existing smoke), the
+    // scan is a no-op, so the free-queue drains below are unchanged.
+    {
+        size_t idx = 0;
+        while (idx < waiting_queue_consumable_.size()) {
+            const waiting_request & w = waiting_queue_consumable_[idx];
+            if (w.session_id.empty()) { idx++; continue; }
+            // B+1: pick the SAME-SESSION resident slot with the largest
+            // token-level common prefix against this prompt.
+            size_t        matched = 0;
+            const int32_t rseq    = find_best_lcp_resident_slot(
+                w.session_id, w.prompt_tokens, matched);
+            if (rseq < 0) { idx++; continue; }  // no same-session resident
+            const seq_state & rs = seqs_[static_cast<size_t>(rseq)];
+            const size_t resident_len = rs.resident_tokens.size();
+
+            // Need at least one new token to prefill (a logits row).
+            if (matched == 0 || matched >= w.prompt_tokens.size()) {
+                idx++;
+                continue;
+            }
+            const bool exact = (matched == resident_len);
+            // Exact full extension is the B1 fast path: no threshold, no
+            // trim. A PARTIAL match (matched < resident_len) is B+1 LCP
+            // reuse: gated by k_lcp_min_tokens and requires trimming the
+            // divergent resident tail. Sub-threshold partials fall through
+            // to the normal full-prefill path.
+            if (!exact && matched < k_lcp_min_tokens) {
+                idx++;
+                continue;
+            }
+
+            int32_t trimmed = 0;
+            if (!exact) {
+                // B+1 tail trim: drop the divergent resident tail
+                // [matched, end) so the retained KV is exactly the matched
+                // prefix [0, matched). No seq_cp; no context shift.
+                llama_memory_seq_rm(mem, rseq,
+                                    /*p0=*/static_cast<llama_pos>(matched),
+                                    /*p1=*/-1);
+                trimmed = static_cast<int32_t>(resident_len - matched);
+            }
+
+            const int32_t        skipped = static_cast<int32_t>(matched);
+            const admission_source src =
+                exact ? admission_source::session_reuse
+                      : admission_source::session_reuse_lcp;
+            const char * label = exact ? "session_reuse" : "session_reuse_lcp";
+            // admit_one binds w (at idx) onto the resident slot, seeds
+            // prefill_cursor=skipped, skips the empty-KV precondition (the
+            // matched prefix KV is intentionally kept), and resets the
+            // residency metadata as part of the active rebind.
+            if (!admit_one(rseq, src, label, iter, mem,
+                           /*waiter_idx=*/idx,
+                           /*prefill_start=*/skipped,
+                           /*skip_empty_kv_check=*/true)) {
+                r.ok = false;
+                return r;
+            }
+            r.admitted++;
+            if (exact) {
+                result_.session_reuse_admitted_count++;
+                result_.session_reuse_prefill_skipped_tokens += skipped;
+            } else {
+                result_.lcp_reuse_admitted_count++;
+                result_.lcp_reuse_matched_tokens += skipped;
+                result_.lcp_reuse_trimmed_tokens += trimmed;
+            }
+            // The waiter at idx was erased and the resident slot is now
+            // active (so it will not re-match); re-examine the same idx,
+            // which now holds the next waiter.
+        }
+    }
+
     // Source priority: drain free_due_to_cancel_ first so the
     // Slice-3 cancel-freed mapping is preserved when both
     // sources are present (out-of-scope for Slice 5 itself,
@@ -2194,6 +2478,39 @@ engine::iter_admission_result engine::iter_run_admissions(
         if (!admit_one(reuse_seq,
                        admission_source::initial_idle,
                        "initial_idle", iter, mem)) {
+            r.ok = false;
+            return r;
+        }
+        r.admitted++;
+    }
+
+    // B1 Slice 4: eviction fallback. If waiters still remain AND every
+    // ordinary free source is empty (no cancel-freed, completion-freed,
+    // or idle slot available), reclaim inactive resident slots oldest-LRU
+    // first, admitting one waiter (normal full prefill) per eviction.
+    // Exact-reusable waiters were already bound by the Slice-3 pre-pass,
+    // so the front waiter here genuinely needs a fresh slot. This is the
+    // ONLY way a resident slot is reclaimed during the run — a resident
+    // slot is never evicted merely because it exists. With no resident
+    // slots present (every pre-Slice-4 smoke), find_evictable_resident_slot
+    // returns -1 and this loop is inert, so no-session FIFO behavior is
+    // unchanged.
+    while (!waiting_queue_consumable_.empty()
+        && free_due_to_cancel_.empty()
+        && free_due_to_completion_.empty()
+        && free_idle_.empty()) {
+        const int32_t evict_seq = find_evictable_resident_slot();
+        if (evict_seq < 0) break;  // nothing reclaimable; leave waiters
+        evict_resident_slot(evict_seq, mem);
+        result_.resident_slots_evicted_count++;
+        // evict_resident_slot pushed evict_seq onto the (previously empty)
+        // free_idle_; admit the FIFO-front waiter onto it via normal full
+        // prefill (empty-KV precondition holds — the slot was just cleared).
+        const int32_t reuse_seq = free_idle_.front();
+        free_idle_.pop_front();
+        if (!admit_one(reuse_seq,
+                       admission_source::evicted_reclaim,
+                       "evicted_reclaim", iter, mem)) {
             r.ok = false;
             return r;
         }
@@ -2532,6 +2849,16 @@ void engine::run_body() {
     result_.arrival_drained_count                 = 0;
     result_.external_admitted_count               = 0;
     result_.first_external_drain_iter             = -1;
+    // B1 Slice 3: per-repeat reset of the exact-session reuse counters.
+    result_.session_reuse_admitted_count          = 0;
+    result_.session_reuse_prefill_skipped_tokens  = 0;
+    // B1 Slice 4: per-repeat reset of the eviction counters.
+    result_.resident_slots_evicted_count          = 0;
+    result_.last_evicted_resident_lru             = 0;
+    // B+1: per-repeat reset of the LCP-reuse counters.
+    result_.lcp_reuse_admitted_count              = 0;
+    result_.lcp_reuse_matched_tokens              = 0;
+    result_.lcp_reuse_trimmed_tokens              = 0;
     result_.iter_release_fired_set.clear();
     result_.submitter_ack_set.clear();
     // Streaming Slice 8: reset stream counters per repeat.
@@ -3313,6 +3640,26 @@ void engine::run_body() {
     }
     cancelled_tokens_.clear();
     live_epoch_by_rid_.clear();
+
+    // ---- B1 Slice 2: clear intentionally-resident slots before the
+    //      residual-KV-empty sweep. Resident slots keep populated KV
+    //      across the engine's lifetime (no reuse consumer yet), but
+    //      that KV must be released at teardown so the sweep below holds
+    //      and there is no leak on shutdown. seq_rm(-1,-1) over the whole
+    //      sequence; reset the residency metadata. -------------------
+    for (size_t s = 0; s < seqs_.size(); s++) {
+        seq_state & rs = seqs_[s];
+        if (!rs.resident_valid) continue;
+        llama_memory_seq_rm(mem, rs.seq_id, /*p0=*/-1, /*p1=*/-1);
+        rs.resident_valid = false;
+        rs.resident_session_id.clear();
+        rs.resident_tokens.clear();
+        rs.resident_pos_max = -1;
+        rs.resident_lru     = 0;
+        rs.kv_cleared       = true;
+        result_.resident_slots_cleared_at_teardown++;
+        trace::event("resident_slot_cleared_teardown seq=%d", rs.seq_id);
+    }
 
     // ---- Residual-KV-empty check (engine-side; main never touches
     //      llama_memory_seq_*). Sweeps n_seq_max_ rather than the

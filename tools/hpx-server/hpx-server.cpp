@@ -524,6 +524,23 @@ struct request_metrics {
     bool         cancel_issued           = false;
     const char * final_status            = "unknown";
     int32_t      n_decoded               = 0;
+    // c=4 request-cycle decomposition (observer-only). Absolute
+    // steady_clock microseconds (server_now_us), same epoch as
+    // submit_us / completion_us and as the engine's responsiveness
+    // timestamps. Default -1 = "phase not reached / not captured".
+    // Populated only when server_diag_enabled(); zero clock reads when
+    // diagnostics are off. t_admitted_us / t_complete_us are copied
+    // from request_result after h.result.get() and are meaningful only
+    // when opts.lib.enable_responsiveness_timing was set (which the
+    // server ties to server_diag_enabled()).
+    int64_t      t_entry_us              = -1;
+    int64_t      t_parse_done_us         = -1;
+    int64_t      t_tokenize_done_us      = -1;
+    int64_t      t_admitted_us           = -1;
+    int64_t      t_complete_us           = -1;
+    int64_t      t_result_available_us   = -1;
+    int64_t      t_response_ready_us     = -1;
+    int64_t      t_exit_us               = -1;
 };
 
 // Emit one JSONL row to LLAMA_HPX_DIAG_METRICS_PATH (O_APPEND, line-
@@ -555,7 +572,15 @@ void dump_request_metrics_jsonl(const request_metrics & m) {
         "\"disconnect_observed\":%s,"
         "\"cancel_issued\":%s,"
         "\"final_status\":\"%s\","
-        "\"n_decoded\":%d}\n",
+        "\"n_decoded\":%d,"
+        "\"t_entry_us\":%lld,"
+        "\"t_parse_done_us\":%lld,"
+        "\"t_tokenize_done_us\":%lld,"
+        "\"t_admitted_us\":%lld,"
+        "\"t_complete_us\":%lld,"
+        "\"t_result_available_us\":%lld,"
+        "\"t_response_ready_us\":%lld,"
+        "\"t_exit_us\":%lld}\n",
         m.request_id,
         m.stream ? "true" : "false",
         static_cast<long long>(m.submit_us),
@@ -567,7 +592,15 @@ void dump_request_metrics_jsonl(const request_metrics & m) {
         m.disconnect_observed ? "true" : "false",
         m.cancel_issued ? "true" : "false",
         m.final_status != nullptr ? m.final_status : "unknown",
-        m.n_decoded);
+        m.n_decoded,
+        static_cast<long long>(m.t_entry_us),
+        static_cast<long long>(m.t_parse_done_us),
+        static_cast<long long>(m.t_tokenize_done_us),
+        static_cast<long long>(m.t_admitted_us),
+        static_cast<long long>(m.t_complete_us),
+        static_cast<long long>(m.t_result_available_us),
+        static_cast<long long>(m.t_response_ready_us),
+        static_cast<long long>(m.t_exit_us));
     if (need_close) {
         std::fclose(fp);
     } else {
@@ -693,6 +726,14 @@ int main(int argc, char ** argv) {
     // any value <= 0 as unbounded (see Slice C invariant in
     // engine_options::lib.prefill_budget_rows).
     opts.lib.prefill_budget_rows  = args.prefill_budget_rows;
+    // c=4 request-cycle decomposition (observer-only): turn on the
+    // engine's Exp-13 responsiveness timestamps (t_admitted_us /
+    // t_complete_us on request_result) ONLY when server diagnostics are
+    // enabled. Off by default -> the engine adds no steady_clock reads
+    // on its hot path and the request_result fields stay -1, byte-
+    // identical to today. No engine source change; this only flips an
+    // existing engine_options flag from the server side.
+    opts.lib.enable_responsiveness_timing = server_diag_enabled();
     opts.preload.prompt_tokens    = nullptr;
     opts.preload.budgets          = {};
     opts.preload.waiting_queue    = &empty_waiting;
@@ -739,6 +780,13 @@ int main(int argc, char ** argv) {
         srv.Post("/completion",
                  [&](const httplib::Request & req,
                      httplib::Response &       res) {
+            // c=4 request-cycle decomposition (observer-only). Phase
+            // timestamps captured into stack locals BEFORE request_metrics
+            // exists (rmet is built after tokenize); assigned into rmet at
+            // its construction. -1 = phase not reached. No clock reads when
+            // diagnostics are off.
+            int64_t te_entry_us = -1, te_parse_us = -1, te_tok_us = -1;
+            if (server_diag_enabled()) te_entry_us = server_now_us();
             nlohmann::json body;
             try {
                 body = nlohmann::json::parse(req.body);
@@ -747,6 +795,7 @@ int main(int argc, char ** argv) {
                            "request body must be valid JSON");
                 return;
             }
+            if (server_diag_enabled()) te_parse_us = server_now_us();
 
             if (!body.is_object()
              || !body.contains("prompt")
@@ -783,6 +832,22 @@ int main(int argc, char ** argv) {
                     return;
                 }
                 stream_requested = body["stream"].get<bool>();
+            }
+
+            // ---- B1 Slice 1: optional top-level "session_id" string ----
+            // Omitted => empty (no session), byte-identical to today.
+            // Present-but-non-string => 400 bad_request. The value is
+            // carried onto submit_request.session_id and plumbed through
+            // the engine, but NO reuse, residency, admission, or KV
+            // behavior depends on it in Slice 1.
+            std::string session_id;
+            if (body.contains("session_id")) {
+                if (!body["session_id"].is_string()) {
+                    send_error(res, 400, "bad_request",
+                        "'session_id' must be a string");
+                    return;
+                }
+                session_id = body["session_id"].get<std::string>();
             }
 
             // ---- M7b: optional nested "sampling" parsing ----------
@@ -908,6 +973,7 @@ int main(int argc, char ** argv) {
                 send_error(res, 413, "payload_too_large", msg);
                 return;
             }
+            if (server_diag_enabled()) te_tok_us = server_now_us();
 
             const int32_t rid =
                 next_rid.fetch_add(1, std::memory_order_relaxed);
@@ -926,9 +992,12 @@ int main(int argc, char ** argv) {
             // the same `metrics_emitted` dedupe flag.
             request_metrics rmet;
             if (server_diag_enabled()) {
-                rmet.request_id = rid;
-                rmet.stream     = stream_requested;
-                rmet.submit_us  = server_now_us();
+                rmet.request_id        = rid;
+                rmet.stream            = stream_requested;
+                rmet.t_entry_us        = te_entry_us;
+                rmet.t_parse_done_us   = te_parse_us;
+                rmet.t_tokenize_done_us = te_tok_us;
+                rmet.submit_us         = server_now_us();
             }
 
             submit_request sr;
@@ -937,6 +1006,7 @@ int main(int argc, char ** argv) {
             sr.decode_budget = decode_budget;
             sr.want_stream   = stream_requested;
             sr.sampling      = std::move(cfg);
+            sr.session_id    = std::move(session_id);
 
             submit_handle h = eng.submit_request(std::move(sr));
 
@@ -955,6 +1025,15 @@ int main(int argc, char ** argv) {
                     send_error(res, 500, "engine_error", e.what());
                     return;
                 }
+                if (server_diag_enabled()) {
+                    rmet.t_result_available_us = server_now_us();
+                    // Engine-stamped responsiveness timestamps (absolute
+                    // steady_clock us; populated because the engine was
+                    // constructed with enable_responsiveness_timing =
+                    // server_diag_enabled()).
+                    rmet.t_admitted_us = r.t_admitted_us;
+                    rmet.t_complete_us = r.t_complete_us;
+                }
 
                 const std::string text =
                     common_detokenize(vocab, r.generated_tokens,
@@ -967,9 +1046,15 @@ int main(int argc, char ** argv) {
                 out["hash"]       = hex_hash(r.hash);
                 out["text"]       = text;
                 res.status = 200;
+                // response fully constructed (detok + JSON object built);
+                // out.dump() serialization + HTTP store fall in the
+                // response_ready -> exit bucket.
+                if (server_diag_enabled())
+                    rmet.t_response_ready_us = server_now_us();
                 res.set_content(out.dump(), "application/json");
                 if (server_diag_enabled()) {
                     rmet.completion_us = server_now_us();
+                    rmet.t_exit_us     = rmet.completion_us;
                     rmet.final_status  = status_name(r.status);
                     rmet.n_decoded     = r.n_decoded;
                     if (r.request_id >= 0) rmet.request_id = r.request_id;

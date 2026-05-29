@@ -154,6 +154,62 @@ add_executable(llama-hpx-engine-keepalive-multi-submit-smoke engine_keepalive_mu
 target_compile_features(llama-hpx-engine-keepalive-multi-submit-smoke PRIVATE cxx_std_17)
 target_link_libraries(llama-hpx-engine-keepalive-multi-submit-smoke PRIVATE llama-hpx-engine)
 
+# B1 Slice 1: session_id plumbing guard. Proves the new optional
+# session_id field is carried end-to-end but is inert — a session-present
+# request produces the byte-identical canonical greedy hash as a
+# no-session request. Built by default; intentionally not installed.
+add_executable(llama-hpx-engine-session-id-plumbing-smoke engine_session_id_plumbing_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-id-plumbing-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-id-plumbing-smoke PRIVATE llama-hpx-engine)
+
+# B1 Slice 2: finalize-time residency + clean teardown guard. Proves a
+# successful session_id completion is kept resident (KV not cleared at
+# finalize, exactly one resident slot recorded), a no-session completion
+# alongside it still produces the canonical hash, and teardown clears the
+# resident KV so the residual-KV sweep passes. Built by default; not installed.
+add_executable(llama-hpx-engine-session-resident-finalize-smoke engine_session_resident_finalize_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-resident-finalize-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-resident-finalize-smoke PRIVATE llama-hpx-engine)
+
+# B1 Slice 3: exact-session reuse guard. Proves a same-session request that
+# exactly extends a resident slot is rebound onto that slot with the prefix
+# prefill skipped, and that its output matches a full-prefill baseline for
+# the same prompt. Built by default; intentionally not installed.
+add_executable(llama-hpx-engine-session-exact-reuse-smoke engine_session_exact_reuse_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-exact-reuse-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-exact-reuse-smoke PRIVATE llama-hpx-engine)
+
+# B1 Slice 4: inactive resident-slot eviction (LRU) guard. Fills all slots
+# with resident sessions, then forces a new session to reclaim the oldest
+# resident slot and full-prefill on it. Built by default; not installed.
+add_executable(llama-hpx-engine-session-evict-inactive-smoke engine_session_evict_inactive_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-evict-inactive-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-evict-inactive-smoke PRIVATE llama-hpx-engine)
+
+# B1 Slice 4: session-mismatch fallback guard. A same-session request whose
+# prompt diverges from the resident prefix must not reuse; with no free slot
+# it evicts the resident slot and full-prefills, matching a baseline. Built
+# by default; intentionally not installed.
+add_executable(llama-hpx-engine-session-mismatch-fallback-smoke engine_session_mismatch_fallback_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-mismatch-fallback-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-mismatch-fallback-smoke PRIVATE llama-hpx-engine)
+
+# B+1: same-session longest-common-prefix reuse guards. (A) divergent
+# suffix reuses the shared prefix and trims the old tail, matching a
+# full-prefill baseline; (B) a sub-threshold prefix does not reuse; (C)
+# cross-session prefixes are never reused. Built by default; not installed.
+add_executable(llama-hpx-engine-session-lcp-divergent-suffix-smoke engine_session_lcp_divergent_suffix_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-lcp-divergent-suffix-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-lcp-divergent-suffix-smoke PRIVATE llama-hpx-engine)
+
+add_executable(llama-hpx-engine-session-lcp-threshold-no-reuse-smoke engine_session_lcp_threshold_no_reuse_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-lcp-threshold-no-reuse-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-lcp-threshold-no-reuse-smoke PRIVATE llama-hpx-engine)
+
+add_executable(llama-hpx-engine-session-cross-session-no-lcp-smoke engine_session_cross_session_no_lcp_smoke.cpp)
+target_compile_features(llama-hpx-engine-session-cross-session-no-lcp-smoke PRIVATE cxx_std_17)
+target_link_libraries(llama-hpx-engine-session-cross-session-no-lcp-smoke PRIVATE llama-hpx-engine)
+
 # N5b: shutdown-vs-queued-but-unadmittable liveness reproducer. Single
 # engine (n_seq_max=1, initial_idle_slots=0, budgets={}, keep_alive=true)
 # with one non-streaming request drained to waiting_queue_consumable_ but
