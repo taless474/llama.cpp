@@ -403,11 +403,49 @@ private:
 
     void drain_external_inbox(int32_t iter);
 
+    // waiter_idx selects which entry of waiting_queue_consumable_ to bind
+    // (0 == FIFO front, the unchanged free-queue-drain behavior).
+    // prefill_start seeds prefill_cursor/pos_next so a reused resident
+    // prefix [0, prefill_start) is kept and only the suffix is prefilled
+    // (0 for a normal full prefill). skip_empty_kv_check bypasses the
+    // empty-KV precondition for the resident-reuse path (the slot
+    // intentionally still holds its prefix KV). B1 Slice 3.
     bool admit_one(int32_t              reuse_seq,
                    admission_source     src,
                    const char *         src_label,
                    int32_t              iter,
-                   llama_memory_t       mem);
+                   llama_memory_t       mem,
+                   size_t               waiter_idx          = 0,
+                   int32_t              prefill_start       = 0,
+                   bool                 skip_empty_kv_check = false);
+
+    // B1 Slice 3: linear scan for a resident slot whose session matches
+    // `session_id`. Returns the seq_id (== slot index) of the most-recent
+    // (max resident_lru) match, or -1 if none. No cross-session matching.
+    int32_t find_resident_slot(const std::string & session_id) const;
+
+    // B+1: same-session longest-common-prefix candidate. Scans resident
+    // slots with the SAME resident_session_id, returns the seq_id with the
+    // largest token-level LCP against `prompt` (tie-break: most-recent
+    // resident_lru, then lowest seq_id), and writes that LCP length into
+    // `matched_out`. Returns -1 (matched_out=0) if no same-session resident
+    // has any common prefix. No cross-session matching.
+    int32_t find_best_lcp_resident_slot(
+        const std::string &              session_id,
+        const std::vector<llama_token> & prompt,
+        size_t &                         matched_out) const;
+
+    // B1 Slice 4: linear scan for the inactive resident slot with the
+    // SMALLEST resident_lru (the oldest). Returns its seq_id (== slot
+    // index), or -1 if none. Only resident, completed (done) slots are
+    // eligible — an active slot is never evictable.
+    int32_t find_evictable_resident_slot() const;
+
+    // B1 Slice 4: reclaim a resident slot: clear its KV
+    // (llama_memory_seq_rm over the whole sequence), reset its residency
+    // metadata, and push it onto free_idle_ for normal admission. Engine
+    // task only; caller guarantees the slot is resident && inactive.
+    void evict_resident_slot(int32_t seq_id, llama_memory_t mem);
 
     // M3b + M5a: staged-cancel → cancelled_request_ids_ /
     // cancelled_tokens_ transfer. Engine task only. N1: swaps
@@ -591,6 +629,12 @@ private:
     // (== args.n_seqs). Used by the residual-KV-empty sweep so it
     // covers the not-yet-bound slots [n_active, n_seq_max).
     int32_t                          n_seq_max_      = 0;
+    // B1 Slice 2: engine-monotonic recency counter stamped onto
+    // seq_state::resident_lru when a successful session_id completion is
+    // kept resident. Starts at 1 (0 is the inert "never resident"
+    // default). Only finalize_and_fulfill reads/advances it; no eviction
+    // consumer exists yet.
+    uint64_t                         resident_lru_next_ = 1;
     // Live Admission Slice 3: read-only handle to the construction-time
     // waiting queue. run_body() seeds waiting_queue_consumable_ from it
     // at each repeat. Engine consumes from the working copy only; the

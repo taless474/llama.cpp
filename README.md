@@ -63,6 +63,22 @@ The current prototype also includes an experimental `PrefillBudgetPolicy`. With 
 
 The validated claim is narrow: prefill budgeting can bound per-iteration prefill/decode interference. It is not a throughput claim and it is not a default-enable recommendation.
 
+The current branch also includes the final hpx-server occupancy/offered-load closeout. The earlier c=4 hpx-server vs llama-server throughput gap was traced to request residency under a closed-loop workload, not HPX orchestration overhead. Under offered load with n_seq_max=4, max_concurrent=16, and 16 clients, the existing HPX backlog/admission machinery kept mean active_seq_count at 4.000/4 whenever the queue was non-empty. The c4 contrast had an empty queue and lower occupancy. The conclusion is to stop this branch as a performance-competition project: Design A, backlog admission, is already effectively implemented; the plausible future lever is Design B, persistent slots / prefix-KV reuse, as a separate project.
+
+Design B was then explored as a scoped POC. A B0 measurement (using `llama-server` `cache_prompt` as an upper-bound reference) confirmed prefix reuse is worth pursuing, and a B1 implementation added optional `session_id` exact-session persistent-slot reuse to the HPX engine: a same-session request whose prompt exactly extends a resident slot skips the matched prefix prefill. B1 is exact-session-continuation reuse only — not a general shared-prefix cache. In the measured W-chat continuation cell, exact-session reuse reduced TTFT p50 from 567.6 ms to 78.3 ms and improved tok/s by 10.7%, while preserving byte-identical outputs. It does not capture the shared-system-prompt upside that B0 measured for W-long-sys and W-repeat-prefix; those need a separate longest-common-prefix (Design B+) follow-on. Use `session_id` only for genuine continuations. This is not a production-readiness claim and not a claim that HPX broadly outperforms `llama-server`.
+
+A B+1 follow-on then added same-session longest-common-prefix (LCP) reuse: a same-session request that shares a common prefix with a resident slot keeps the matched prefix, trims the divergent resident tail, and prefills only the new suffix (same-session only; no cross-session reuse, `seq_cp`, or context shift). B+1 recovered the shared-prefix upside B1 missed (W-long-sys tok/s +40.2%, W-repeat-prefix +52.0%, W-chat +26.8%, W-control neutral). LCP reuse is structurally correct and performance-positive, but output is not guaranteed byte-identical to a fresh full-prefill under partial-LCP reuse: one of 40 W-repeat-prefix requests diverged, traced to deterministic cross-shape floating-point greedy near-tie sensitivity (correct KV positions and trim; no KV contamination), not a bug.
+
+What this means for the performance path: the HPX serving-control / backlog / admission question is closed — under offered load HPX already keeps all slots full — so this branch should not be continued as a generic performance-competition track, and more tuning of admission, backlog, the HTTP handler, or orchestration is not the right lever. If the goal is performance, the evidence-backed direction is a separate prefix-cache / persistent-slot project. The two are distinct: backlog/admission keeps batches full when queued work exists, whereas a prefix cache avoids recomputing repeated prompt prefixes. Within that prefix-reuse line, exact-session continuation reuse and same-session LCP reuse already show real gains; cross-session LCP is deferred as a separate policy decision because cross-session cache hits can create a timing side channel. None of this is a production-readiness claim or a claim that HPX broadly outperforms `llama-server`.
+
+See:
+
+```text
+docs/hpx/hpx_server_occupancy_offered_load_closeout.md
+docs/hpx/hpx_exact_session_prefix_reuse_poc.md
+docs/hpx/hpx_same_session_lcp_reuse_poc.md
+```
+
 ---
 
 ## What HPX owns
@@ -295,6 +311,9 @@ docs/hpx/hpx_native_serving_control_plane_design.md
 docs/hpx/serving_overhead_diagnostics_roadmap.md
 docs/hpx/prefill_budget_policy_design.md
 docs/hpx/prefill_budget_policy_result.md
+docs/hpx/hpx_server_occupancy_offered_load_closeout.md
+docs/hpx/hpx_exact_session_prefix_reuse_poc.md
+docs/hpx/hpx_same_session_lcp_reuse_poc.md
 docs/hpx/continuous_batching_upstream_notes.md
 docs/hpx/continuous_batching_simulator_design.md
 docs/hpx/continuous_batching_phase3_target.md
@@ -395,7 +414,9 @@ The `experiments/` tree contains serving-bench evidence packages and server-vs-s
 - `hpx-bench/experiments/14_hpx_server_end_to_end_responsiveness/` — end-to-end hpx-server client-visible responsiveness; records hpx-server responsiveness behavior and later slot-recovery refreshes.
 - `hpx-bench/experiments/15_hpx_vs_llama_server_semantics/` — semantic-alignment revalidation against `llama-server`; useful for comparison setup, but not a throughput benchmark.
 - `hpx-bench/experiments/16_prefill_budget_policy_server_w1c/` — server-path PrefillBudgetPolicy validation; shows that an HPX-owned prefill budget can bound per-iteration prefill/decode interference.
-- `hpx-bench/experiments/17_hpx_vs_llama_server_throughput_smoke/` — small external throughput/scaling smoke for `llama-server` vs `llama-hpx-server` with default B=0; identifies a moderate-concurrency serving-control attribution target.
+- `hpx-bench/experiments/17_hpx_vs_llama_server_throughput_smoke/` — small external throughput/scaling smoke for `llama-server` vs `llama-hpx-server` with default B=0; initially exposed the c=4 attribution target later resolved by the occupancy/offered-load closeout.
+
+The final occupancy/offered-load POC showed that the existing HPX backlog/admission machinery fills all active slots when queued work exists, so the previous c=4 loss was a closed-loop no-work-ready artifact rather than an HPX admission defect. See `docs/hpx/hpx_server_occupancy_offered_load_closeout.md`.
 
 The `sim/` tree contains the continuous-batching simulator and workload analysis that helped define the mixed-decode target.
 

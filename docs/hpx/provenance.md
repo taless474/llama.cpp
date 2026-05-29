@@ -5793,3 +5793,714 @@ PrefillBudgetPolicy is a positive HPX-native scheduling result.
 Baseline HPX serving throughput still has an open moderate-concurrency
 performance attribution question.
 ```
+
+
+## 12. hpx-server throughput attribution, occupancy closeout, and prefix-cache follow-on
+
+This section records the work that followed the PrefillBudgetPolicy checkpoint.
+
+The previous checkpoint left this as the next technical attribution target:
+
+```text
+why HPX-B0 loses the most short-prompt throughput efficiency at c=4
+```
+
+That question is now resolved.
+
+The conclusion is:
+
+```text
+The c=4 loss was not caused by HPX orchestration overhead,
+HTTP handler overhead, engine idle/wakeup, or broken backlog admission.
+
+The current HPX backlog/admission machinery fills all active slots when queued
+work exists.
+
+The remaining performance path is not more admission/backlog tuning. It is a
+separate prefix-cache / persistent-slot line of work.
+```
+
+### 12.1 Equal-thread c=4 baseline
+
+The first follow-up checked whether the earlier hpx-server vs llama-server gap was caused by unequal ggml compute-thread settings.
+
+Both servers were rerun with explicit 4-thread ggml compute settings:
+
+```text
+hpx-server:
+  --n-threads 4
+  --hpx-os-threads 2
+
+llama-server:
+  --threads 4
+  --threads-batch 4
+```
+
+The c=4 gap remained:
+
+```text
+c=4 equal-thread baseline:
+  llama-server: 72.7 tok/s
+  hpx-server:   60.1 tok/s
+```
+
+So the earlier c=4 gap was not explained by HPX using fewer ggml compute threads.
+
+### 12.2 Engine attribution
+
+The next attribution run enabled hpx-server diagnostics and decomposed engine time.
+
+For c=4:
+
+```text
+Σdecode ms:      7018.3
+Σiter ms:        7032.0
+Σnon-decode ms:    13.7
+
+decode / iter:
+  7018.3 / 7032.0 ≈ 99.8%
+
+non-decode fraction:
+  ≈ 0.19%
+
+idle fraction:
+  ≈ 2.6%
+
+mean active_seq_count:
+  2.87
+
+active<c and queued:
+  0.000
+```
+
+Interpretation:
+
+```text
+llama_decode dominated engine time.
+
+HPX per-iteration orchestration was not the bottleneck.
+
+The engine was not sitting idle while queued work waited.
+
+The observed deficit was an occupancy/residency effect, not an engine-control
+overhead effect.
+```
+
+### 12.3 Request-cycle decomposition
+
+A server-path decomposition then measured the request lifecycle around the engine.
+
+For c=4, the relevant median per-request timings were:
+
+```text
+submit -> admit:
+  ≈ 49.0 ms
+
+admit -> complete:
+  ≈ 486.0 ms
+
+server-side overhead outside engine:
+  ≈ 39-40 us/request
+```
+
+The following were all too small to explain the throughput gap:
+
+```text
+JSON parse
+tokenization
+future/result propagation
+detokenization
+response JSON construction
+HTTP response handling
+client resubmit gap
+TCP connection setup
+```
+
+Keep-alive did not materially change hpx-server throughput:
+
+```text
+hpx c=4:
+  new connection: 59.5 tok/s
+  keep-alive:     60.4 tok/s
+```
+
+The diagnosis at this stage was:
+
+```text
+The c=4 gap came from lower request residency / effective batch occupancy,
+not from hpx-server handler overhead.
+```
+
+### 12.4 Occupancy / offered-load POC
+
+The final occupancy test asked whether the existing HPX backlog/admission machinery can keep all slots full when queued work actually exists.
+
+Setup:
+
+```text
+llama-hpx-server
+TinyLlama F32
+n_seq_max = 4
+max_concurrent = 16
+--n-threads 4
+--hpx-os-threads 2
+--ctx-size 4096
+prompt = "Hello, my name is"
+decode_budget = 8
+greedy
+diagnostics enabled
+clean shutdown through POST /shutdown
+```
+
+Two cells were run:
+
+```text
+c16 offered-load cell:
+  16 clients
+  max_concurrent = 16
+  n_seq_max = 4
+
+c4 contrast cell:
+  4 clients
+  max_concurrent = 16
+  n_seq_max = 4
+```
+
+Result:
+
+```text
+c16 offered load:
+  total requests:                         320
+  failed requests:                        0
+  503 count:                              0
+  canonical b8 hash:                      all 0x0619d4d1900c2365
+  admitted_count:                         321   # 320 measured + 1 warmup
+  promises_fulfilled:                     321
+  mean active_seq_count, all iters:        3.989 / 4
+  mean active_seq_count, queue > 0:        4.000 / 4
+  fraction iters with queue > 0:           0.984
+  mean waiting_queue_depth:               11.185
+  mean batch_n_tokens:                     6.483
+
+c4 contrast:
+  total requests:                         80
+  failed requests:                        0
+  503 count:                              0
+  canonical b8 hash:                      all 0x0619d4d1900c2365
+  admitted_count:                         81    # 80 measured + 1 warmup
+  promises_fulfilled:                     81
+  mean active_seq_count, all iters:        3.541 / 4
+  fraction iters with queue > 0:           0.000
+  mean waiting_queue_depth:                0.000
+  mean batch_n_tokens:                     5.757
+```
+
+Interpretation:
+
+```text
+Under offered load, HPX kept all 4 active slots full whenever queued work existed.
+
+The old c=4 loss was a closed-loop no-work-ready artifact, not a broken HPX
+admission/backlog mechanism.
+
+Design A, HPX-owned pending/backlog admission, is effectively present for the
+tested offered-load path.
+```
+
+This closes the c=4 serving-control attribution target from section 11.13.
+
+### 12.5 Occupancy closeout decision
+
+The occupancy work reached this decision:
+
+```text
+Stop the current hpx-server branch as a generic performance-competition track.
+
+Do not keep tuning admission, backlog, HTTP handler, future completion, or
+orchestration hoping for raw throughput gains.
+
+The backlog/admission question is closed for the tested path.
+```
+
+The distinction is:
+
+```text
+backlog/admission:
+  keeps batches full when queued work exists
+
+prefix cache / persistent slots:
+  avoids recomputing repeated prompt prefixes
+```
+
+The remaining evidence-backed performance path is therefore a separate prefix-cache / persistent-slot project.
+
+The closeout is documented in:
+
+```text
+docs/hpx/hpx_server_occupancy_offered_load_closeout.md
+```
+
+### 12.6 B0 prefix-reuse opportunity study
+
+A follow-on Design B study measured whether prefix-KV reuse is worth pursuing.
+
+Primary reference:
+
+```text
+llama-server cache_prompt=false vs cache_prompt=true
+```
+
+Cross-check:
+
+```text
+hpx-server diagnostics measuring prefill-vs-decode cost
+```
+
+B0 results:
+
+```text
+W-long-sys:
+  TTFT p50: 399 -> 53 ms
+  TTFT improvement: 86.8%
+  tok/s: 15.7 -> 23.5
+  throughput improvement: +50.3%
+  prompt_n: 466 -> 10 processed tokens
+  cached/request tokens: 456
+
+W-repeat-prefix:
+  TTFT p50: 407 -> 56 ms
+  TTFT improvement: 86.3%
+  tok/s: 15.6 -> 23.9
+  throughput improvement: +53.4%
+  prompt_n: 451 -> 5 processed tokens
+  cached/request tokens: 446
+
+W-chat:
+  TTFT p50: 177 -> 54 ms
+  TTFT improvement: 69.3%
+  tok/s: 22.6 -> 23.8
+  throughput improvement: +5.1%
+  prompt_n: 192 -> 29 processed tokens
+  cached/request tokens: 162
+
+W-control:
+  TTFT p50: 53 -> 60 ms
+  TTFT improvement: -13.5%
+  tok/s: 22.7 -> 22.5
+  throughput improvement: -1.2%
+```
+
+Interpretation:
+
+```text
+Prefix reuse is a real performance lever.
+
+The large wins occur when prefill is a large part of the request.
+
+The tiny independent control workload correctly shows no benefit.
+```
+
+### 12.7 B1 exact-session persistent-slot POC
+
+B1 implemented a narrow HPX persistent-slot POC:
+
+```text
+optional session_id
+same-session only
+same resident slot only
+exact token-extension reuse only
+full-prefill fallback on mismatch
+inactive resident eviction
+no cross-session reuse
+no global longest-common-prefix matching
+no llama_memory_seq_cp
+no context shift
+```
+
+Implementation slices:
+
+```text
+Slice 1:
+  session_id plumbing
+
+Slice 2:
+  clean successful session requests can leave resident KV
+  resident KV cleared at teardown
+
+Slice 3:
+  exact-session reuse
+  skip resident prefix prefill
+  output matched full-prefill baseline in smoke
+
+Slice 4:
+  inactive resident eviction
+  mismatch fallback
+```
+
+Key smoke results:
+
+```text
+no-session b8 anchor:
+  0x0619d4d1900c2365
+
+Slice 3 exact reuse:
+  skipped prefix tokens: 13
+  reuse hash == full-prefill baseline hash:
+    0x886f58b78a7e4f99
+
+Slice 4 mismatch fallback:
+  reuse_admitted = 0
+  evicted_count = 1
+  output hash == full-prefill baseline:
+    0x8161ebdda277f73e
+```
+
+B1 benchmark result:
+
+```text
+W-chat:
+  TTFT p50: 567.6 -> 78.3 ms
+  TTFT improvement: 86.2%
+  tok/s: 17.5 -> 19.3
+  throughput improvement: +10.7%
+  prefill rows: 14800 -> 2788
+  skipped rows: 12012
+  skipped fraction: ≈ 81%
+  hash mismatches: 0 / 40
+```
+
+B1 did not help shared-prefix divergent-suffix workloads:
+
+```text
+W-long-sys:
+  reuse fired: no
+  skipped rows: 0
+  TTFT and throughput regressed
+
+W-repeat-prefix:
+  reuse fired: no
+  skipped rows: 0
+  TTFT and throughput regressed
+```
+
+Interpretation:
+
+```text
+B1 was demonstrated successfully on the measured exact multi-turn continuation
+workload.
+
+B1 is not a general shared-prefix cache.
+```
+
+The B1 result is documented in:
+
+```text
+docs/hpx/hpx_exact_session_prefix_reuse_poc.md
+```
+
+### 12.8 B+1 same-session LCP POC
+
+B+1 extended B1 from exact continuation to same-session longest-common-prefix reuse.
+
+Scope:
+
+```text
+same-session LCP only
+no cross-session LCP
+no global cross-session cache
+no llama_memory_seq_cp
+no context shift
+no hpx-server.cpp change
+no tokenizer/sampler/llama_decode change
+```
+
+Mechanism:
+
+```text
+resident slot:
+  shared prefix + old suffix
+
+incoming same-session prompt:
+  shared prefix + new suffix
+
+B+1:
+  find token-level longest common prefix
+  keep KV for the shared prefix
+  remove old suffix KV with llama_memory_seq_rm(seq_id, matched, -1)
+  prefill the new suffix from matched onward
+```
+
+Smoke results:
+
+```text
+LCP divergent-suffix smoke:
+  matched tokens: 43
+  trimmed tokens: 12
+  lcp_reuse_admitted_count: 1
+  output matched full-prefill baseline:
+    0x917f8acbae3746cf
+
+Threshold tiny-prefix smoke:
+  no reuse
+  output matched baseline:
+    0x88f68c24302e81fc
+
+Cross-session same-prefix smoke:
+  no reuse
+  output matched baseline:
+    0x917f8acbae3746cf
+
+no-session b8 anchor:
+  0x0619d4d1900c2365
+```
+
+B+1 benchmark result:
+
+```text
+W-long-sys:
+  strong improvement
+  tok/s improvement: +40.2%
+
+W-repeat-prefix:
+  strong improvement
+  tok/s improvement: +52.0%
+  close to B0 llama-server cache_prompt result of +53.4%
+
+W-chat:
+  tok/s improvement: +26.8%
+
+W-control:
+  neutral
+```
+
+A small W-long-sys smoke also confirmed:
+
+```text
+TTFT:
+  ≈ 395 ms -> ≈ 77 ms
+
+TTFT improvement:
+  ≈ 80%
+
+tok/s:
+  +48.6%
+
+prefill skipped:
+  ≈ 78%
+```
+
+Interpretation:
+
+```text
+B+1 recovers the shared-prefix same-session performance upside that B1 missed.
+
+It remains same-session only and avoids the cross-session cache-hit timing
+side-channel.
+```
+
+### 12.9 B+1 deterministic mismatch investigation
+
+The B+1 benchmark found one deterministic mismatch:
+
+```text
+W-repeat-prefix:
+  hash mismatches: 1 / 40
+```
+
+The mismatch was investigated separately.
+
+Result:
+
+```text
+reproducible across 4 runs
+always measured index 30 / request i=32
+always the same hash pair
+
+no-session hash:
+  0x35fcec78e7ef42d3
+
+session/LCP hash:
+  0x7c6c2a5fa91b4c42
+
+both completed cleanly
+both n_decoded = 16
+```
+
+Token-level observation:
+
+```text
+shared output prefix:
+  "1."
+
+first divergence:
+  no-session token id: 16585  text: " Background"
+  session/LCP token id: 349    text: " P"
+
+both continuations were coherent phrases from the prompt.
+```
+
+Trace evidence:
+
+```text
+first generated token position:
+  451 on both paths
+
+subsequent generated positions:
+  452, 453, 454, ...
+
+old resident tail:
+  trimmed
+
+new suffix:
+  prefilled contiguously
+```
+
+Interpretation:
+
+```text
+The mismatch is deterministic cross-shape floating-point / greedy near-tie
+sensitivity, not stale KV, wrong positions, or a tail-trim bug.
+
+Partial-LCP reuse is structurally correct and performance-positive, but it is
+not guaranteed byte-identical to fresh full-prefill under all batch shapes.
+```
+
+Correctness policy:
+
+```text
+Byte-identity remains appropriate for fixed-shape anchors and controlled smokes.
+
+For partial-LCP reuse, byte-identity against fresh full-prefill is too strict
+because reused prefix KV may have been computed under a different batch shape.
+
+The right gates are:
+  token-level prefix match
+  correct tail trim
+  contiguous positions
+  no cross-session reuse
+  no stale-KV contamination
+  no KV leaks
+  mismatch rate reported when comparing against fresh full-prefill
+```
+
+The B+1 result is documented in:
+
+```text
+docs/hpx/hpx_same_session_lcp_reuse_poc.md
+```
+
+### 12.10 Current performance interpretation
+
+The current interpretation is:
+
+```text
+HPX serving-control / backlog / admission:
+  validated
+  not the remaining performance lever
+
+Prefix-cache / persistent-slot reuse:
+  demonstrated as the evidence-backed performance path
+
+B1 exact-session reuse:
+  strong for measured continuation workloads
+
+B+1 same-session LCP:
+  strong for measured same-session shared-prefix workloads
+
+B+2 cross-session LCP:
+  deferred
+```
+
+The important boundary is:
+
+```text
+This work does not show that hpx-server broadly beats llama-server.
+
+It shows that HPX can implement the relevant prefix-reuse mechanisms around
+llama.cpp in a correctness-first prototype, and that those mechanisms can
+recover the expected prefill savings on targeted workloads.
+```
+
+### 12.11 Remaining open questions
+
+The following questions remain out of scope for this checkpoint:
+
+```text
+B+2 cross-session LCP:
+  useful for independent sessions sharing the same prefix
+  deferred because cache hits can create a timing side channel
+
+llama_memory_seq_cp:
+  not needed for B1/B+1
+  may be relevant for fan-out or cross-slot prefix sharing
+
+context shift:
+  not implemented in B1/B+1
+  needed for long-running sessions that exceed context
+
+off-context prompt cache:
+  not implemented
+  would be a larger cache subsystem
+
+quantized models / larger models:
+  not characterized
+
+Llama 3 / non-TinyLlama generalization:
+  not characterized
+
+stochastic sampling:
+  not characterized
+
+concurrent multi-session prefix-cache behavior:
+  not characterized
+
+production policy:
+  eviction, privacy, fairness, isolation, determinism, and API semantics remain
+  future design topics
+```
+
+### 12.12 Section 12 conclusion
+
+Section 11 ended with this open attribution question:
+
+```text
+why HPX-B0 loses the most short-prompt throughput efficiency at c=4
+```
+
+Section 12 resolves it:
+
+```text
+The c=4 short-prompt loss was a closed-loop no-work-ready artifact.
+Under offered load, HPX backlog/admission fills all slots.
+```
+
+The performance path after that is now clearer:
+
+```text
+Do not keep tuning admission/backlog/HTTP/orchestration.
+
+If the goal is performance, the next line of work is prefix-cache /
+persistent-slot reuse.
+```
+
+That path has now been partially demonstrated:
+
+```text
+B1:
+  exact-session continuation reuse
+  large TTFT win on measured W-chat continuation
+
+B+1:
+  same-session LCP reuse
+  large shared-prefix gains on same-session divergent-suffix workloads
+  deterministic cross-shape FP caveat
+```
+
+The correct stop point is:
+
+```text
+Stop the current branch as a generic performance-competition track.
+
+If continuing later, treat further prefix-cache work as a separate, explicitly
+scoped project with its own correctness, privacy, and determinism policy.
+```
